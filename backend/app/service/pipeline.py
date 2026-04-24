@@ -12,6 +12,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.agents.architect import architect_agent
 from app.agents.designer import designer_agent
 from app.agents.coder import coder_agent
+from app.agents.multi_agent_coordinator import multi_agent_coordinator
 from app.models.pipeline import (
     Pipeline, PipelineRead, PipelineStatus,
     PipelineStage, StageName, StageStatus, PipelineStageRead
@@ -622,21 +623,22 @@ class PipelineService:
     async def _generate_pr_description(
         cls,
         pipeline_id: int,
-        coder_output: Dict[str, Any],
+        multi_agent_output: Dict[str, Any],
         execution_summary: Dict[str, Any],
         git_service: GitProviderService
     ) -> str:
         """
-        生成语义化的 PR 描述
+        生成语义化的 PR 描述（支持多 Agent 输出）
         
         包含：
-        1. 修改了哪些文件
+        1. 修改了哪些文件（代码 + 测试）
         2. 核心逻辑变动
-        3. 测试建议
+        3. 测试覆盖情况
+        4. 测试建议
         
         Args:
             pipeline_id: Pipeline ID
-            coder_output: CoderAgent 输出
+            multi_agent_output: 多 Agent 协调器输出
             execution_summary: 代码执行摘要
             git_service: Git 服务实例
             
@@ -645,13 +647,20 @@ class PipelineService:
         """
         # 获取文件变更列表
         files_changed = []
-        if "files" in coder_output:
-            for file_change in coder_output["files"]:
-                files_changed.append({
+        test_files = []
+        
+        if "files" in multi_agent_output:
+            for file_change in multi_agent_output["files"]:
+                file_info = {
                     "path": file_change.get("file_path", ""),
                     "type": file_change.get("change_type", "modify"),
                     "description": file_change.get("description", "")
-                })
+                }
+                # 区分代码文件和测试文件
+                if "test" in file_info["path"].lower() or file_info["path"].startswith("tests/"):
+                    test_files.append(file_info)
+                else:
+                    files_changed.append(file_info)
         
         # 获取 diff 统计
         diff_stat = git_service.create_commit_summary()
@@ -663,18 +672,28 @@ class PipelineService:
             f"**Pipeline ID**: #{pipeline_id}",
             "",
             "### 变更摘要",
-            f"{coder_output.get('summary', '无描述')}",
+            f"{multi_agent_output.get('summary', '无描述')}",
             "",
-            "### 修改的文件",
+            "### 代码文件",
         ]
         
-        # 添加文件列表
+        # 添加代码文件列表
         if files_changed:
             for f in files_changed:
                 type_emoji = {"add": "➕", "modify": "📝", "delete": "🗑️"}.get(f["type"], "📝")
                 lines.append(f"- {type_emoji} `{f['path']}` - {f['description'] or '代码变更'}")
         else:
-            lines.append("- 无文件变更记录")
+            lines.append("- 无代码文件变更")
+        
+        # 添加测试文件列表
+        lines.append("")
+        lines.append("### 测试文件")
+        if test_files:
+            for f in test_files:
+                type_emoji = {"add": "➕", "modify": "📝", "delete": "🗑️"}.get(f["type"], "📝")
+                lines.append(f"- {type_emoji} `{f['path']}` - {f['description'] or '测试代码'}")
+        else:
+            lines.append("- 无测试文件")
         
         # 添加统计信息
         lines.extend([
@@ -686,19 +705,34 @@ class PipelineService:
         ])
         
         # 添加测试建议
-        tests_included = coder_output.get("tests_included", False)
-        dependencies = coder_output.get("dependencies_added", [])
+        tests_included = multi_agent_output.get("tests_included", False)
+        coverage_targets = multi_agent_output.get("coverage_targets", [])
+        dependencies = multi_agent_output.get("dependencies_added", [])
         
         lines.extend([
             "",
-            "### 测试建议",
+            "### 测试覆盖",
         ])
         
-        if tests_included:
-            lines.append("✅ 本次变更已包含测试代码，请运行测试套件验证：")
+        if tests_included and test_files:
+            lines.append("✅ 本次变更已包含测试代码")
+            
+            # 添加测试覆盖目标
+            if coverage_targets:
+                lines.append("")
+                lines.append("**测试覆盖目标：**")
+                for target in coverage_targets:
+                    lines.append(f"- {target}")
+            
+            lines.append("")
+            lines.append("**运行测试：**")
             lines.append("```bash")
             lines.append("# 运行所有测试")
             lines.append("pytest")
+            lines.append("")
+            lines.append("# 运行特定测试文件")
+            for tf in test_files:
+                lines.append(f"pytest {tf['path']}")
             lines.append("```")
         else:
             lines.append("⚠️ 本次变更未包含测试代码，建议进行以下验证：")
@@ -841,13 +875,20 @@ class PipelineService:
                         if content:
                             target_files[file_path] = content
             
-            # 6. 调用 CoderAgent 生成代码
-            coder_result = await coder_agent.generate_code(design_output, target_files)
+            # 6. 调用多 Agent 协调器并行生成代码和测试
+            print(f"[PipelineService] 启动多 Agent 协作 - Pipeline {pipeline_id}")
+            multi_agent_result = await multi_agent_coordinator.execute_parallel(
+                design_output, 
+                target_files
+            )
             
-            if not coder_result["success"]:
+            if not multi_agent_result["success"]:
                 # 更新 CODING 阶段状态
                 coding_stage.status = StageStatus.FAILED
-                coding_stage.output_data = {"error": coder_result["error"]}
+                coding_stage.output_data = {
+                    "error": multi_agent_result["error"],
+                    "agent_outputs": multi_agent_result.get("output", {}).get("agent_outputs", {})
+                }
                 coding_stage.completed_at = datetime.utcnow()
                 session.add(coding_stage)
                 
@@ -862,12 +903,16 @@ class PipelineService:
                 return {
                     "success": False,
                     "status": PipelineStatus.FAILED.value,
-                    "message": f"CoderAgent failed: {coder_result['error']}",
+                    "message": f"Multi-agent execution failed: {multi_agent_result['error']}",
                     "git_branch": git_branch
                 }
             
-            # 6. 应用代码变更
-            generated_files = coder_result["output"]["files"]
+            # 获取合并后的输出
+            combined_output = multi_agent_result["output"]
+            print(f"[PipelineService] 多 Agent 协作完成 - 生成 {len(combined_output.get('files', []))} 个文件")
+            
+            # 6. 应用代码变更（包括代码和测试文件）
+            generated_files = combined_output["files"]
             changes_dict = {}
             for file_change in generated_files:
                 changes_dict[file_change["file_path"]] = file_change["content"]
@@ -910,7 +955,7 @@ class PipelineService:
                 git_service.add_files()
                 
                 if git_service.has_changes():
-                    commit_message = f"feat(pipeline-{pipeline_id}): {coder_result['output']['summary'][:100]}"
+                    commit_message = f"feat(pipeline-{pipeline_id}): {combined_output.get('summary', '代码和测试生成')[:100]}"
                     git_service.commit_changes(commit_message)
                     commit_hash = git_service.get_last_commit_hash()
             
@@ -925,7 +970,7 @@ class PipelineService:
             # 9. 生成 PR 描述
             pr_description = await cls._generate_pr_description(
                 pipeline_id=pipeline_id,
-                coder_output=coder_result["output"],
+                multi_agent_output=combined_output,
                 execution_summary=execution_result.summary,
                 git_service=git_service
             )
@@ -952,12 +997,16 @@ class PipelineService:
             # 11. 更新 CODING 阶段状态
             coding_stage.status = StageStatus.SUCCESS
             coding_stage.output_data = {
-                "coder_output": coder_result["output"],
+                "multi_agent_output": combined_output,
+                "code_agent_log": combined_output.get("agent_outputs", {}).get("coder"),
+                "test_agent_log": combined_output.get("agent_outputs", {}).get("tester"),
                 "execution_summary": execution_result.summary,
                 "git_branch": git_branch,
                 "commit_hash": commit_hash,
                 "pr_url": pr_url,
-                "pr_created": pr_result.success
+                "pr_created": pr_result.success,
+                "tests_included": combined_output.get("tests_included", False),
+                "coverage_targets": combined_output.get("coverage_targets", [])
             }
             coding_stage.completed_at = datetime.utcnow()
             session.add(coding_stage)
