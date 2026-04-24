@@ -3,6 +3,11 @@ Git 集成服务
 业务逻辑层 - 封装基础 Git 操作
 
 原则：以跳过验证为耻。每个 Git 操作后必须检查返回码。
+
+重构说明：
+- 所有路径操作基于 settings.TARGET_PROJECT_PATH
+- 实现平台代码与 AI 操作目标代码的解耦
+- push_branch 前强制锁定远程地址
 """
 
 import os
@@ -10,6 +15,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from app.core.config import settings
 
 
 @dataclass
@@ -36,6 +43,9 @@ class GitProviderService:
     3. 提供安全的代码库操作接口
     
     原则：以跳过验证为耻
+    
+    重要：所有操作基于 settings.TARGET_PROJECT_PATH
+    实现平台代码与 AI 操作目标代码的解耦
     """
     
     def __init__(self, repo_path: Optional[str] = None):
@@ -43,17 +53,38 @@ class GitProviderService:
         初始化 Git 服务
         
         Args:
-            repo_path: 仓库路径，默认使用当前工作目录
+            repo_path: 仓库路径，默认使用 settings.TARGET_PROJECT_PATH
         """
         if repo_path:
             self.repo_path = Path(repo_path).resolve()
         else:
-            # 默认使用项目根目录
-            self.repo_path = Path(__file__).parent.parent.parent.parent.resolve()
+            # 从配置获取目标项目路径
+            target_path = settings.TARGET_PROJECT_PATH
+            
+            if not target_path:
+                raise GitProviderError(
+                    "TARGET_PROJECT_PATH 未配置。\n"
+                    "请在 .env 中设置 TARGET_PROJECT_PATH=workspace/your-repo\n"
+                    "并确保目录下已 clone 目标仓库。"
+                )
+            
+            # 解析路径
+            target_path_obj = Path(target_path)
+            if not target_path_obj.is_absolute():
+                # 基于 backend 父目录解析
+                backend_dir = Path(__file__).parent.parent.parent
+                project_root = backend_dir.parent
+                target_path_obj = project_root / target_path
+            
+            self.repo_path = target_path_obj.resolve()
         
         # 验证是 Git 仓库
         if not (self.repo_path / ".git").exists():
-            raise GitProviderError(f"{self.repo_path} 不是 Git 仓库")
+            raise GitProviderError(
+                f"{self.repo_path} 不是 Git 仓库。\n"
+                f"请先在 workspace 目录下 clone 目标仓库：\n"
+                f"  git clone https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git {settings.TARGET_PROJECT_PATH}"
+            )
     
     def _run_git_command(
         self,
@@ -285,9 +316,46 @@ class GitProviderService:
         result = self._run_git_command(args)
         return result.stdout
     
+    def _ensure_remote_url(self) -> bool:
+        """
+        确保远程仓库 URL 正确设置
+        
+        使用 GITHUB_TOKEN 设置远程地址，确保推送到正确的仓库
+        
+        Returns:
+            bool: 是否成功
+        """
+        token = settings.GITHUB_TOKEN
+        owner = settings.GITHUB_OWNER
+        repo = settings.GITHUB_REPO
+        
+        if not all([token, owner, repo]):
+            print("[GitProviderService] 警告: GitHub 配置不完整，无法锁定远程地址")
+            return False
+        
+        # 构建带 Token 的远程 URL
+        remote_url = f"https://{token}@github.com/{owner}/{repo}.git"
+        
+        try:
+            # 检查当前远程地址
+            result = self._run_git_command(["remote", "get-url", "origin"], check=False)
+            current_url = result.stdout.strip()
+            
+            # 如果当前 URL 不包含 token，则更新
+            if token not in current_url:
+                print(f"[GitProviderService] 锁定远程地址到: {owner}/{repo}")
+                self._run_git_command(["remote", "set-url", "origin", remote_url])
+            
+            return True
+        except Exception as e:
+            print(f"[GitProviderService] 设置远程地址失败: {e}")
+            return False
+    
     def push_branch(self, branch_name: str, remote: str = "origin") -> GitResult:
         """
         推送分支到远程
+        
+        推送前会强制锁定远程地址到 GITHUB_OWNER/GITHUB_REPO
         
         Args:
             branch_name: 分支名
@@ -296,6 +364,10 @@ class GitProviderService:
         Returns:
             GitResult: 操作结果
         """
+        # 首先锁定远程地址
+        self._ensure_remote_url()
+        
+        # 执行推送
         return self._run_git_command(
             ["push", "-u", remote, branch_name],
             check=False  # 允许失败（可能没有远程）

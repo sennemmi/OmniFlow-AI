@@ -19,6 +19,7 @@ from app.models.pipeline import (
 from app.service.project import ProjectService
 from app.service.git_provider import GitProviderService, GitProviderError
 from app.service.code_executor import CodeExecutorService
+from app.service.platform_provider import GitHubProviderService, PullRequestResult
 
 
 class PipelineService:
@@ -618,6 +619,127 @@ class PipelineService:
             await session.rollback()
     
     @classmethod
+    async def _generate_pr_description(
+        cls,
+        pipeline_id: int,
+        coder_output: Dict[str, Any],
+        execution_summary: Dict[str, Any],
+        git_service: GitProviderService
+    ) -> str:
+        """
+        生成语义化的 PR 描述
+        
+        包含：
+        1. 修改了哪些文件
+        2. 核心逻辑变动
+        3. 测试建议
+        
+        Args:
+            pipeline_id: Pipeline ID
+            coder_output: CoderAgent 输出
+            execution_summary: 代码执行摘要
+            git_service: Git 服务实例
+            
+        Returns:
+            str: PR 描述文本
+        """
+        # 获取文件变更列表
+        files_changed = []
+        if "files" in coder_output:
+            for file_change in coder_output["files"]:
+                files_changed.append({
+                    "path": file_change.get("file_path", ""),
+                    "type": file_change.get("change_type", "modify"),
+                    "description": file_change.get("description", "")
+                })
+        
+        # 获取 diff 统计
+        diff_stat = git_service.create_commit_summary()
+        
+        # 构建 PR 描述
+        lines = [
+            f"## OmniFlowAI 自动生成的 PR",
+            "",
+            f"**Pipeline ID**: #{pipeline_id}",
+            "",
+            "### 变更摘要",
+            f"{coder_output.get('summary', '无描述')}",
+            "",
+            "### 修改的文件",
+        ]
+        
+        # 添加文件列表
+        if files_changed:
+            for f in files_changed:
+                type_emoji = {"add": "➕", "modify": "📝", "delete": "🗑️"}.get(f["type"], "📝")
+                lines.append(f"- {type_emoji} `{f['path']}` - {f['description'] or '代码变更'}")
+        else:
+            lines.append("- 无文件变更记录")
+        
+        # 添加统计信息
+        lines.extend([
+            "",
+            "### 变更统计",
+            f"- 成功写入: {execution_summary.get('success', 0)} 个文件",
+            f"- 失败: {execution_summary.get('failed', 0)} 个文件",
+            f"- 总计: {execution_summary.get('total', 0)} 个文件",
+        ])
+        
+        # 添加测试建议
+        tests_included = coder_output.get("tests_included", False)
+        dependencies = coder_output.get("dependencies_added", [])
+        
+        lines.extend([
+            "",
+            "### 测试建议",
+        ])
+        
+        if tests_included:
+            lines.append("✅ 本次变更已包含测试代码，请运行测试套件验证：")
+            lines.append("```bash")
+            lines.append("# 运行所有测试")
+            lines.append("pytest")
+            lines.append("```")
+        else:
+            lines.append("⚠️ 本次变更未包含测试代码，建议进行以下验证：")
+            lines.append("1. 手动测试相关功能")
+            lines.append("2. 检查边界条件处理")
+            lines.append("3. 验证错误处理逻辑")
+        
+        # 添加依赖变更提示
+        if dependencies:
+            lines.extend([
+                "",
+                "### 新增依赖",
+                "以下依赖需要安装：",
+            ])
+            for dep in dependencies:
+                lines.append(f"- `{dep}`")
+            lines.extend([
+                "",
+                "```bash",
+                "# 安装依赖",
+                f"pip install {' '.join(dependencies)}",
+                "```"
+            ])
+        
+        # 添加审查清单
+        lines.extend([
+            "",
+            "---",
+            "",
+            "### 审查清单",
+            "- [ ] 代码符合项目规范",
+            "- [ ] 功能符合需求描述",
+            "- [ ] 错误处理完善",
+            "- [ ] 无安全隐患",
+            "",
+            "*此 PR 由 OmniFlowAI 自动生成* 🤖"
+        ])
+        
+        return "\n".join(lines)
+    
+    @classmethod
     async def _trigger_coding_phase(
         cls,
         pipeline_id: int,
@@ -631,7 +753,9 @@ class PipelineService:
         2. 运行 CoderAgent 生成代码
         3. 调用 CodeExecutorService 写入文件
         4. 自动 git commit
-        5. 将 Pipeline 状态设为 SUCCESS
+        5. 执行 git push
+        6. 调用 GitHubProviderService 创建 PR
+        7. 将 Pipeline 状态设为 SUCCESS
         
         Args:
             pipeline_id: Pipeline ID
@@ -644,6 +768,7 @@ class PipelineService:
         
         git_branch = None
         commit_hash = None
+        pr_url = None
         
         try:
             # 1. 创建 Git 分支
@@ -659,7 +784,23 @@ class PipelineService:
                 else:
                     raise
             
-            # 2. 获取 DESIGN 阶段的输出
+            # 2. 获取 Pipeline 和 DESIGN 阶段信息
+            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
+            result = await session.execute(statement)
+            pipeline = result.scalar_one_or_none()
+            
+            if not pipeline:
+                return {
+                    "success": False,
+                    "status": PipelineStatus.FAILED.value,
+                    "message": "Pipeline not found",
+                    "git_branch": git_branch
+                }
+            
+            # 获取原始需求描述（用于 PR 标题）
+            requirement_summary = pipeline.description[:80] if pipeline.description else f"Pipeline #{pipeline_id}"
+            
+            # 3. 获取 DESIGN 阶段的输出
             statement = select(PipelineStage).where(
                 PipelineStage.pipeline_id == pipeline_id,
                 PipelineStage.name == StageName.DESIGN
@@ -677,7 +818,7 @@ class PipelineService:
             
             design_output = design_stage.output_data
             
-            # 3. 创建 CODING 阶段
+            # 4. 创建 CODING 阶段
             coding_stage = PipelineStage(
                 pipeline_id=pipeline_id,
                 name=StageName.CODING,
@@ -687,7 +828,7 @@ class PipelineService:
             session.add(coding_stage)
             await session.commit()
             
-            # 4. 读取目标文件当前内容
+            # 5. 读取目标文件当前内容
             code_executor = CodeExecutorService()
             target_files = {}
             
@@ -700,7 +841,7 @@ class PipelineService:
                         if content:
                             target_files[file_path] = content
             
-            # 5. 调用 CoderAgent 生成代码
+            # 6. 调用 CoderAgent 生成代码
             coder_result = await coder_agent.generate_code(design_output, target_files)
             
             if not coder_result["success"]:
@@ -773,18 +914,55 @@ class PipelineService:
                     git_service.commit_changes(commit_message)
                     commit_hash = git_service.get_last_commit_hash()
             
-            # 8. 更新 CODING 阶段状态
+            # 8. 推送分支到远程
+            print(f"[PipelineService] 推送分支: {git_branch}")
+            push_result = git_service.push_branch(git_branch)
+            
+            if not push_result.success:
+                print(f"[PipelineService] 推送分支警告: {push_result.stderr}")
+                # 推送失败不阻断流程，继续尝试创建 PR
+            
+            # 9. 生成 PR 描述
+            pr_description = await cls._generate_pr_description(
+                pipeline_id=pipeline_id,
+                coder_output=coder_result["output"],
+                execution_summary=execution_result.summary,
+                git_service=git_service
+            )
+            
+            # 10. 创建 Pull Request
+            # PR 标题格式: OmniFlowAI: ${requirement_summary}
+            pr_title = f"OmniFlowAI: {requirement_summary}"
+            
+            async with GitHubProviderService() as github_service:
+                pr_result = await github_service.create_pull_request(
+                    head_branch=git_branch,
+                    title=pr_title,
+                    body=pr_description,
+                    base_branch="main"
+                )
+            
+            if pr_result.success:
+                pr_url = pr_result.pr_url
+                print(f"[PipelineService] PR 创建成功: {pr_url}")
+            else:
+                print(f"[PipelineService] PR 创建失败: {pr_result.error}")
+                # PR 创建失败不阻断流程，继续完成 Pipeline
+            
+            # 11. 更新 CODING 阶段状态
             coding_stage.status = StageStatus.SUCCESS
             coding_stage.output_data = {
                 "coder_output": coder_result["output"],
                 "execution_summary": execution_result.summary,
                 "git_branch": git_branch,
-                "commit_hash": commit_hash
+                "commit_hash": commit_hash,
+                "pr_url": pr_url,
+                "pr_created": pr_result.success
             }
             coding_stage.completed_at = datetime.utcnow()
             session.add(coding_stage)
             
-            # 9. 更新 Pipeline 状态为 SUCCESS
+            # 12. 更新 Pipeline 状态为 SUCCESS
             statement = select(Pipeline).where(Pipeline.id == pipeline_id)
             result = await session.execute(statement)
             pipeline = result.scalar_one_or_none()
@@ -799,6 +977,7 @@ class PipelineService:
                 "message": "Coding phase completed successfully",
                 "git_branch": git_branch,
                 "commit_hash": commit_hash,
+                "pr_url": pr_url,
                 "files_changed": execution_result.summary
             }
             

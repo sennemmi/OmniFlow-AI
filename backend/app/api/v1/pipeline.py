@@ -139,10 +139,12 @@ async def get_pipeline_status(
             if coding_stage and coding_stage.output_data:
                 output_data = coding_stage.output_data
                 
-                # 添加 Git 分支和提交信息
+                # 添加 Git 分支、提交信息和 PR 链接
                 response_data["delivery"] = {
                     "git_branch": output_data.get("git_branch"),
                     "commit_hash": output_data.get("commit_hash"),
+                    "pr_url": output_data.get("pr_url"),
+                    "pr_created": output_data.get("pr_created", False),
                     "summary": output_data.get("coder_output", {}).get("summary", ""),
                     "files_changed": output_data.get("execution_summary", {})
                 }

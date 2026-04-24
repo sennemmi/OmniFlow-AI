@@ -1,12 +1,18 @@
 """
 项目上下文服务
 业务逻辑层 - 提供项目文件树等上下文信息
+
+重构说明：
+- 所有路径操作基于 settings.TARGET_PROJECT_PATH
+- 实现平台代码与 AI 操作目标代码的解耦
 """
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+
+from app.core.config import settings
 
 
 @dataclass
@@ -27,6 +33,9 @@ class ProjectService:
     - 项目元数据
     
     遵循"以认真查询为荣"原则，让 Agent 了解工作环境
+    
+    重要：所有路径操作基于 settings.TARGET_PROJECT_PATH
+    实现平台代码与 AI 操作目标代码的解耦
     """
     
     # 默认跳过的目录和文件模式
@@ -206,12 +215,57 @@ class ProjectService:
 # 便捷函数
 def get_current_project_tree(max_depth: int = 5) -> Optional[FileNode]:
     """
-    获取当前工作目录的文件树
+    获取目标项目的文件树
+    
+    基于 settings.TARGET_PROJECT_PATH 获取 AI 操作的目标项目文件树
+    实现平台代码与目标代码的解耦
     
     Returns:
-        FileNode: 当前项目的文件树根节点
+        FileNode: 目标项目的文件树根节点，未配置返回 None
     """
-    # 获取 backend 的父目录（项目根目录）
-    current_file = Path(__file__)
-    project_root = current_file.parent.parent.parent.parent
-    return ProjectService.get_file_tree(str(project_root), max_depth=max_depth)
+    # 从配置获取目标项目路径
+    target_path = settings.TARGET_PROJECT_PATH
+    
+    if not target_path:
+        # 未配置目标项目路径，返回 None
+        print("[ProjectService] 警告: TARGET_PROJECT_PATH 未配置")
+        return None
+    
+    # 如果是相对路径，基于 backend 父目录解析
+    target_path_obj = Path(target_path)
+    if not target_path_obj.is_absolute():
+        # 获取 backend 的父目录（项目根目录）
+        current_file = Path(__file__)
+        project_root = current_file.parent.parent.parent.parent
+        target_path_obj = project_root / target_path
+    
+    target_path_str = str(target_path_obj.resolve())
+    
+    # 验证路径存在
+    if not target_path_obj.exists():
+        print(f"[ProjectService] 警告: 目标项目路径不存在: {target_path_str}")
+        return None
+    
+    return ProjectService.get_file_tree(target_path_str, max_depth=max_depth)
+
+
+def get_target_project_path() -> Optional[Path]:
+    """
+    获取目标项目的绝对路径
+    
+    Returns:
+        Optional[Path]: 目标项目路径，未配置返回 None
+    """
+    target_path = settings.TARGET_PROJECT_PATH
+    
+    if not target_path:
+        return None
+    
+    target_path_obj = Path(target_path)
+    if not target_path_obj.is_absolute():
+        # 获取 backend 的父目录（项目根目录）
+        current_file = Path(__file__)
+        project_root = current_file.parent.parent.parent.parent
+        target_path_obj = project_root / target_path
+    
+    return target_path_obj.resolve()

@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     # 兼容旧版环境变量名
     DEFAULT_LLM_MODEL: str = ""
     
+    # ============================================
+    # AI 目标项目配置（平台与目标项目解耦）
+    # ============================================
+    
+    # AI 操作的目标项目路径（workspace 目录下）
+    # 例如: workspace/feishutemp
+    TARGET_PROJECT_PATH: str = ""
+    
+    # GitHub 配置（用于远程推送）
+    GITHUB_TOKEN: str = ""
+    GITHUB_OWNER: str = ""
+    GITHUB_REPO: str = ""
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

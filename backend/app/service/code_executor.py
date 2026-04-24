@@ -5,6 +5,10 @@
 原则：
 1. 在修改前自动备份原文件（防止 AI 改坏代码）
 2. 简单的冲突检测：如果目标文件不存在，主动报错
+
+重构说明：
+- 所有路径操作基于 settings.TARGET_PROJECT_PATH
+- 实现平台代码与 AI 操作目标代码的解耦
 """
 
 import hashlib
@@ -13,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+
+from app.core.config import settings
 
 
 @dataclass
@@ -54,6 +60,9 @@ class CodeExecutorService:
     - 修改前必须备份
     - 文件不存在时报错（不自动创建目录）
     - 提供回滚能力
+    
+    重要：所有操作基于 settings.TARGET_PROJECT_PATH
+    实现平台代码与 AI 操作目标代码的解耦
     """
     
     BACKUP_DIR_NAME = ".devflow_backups"
@@ -64,15 +73,38 @@ class CodeExecutorService:
         初始化代码执行服务
         
         Args:
-            project_root: 项目根目录，默认使用 backend 的父目录
+            project_root: 项目根目录，默认使用 settings.TARGET_PROJECT_PATH
         """
         if project_root:
             self.project_root = Path(project_root).resolve()
         else:
-            # 默认使用项目根目录
-            self.project_root = Path(__file__).parent.parent.parent.parent.resolve()
+            # 从配置获取目标项目路径
+            target_path = settings.TARGET_PROJECT_PATH
+            
+            if not target_path:
+                raise CodeExecutorError(
+                    "TARGET_PROJECT_PATH 未配置。\n"
+                    "请在 .env 中设置 TARGET_PROJECT_PATH=workspace/your-repo"
+                )
+            
+            # 解析路径
+            target_path_obj = Path(target_path)
+            if not target_path_obj.is_absolute():
+                # 基于 backend 父目录解析
+                backend_dir = Path(__file__).parent.parent.parent
+                project_root_path = backend_dir.parent
+                target_path_obj = project_root_path / target_path
+            
+            self.project_root = target_path_obj.resolve()
+            
+            # 验证路径存在
+            if not self.project_root.exists():
+                raise CodeExecutorError(
+                    f"目标项目路径不存在: {self.project_root}\n"
+                    f"请确保目录已创建: {settings.TARGET_PROJECT_PATH}"
+                )
         
-        # 备份目录
+        # 备份目录（在目标项目内）
         self.backup_dir = self.project_root / self.BACKUP_DIR_NAME
         self.backup_dir.mkdir(exist_ok=True)
     

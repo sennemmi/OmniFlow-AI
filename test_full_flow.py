@@ -1,105 +1,113 @@
 import requests
 import time
 import json
+import sys
 
+# 配置
 BASE_URL = "http://localhost:8000/api/v1"
+# 更有挑战性的需求：要求跨文件操作
+REQUIREMENT = """
+实现一个系统信息查询功能：
+1. 在 models/system.py 定义 SystemInfo 模型 (包含 uptime, os_version, python_version)。
+2. 在 service/system_service.py 实现获取这些信息的逻辑。
+3. 在 api/v1/system_info.py 暴露 GET /system/info 接口。
+4. 在 main.py 中注册这个新路由。
+必须严格遵守 api -> service -> models 的分层架构。
+"""
 
-def wait_for_pause(pipeline_id):
+def print_divider(title):
+    print(f"\n{'='*20} {title} {'='*20}")
+
+def wait_for_pipeline_state(pipeline_id, target_states=["paused", "success", "failed"]):
+    """持续轮询直到进入目标状态"""
     while True:
-        resp = requests.get(f"{BASE_URL}/pipeline/{pipeline_id}/status").json()
-        if not resp.get("success"):
-            print(f"❌ 查询失败: {resp.get('error')}")
-            return None
-        
-        data = resp.get("data")
-        if not data:
-            print("❌ 无数据返回")
-            return None
-        
-        status = data.get("status")
-        print(f"当前状态: {status}...")
-        
-        if status == "paused":
-            return data
-        if status == "failed":
-            print("❌ Pipeline 失败:", json.dumps(data, indent=2, ensure_ascii=False))
-            return None
-        if status == "success":
-            return data
-        time.sleep(3)
+        try:
+            resp = requests.get(f"{BASE_URL}/pipeline/{pipeline_id}/status").json()
+            if not resp.get("success"):
+                print(f"❌ API 报错: {resp.get('error')}")
+                return None
+            
+            data = resp.get("data")
+            status = data.get("status")
+            current_stage = data.get("current_stage")
+            
+            # 打印进度条效果
+            sys.stdout.write(f"\r[Pipeline ID: {pipeline_id}] 阶段: {current_stage or 'INIT'} | 状态: {status}...")
+            sys.stdout.flush()
 
-def get_last_stage_output(data):
-    """获取最后一个阶段的输出"""
-    stages = data.get("stages", [])
-    if not stages:
-        return None
-    return stages[-1].get("output_data")
+            if status in target_states:
+                print("\n") # 换行
+                return data
+            
+            time.sleep(3)
+        except Exception as e:
+            print(f"\n❌ 请求异常: {e}")
+            return None
 
-# 1. 创建需求
-print("🚀 1. 提交需求...")
-req = {"requirement": "在 api/v1 下新增一个 /system/stats 接口，返回内存和 CPU 占用率，需要遵循 api -> service -> models 的分层规范。"}
-res = requests.post(f"{BASE_URL}/pipeline/create", json=req).json()
+def get_stage_output(data, stage_name):
+    """提取特定阶段的输出数据"""
+    for stage in data.get("stages", []):
+        if stage["name"] == stage_name:
+            return stage.get("output_data")
+    return None
+
+# --- 执行开始 ---
+print_divider("OmniFlowAI 全流程端到端测试")
+
+# 1. 提交需求
+print(f"🚀 步骤 1: 提交开发需求...")
+res = requests.post(f"{BASE_URL}/pipeline/create", json={"requirement": REQUIREMENT}).json()
 
 if not res.get("success"):
-    print(f"❌ 创建 Pipeline 失败: {res.get('error')}")
+    print(f"❌ 创建失败: {res.get('error')}")
     exit(1)
 
 p_id = res["data"]["pipeline_id"]
 print(f"✅ Pipeline 已创建: ID {p_id}")
 
-# 2. 等待需求分析完成并审批
-print("\n🔍 2. 等待架构师分析完成...")
-data = wait_for_pause(p_id)
-if not data:
-    print("❌ 架构师分析阶段失败")
-    exit(1)
+# 2. 架构分析阶段
+print_divider("阶段 1: 架构师需求拆解 (REQUIREMENT)")
+data = wait_for_pipeline_state(p_id)
+output = get_stage_output(data, "REQUIREMENT")
 
-output = get_last_stage_output(data)
 if output:
-    print(f"💡 架构师方案: {json.dumps(output, indent=2, ensure_ascii=False)}")
-else:
-    print("⚠️ 架构师方案为空")
+    print(f"🤖 AI 拆解方案:\n{json.dumps(output, indent=2, ensure_ascii=False)}")
+    print(f"建议修改文件: {output.get('affected_files', [])}")
 
-input("确认方案无误？按回车进行 [Approve]...")
-approve_res = requests.post(f"{BASE_URL}/pipeline/{p_id}/approve", json={"notes": "架构拆解合理，同意进入设计阶段"}).json()
-if not approve_res.get("success"):
-    print(f"❌ 审批失败: {approve_res.get('error')}")
-    exit(1)
+input("\n👉 请 Review 架构方案。按回车 [Approve] 继续...")
+requests.post(f"{BASE_URL}/pipeline/{p_id}/approve", json={"notes": "架构方案符合八荣八耻规范"})
 
-# 3. 等待技术设计完成并审批
-print("\n🎨 3. 等待设计师输出技术方案...")
-data = wait_for_pause(p_id)
-if not data:
-    print("❌ 设计师阶段失败")
-    exit(1)
+# 3. 技术设计阶段
+print_divider("阶段 2: 设计师详细设计 (DESIGN)")
+data = wait_for_pipeline_state(p_id)
+output = get_stage_output(data, "DESIGN")
 
-output = get_last_stage_output(data)
 if output:
-    print(f"💡 设计师方案: {json.dumps(output, indent=2, ensure_ascii=False)}")
-else:
-    print("⚠️ 设计师方案为空")
+    print(f"🎨 AI 详细设计:\n{json.dumps(output, indent=2, ensure_ascii=False)}")
+    print(f"设计逻辑: {output.get('logic_flow', '无')}")
 
-input("确认技术细节无误？按回车进行 [Approve] 启动编码...")
-approve_res = requests.post(f"{BASE_URL}/pipeline/{p_id}/approve", json={"notes": "设计符合规范，开始编码"}).json()
-if not approve_res.get("success"):
-    print(f"❌ 审批失败: {approve_res.get('error')}")
-    exit(1)
+input("\n👉 请 Review 技术细节。按回车 [Approve] 启动 AI 自动编码...")
+requests.post(f"{BASE_URL}/pipeline/{p_id}/approve", json={"notes": "设计详尽，同意执行代码变更"})
 
-# 4. 等待编码完成
-print("\n⌨️ 4. Coder 正在疯狂码字中...")
-final_data = wait_for_pause(p_id)
-
-if not final_data:
-    print("❌ 编码阶段失败")
-    exit(1)
+# 4. 自动编码与交付阶段
+print_divider("阶段 3: 编码、推送与 PR (CODING)")
+print("⏳ Coder Agent 正在生成代码并尝试 Push 到 GitHub...")
+final_data = wait_for_pipeline_state(p_id, target_states=["success", "failed"])
 
 if final_data.get("status") == "success":
-    print("\n🎉 任务圆满完成！")
+    print_divider("🎉 流程全部完成！")
     delivery = final_data.get("delivery", {})
-    print(f"📦 交付分支: {delivery.get('git_branch')}")
+    print(f"✅ 状态: 成功 (SUCCESS)")
+    print(f"🌿 Git 分支: {delivery.get('git_branch')}")
+    print(f"🔗 Commit Hash: {delivery.get('commit_hash')}")
     print(f"📝 变更摘要: {delivery.get('summary')}")
-    print("-" * 50)
-    print("请去查看代码库变更，并切到对应分支运行测试！")
+    
+    if delivery.get("diff_summary"):
+        print("\n--- 代码变更摘要 (Diff) ---")
+        print(delivery.get("diff_summary")[:1000] + "...")
+    
+    print("\n🚀 [下一步]: 请前往 GitHub 仓库查看 PR 链接！")
+    print(f"仓库地址: https://github.com/sennemmi/feishutemp/pulls")
 else:
-    print(f"❌ Pipeline 最终状态: {final_data.get('status')}")
+    print_divider("❌ 流程失败")
     print(json.dumps(final_data, indent=2, ensure_ascii=False))

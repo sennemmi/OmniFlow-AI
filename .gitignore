@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# AI 操作的目标代码目录（防止误提交到平台仓库）
+workspace/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -65,3 +68,7 @@ frontend/build/
 .coverage
 htmlcov/
 .pytest_cache/
+
+repomix-output.xml
+.devflow_backups/
+.trae/
