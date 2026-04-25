@@ -41,5 +41,9 @@ async def init_db():
     async with engine.begin() as conn:
         # 导入所有模型以确保它们被注册
         from app.models.pipeline import Pipeline, PipelineStage
-        
+
         await conn.run_sync(SQLModel.metadata.create_all)
+
+    # 设置 SQLAlchemy 慢查询监听
+    from app.core.logging import setup_sqlalchemy_logging
+    setup_sqlalchemy_logging(engine)

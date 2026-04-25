@@ -13,12 +13,14 @@
 
 import hashlib
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+from datetime import datetime
+
 from app.core.config import settings
+from app.core.timezone import now_str
 
 
 @dataclass
@@ -120,7 +122,7 @@ class CodeExecutorService:
         """
         # 使用相对路径 + 时间戳 + hash 生成备份文件名
         rel_path = file_path.relative_to(self.project_root)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = now_str("%Y%m%d_%H%M%S")
         path_hash = hashlib.md5(str(rel_path).encode()).hexdigest()[:8]
         
         backup_name = f"{rel_path.name}.{timestamp}.{path_hash}.bak"

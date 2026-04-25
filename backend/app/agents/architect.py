@@ -26,6 +26,7 @@ class ArchitectState(TypedDict):
     """架构师 Agent 状态"""
     requirement: str
     file_tree: Dict[str, Any]
+    element_context: Optional[Dict[str, Any]]
     output: Optional[Dict[str, Any]]
     error: Optional[str]
     retry_count: int
@@ -126,7 +127,8 @@ class ArchitectAgent:
             # 构建用户提示
             user_prompt = self._build_prompt(
                 state["requirement"],
-                state["file_tree"]
+                state["file_tree"],
+                state.get("element_context")
             )
             
             # 调用 LLM
@@ -189,10 +191,22 @@ class ArchitectAgent:
         else:
             return "failed"
     
-    def _build_prompt(self, requirement: str, file_tree: Dict[str, Any]) -> str:
+    def _build_prompt(self, requirement: str, file_tree: Dict[str, Any], element_context: Optional[Dict[str, Any]] = None) -> str:
         """构建 LLM 提示"""
         
         file_tree_str = json.dumps(file_tree, indent=2, ensure_ascii=False)
+        
+        # 构建 element_context 部分
+        element_context_str = ""
+        if element_context:
+            element_context_str = f"""
+【页面元素上下文】
+- HTML: {element_context.get('html', 'N/A')}
+- XPath: {element_context.get('xpath', 'N/A')}
+- 数据源: {element_context.get('data_source', 'N/A')}
+
+请根据以上元素上下文进行精准修复。
+"""
         
         return f"""【用户需求】
 {requirement}
@@ -201,6 +215,7 @@ class ArchitectAgent:
 ```
 {file_tree_str}
 ```
+{element_context_str}
 
 请根据以上信息，输出结构化的技术设计方案（JSON 格式）。
 """
@@ -279,13 +294,14 @@ class ArchitectAgent:
         
         return json.loads(json_str)
     
-    async def analyze(self, requirement: str, file_tree: Dict[str, Any]) -> Dict[str, Any]:
+    async def analyze(self, requirement: str, file_tree: Dict[str, Any], element_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         分析需求并输出方案
         
         Args:
             requirement: 用户需求描述
             file_tree: 项目文件树字典
+            element_context: 页面元素上下文（可选）
             
         Returns:
             Dict: 包含分析结果或错误信息
@@ -293,6 +309,7 @@ class ArchitectAgent:
         initial_state: ArchitectState = {
             "requirement": requirement,
             "file_tree": file_tree,
+            "element_context": element_context,
             "output": None,
             "error": None,
             "retry_count": 0

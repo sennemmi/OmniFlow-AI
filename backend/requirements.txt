@@ -25,6 +25,8 @@ psutil>=5.9.0
 
 # Logging & Monitoring
 structlog==24.4.0
+python-json-logger==2.0.7      # 标准库 logging → JSON 格式
+rich==13.9.4                   # 开发环境彩色控制台输出
 
 # Testing
 pytest==8.3.3

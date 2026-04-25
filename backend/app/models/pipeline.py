@@ -9,6 +9,8 @@ from typing import List, Optional, Dict, Any
 
 from sqlmodel import SQLModel, Field, Relationship, Column, JSON
 
+from app.core.timezone import now
+
 
 class PipelineStatus(str, Enum):
     """Pipeline 状态枚举"""
@@ -23,6 +25,8 @@ class StageName(str, Enum):
     REQUIREMENT = "REQUIREMENT"
     DESIGN = "DESIGN"
     CODING = "CODING"
+    CODE_REVIEW = "CODE_REVIEW"
+    DELIVERY = "DELIVERY"
 
 
 class StageStatus(str, Enum):
@@ -35,6 +39,7 @@ class StageStatus(str, Enum):
 
 class PipelineBase(SQLModel):
     """Pipeline 基础模型"""
+    name: str = Field(default="", description="Pipeline 名称")
     description: str = Field(description="原始需求描述")
     status: PipelineStatus = Field(
         default=PipelineStatus.RUNNING,
@@ -55,8 +60,8 @@ class Pipeline(PipelineBase, table=True):
     __tablename__ = "pipelines"
     
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=now)
+    updated_at: datetime = Field(default_factory=now)
     
     # 关联的阶段
     stages: List["PipelineStage"] = Relationship(back_populates="pipeline")
@@ -86,7 +91,7 @@ class PipelineStage(PipelineStageBase, table=True):
     
     id: Optional[int] = Field(default=None, primary_key=True)
     pipeline_id: int = Field(foreign_key="pipelines.id")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=now)
     completed_at: Optional[datetime] = Field(default=None)
     
     # 关联的 Pipeline

@@ -3,24 +3,27 @@ Pipeline 业务服务
 业务逻辑层 - 协调 Pipeline 创建、Agent 调用和人工审批
 """
 
-from datetime import datetime
 from typing import Optional, Dict, Any
+from pathlib import Path
 
 from sqlalchemy.orm import selectinload
 from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlmodel import select
 
-from app.agents.architect import architect_agent
-from app.agents.designer import designer_agent
-from app.agents.coder import coder_agent
-from app.agents.multi_agent_coordinator import multi_agent_coordinator
+from app.core.config import settings
+from app.core.logging import info, op_logger
+from app.core.sse_log_buffer import push_log
 from app.models.pipeline import (
     Pipeline, PipelineRead, PipelineStatus,
     PipelineStage, StageName, StageStatus, PipelineStageRead
 )
-from app.service.project import ProjectService
-from app.service.git_provider import GitProviderService, GitProviderError
 from app.service.code_executor import CodeExecutorService
-from app.service.platform_provider import GitHubProviderService, PullRequestResult
+from app.service.git_provider import GitProviderService, GitProviderError
+from app.service.platform_provider import GitHubProviderService
+from app.service.workspace import workspace_context
+from app.service.workflow import WorkflowService
+from app.service.agent_coordinator import AgentCoordinatorService
+from app.service.pr_generator import PRGeneratorService
 
 
 class PipelineService:
@@ -29,34 +32,20 @@ class PipelineService:
     
     负责：
     1. Pipeline 的创建和管理
-    2. 协调 ArchitectAgent/DesignerAgent 分析需求
-    3. 管理 Pipeline 状态流转（含人工审批）
-    4. 实现"自动回归"思想（驳回后重新执行）
+    2. 协调 Agent 执行 - 委托给 AgentCoordinatorService
+    3. 管理 Pipeline 状态流转 - 委托给 WorkflowService
+    4. 代码交付 - 委托给 WorkspaceService 管理工作区
+    5. PR 生成 - 委托给 PRGeneratorService
     """
     
     @classmethod
-    async def create_pipeline(
+    async def create_pipeline_record(
         cls,
         requirement: str,
+        element_context: Optional[Dict[str, Any]],
         session: AsyncSession
     ) -> PipelineRead:
-        """
-        创建新的 Pipeline
-        
-        流程：
-        1. 保存 Pipeline 到数据库
-        2. 创建初始阶段（REQUIREMENT）
-        3. 异步触发 ArchitectAgent 分析
-        
-        Args:
-            requirement: 用户需求描述
-            session: 数据库会话
-            
-        Returns:
-            PipelineRead: 创建的 Pipeline 信息
-        """
-        from sqlmodel import select
-        
+        """创建 Pipeline 记录（仅创建，不触发分析）"""
         # 1. 创建 Pipeline
         pipeline = Pipeline(
             description=requirement,
@@ -64,7 +53,58 @@ class PipelineService:
             current_stage=StageName.REQUIREMENT
         )
         session.add(pipeline)
-        await session.flush()  # 获取 ID
+        await session.flush()
+
+        info("Pipeline 记录创建成功", pipeline_id=pipeline.id, status="RUNNING")
+
+        # 2. 创建 REQUIREMENT 阶段
+        stage = PipelineStage(
+            pipeline_id=pipeline.id,
+            name=StageName.REQUIREMENT,
+            status=StageStatus.RUNNING,
+            input_data={"requirement": requirement, "element_context": element_context}
+        )
+        session.add(stage)
+        await session.flush()
+
+        info("Pipeline 阶段创建成功", pipeline_id=pipeline.id, stage="REQUIREMENT")
+        op_logger.log_pipeline_create(
+            pipeline_id=pipeline.id,
+            description=requirement,
+            has_context=element_context is not None
+        )
+
+        # 3. 重新查询以获取完整数据
+        statement = select(Pipeline).where(Pipeline.id == pipeline.id).options(
+            selectinload(Pipeline.stages)
+        )
+        result = await session.execute(statement)
+        pipeline_with_stages = result.scalar_one()
+
+        return cls._build_pipeline_read(pipeline_with_stages)
+    
+    @classmethod
+    async def run_architect_task(
+        cls,
+        pipeline_id: int,
+        requirement: str,
+        element_context: Optional[Dict[str, Any]],
+        session: AsyncSession
+    ) -> None:
+        """后台任务：运行 ArchitectAgent 分析"""
+        await cls._trigger_architect_analysis(pipeline_id, requirement, element_context, session)
+    
+    @classmethod
+    async def create_pipeline(cls, requirement: str, session: AsyncSession) -> PipelineRead:
+        """创建新的 Pipeline（旧版同步方法，保留兼容性）"""
+        # 1. 创建 Pipeline
+        pipeline = Pipeline(
+            description=requirement,
+            status=PipelineStatus.RUNNING,
+            current_stage=StageName.REQUIREMENT
+        )
+        session.add(pipeline)
+        await session.flush()
         
         # 2. 创建 REQUIREMENT 阶段
         stage = PipelineStage(
@@ -76,43 +116,32 @@ class PipelineService:
         session.add(stage)
         await session.commit()
         
-        # 3. 重新查询以获取完整数据（包括 stages）
+        # 3. 触发 ArchitectAgent
+        await cls._trigger_architect_analysis(pipeline.id, requirement, None, session)
+        
+        # 4. 返回结果
         statement = select(Pipeline).where(Pipeline.id == pipeline.id).options(
             selectinload(Pipeline.stages)
         )
         result = await session.execute(statement)
         pipeline_with_stages = result.scalar_one()
-        
-        # 4. 异步触发 ArchitectAgent（这里先同步执行）
-        # TODO: 使用 Celery 或 BackgroundTasks 实现真正的异步
-        await cls._trigger_architect_analysis(pipeline.id, requirement, session)
-        
-        # 构建 PipelineRead 对象
         return cls._build_pipeline_read(pipeline_with_stages)
     
     @classmethod
     def _build_pipeline_read(cls, pipeline: Pipeline) -> PipelineRead:
-        """
-        将 Pipeline ORM 对象转换为 PipelineRead
-        
-        Args:
-            pipeline: Pipeline ORM 对象
-            
-        Returns:
-            PipelineRead: 读取模型
-        """
-        stages_read = []
-        if pipeline.stages:
-            for stage in pipeline.stages:
-                stages_read.append(PipelineStageRead(
-                    id=stage.id,
-                    name=stage.name,
-                    status=stage.status,
-                    input_data=stage.input_data,
-                    output_data=stage.output_data,
-                    created_at=stage.created_at,
-                    completed_at=stage.completed_at
-                ))
+        """将 Pipeline ORM 对象转换为 PipelineRead"""
+        stages_read = [
+            PipelineStageRead(
+                id=stage.id,
+                name=stage.name,
+                status=stage.status,
+                input_data=stage.input_data,
+                output_data=stage.output_data,
+                created_at=stage.created_at,
+                completed_at=stage.completed_at
+            )
+            for stage in (pipeline.stages or [])
+        ]
         
         return PipelineRead(
             id=pipeline.id,
@@ -124,122 +153,416 @@ class PipelineService:
             stages=stages_read if stages_read else None
         )
     
+    # ==================== Agent 触发方法（委托给 AgentCoordinatorService） ====================
+    
     @classmethod
     async def _trigger_architect_analysis(
         cls,
         pipeline_id: int,
         requirement: str,
+        element_context: Optional[Dict[str, Any]],
         session: AsyncSession
     ) -> None:
-        """
-        触发 ArchitectAgent 分析
-        
-        分析完成后，Pipeline 状态设为 PAUSED，等待人工审批
-        
-        Args:
-            pipeline_id: Pipeline ID
-            requirement: 需求描述
-            session: 数据库会话
-        """
-        from sqlmodel import select
-        
+        """触发 ArchitectAgent 分析"""
         try:
-            # 获取项目文件树
-            from app.service.project import get_current_project_tree
-            file_tree_node = get_current_project_tree(max_depth=4)
-            file_tree = ProjectService.file_tree_to_dict(file_tree_node) if file_tree_node else {}
-            
-            # 调用 ArchitectAgent
-            result = await architect_agent.analyze(requirement, file_tree)
-            
-            # 获取当前阶段
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.REQUIREMENT
+            result = await AgentCoordinatorService.run_architect_analysis(
+                pipeline_id, requirement, element_context, session
             )
-            result_query = await session.execute(statement)
-            stage = result_query.scalar_one_or_none()
             
-            if stage:
-                if result["success"]:
-                    stage.status = StageStatus.SUCCESS
-                    stage.output_data = result["output"]
-                else:
-                    stage.status = StageStatus.FAILED
-                    stage.output_data = {"error": result["error"]}
-                
-                stage.completed_at = datetime.utcnow()
-                session.add(stage)
-            
-            # 更新 Pipeline 状态为 PAUSED，等待人工审批
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            result_query = await session.execute(statement)
-            pipeline = result_query.scalar_one_or_none()
-            
+            # 更新 Pipeline 状态
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
             if pipeline:
                 if result["success"]:
-                    # 分析成功，设为 PAUSED 等待审批
-                    pipeline.status = PipelineStatus.PAUSED
+                    await WorkflowService.set_pipeline_paused(pipeline, session)
                 else:
-                    # 分析失败
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
+                    await WorkflowService.set_pipeline_failed(pipeline, session)
+                    from app.core.sse_log_buffer import remove_buffer
+                    remove_buffer(pipeline_id)
+
+        except Exception:
+            await session.rollback()
+            from app.core.sse_log_buffer import remove_buffer
+            remove_buffer(pipeline_id)
+            raise
+    
+    @classmethod
+    async def _trigger_designer_analysis(cls, pipeline_id: int, session: AsyncSession) -> None:
+        """触发 DesignerAgent 进行技术设计"""
+        try:
+            result = await AgentCoordinatorService.run_designer_analysis(pipeline_id, session)
+            
+            # 更新 Pipeline 状态
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                if result["success"]:
+                    await WorkflowService.set_pipeline_paused(pipeline, session)
+                else:
+                    await WorkflowService.set_pipeline_failed(pipeline, session)
+
+        except Exception:
+            await session.rollback()
+            raise
+    
+    @classmethod
+    async def _trigger_architect_analysis_with_feedback(
+        cls, pipeline_id: int, requirement: str, reason: str,
+        suggested_changes: Optional[str], session: AsyncSession
+    ) -> None:
+        """携带驳回反馈重新触发 ArchitectAgent"""
+        try:
+            result = await AgentCoordinatorService.run_architect_with_feedback(
+                pipeline_id, requirement, reason, suggested_changes, session
+            )
+            
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                if result["success"]:
+                    await WorkflowService.set_pipeline_paused(pipeline, session)
+                else:
+                    await WorkflowService.set_pipeline_failed(pipeline, session)
                 
-        except Exception as e:
-            # 记录错误但不抛出，避免影响 API 响应
-            print(f"Architect analysis failed for pipeline {pipeline_id}: {e}")
+        except Exception:
             await session.rollback()
     
     @classmethod
+    async def _trigger_designer_analysis_with_feedback(
+        cls, pipeline_id: int, reason: str,
+        suggested_changes: Optional[str], session: AsyncSession
+    ) -> None:
+        """携带驳回反馈重新触发 DesignerAgent"""
+        try:
+            result = await AgentCoordinatorService.run_designer_with_feedback(
+                pipeline_id, reason, suggested_changes, session
+            )
+            
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                if result["success"]:
+                    await WorkflowService.set_pipeline_paused(pipeline, session)
+                else:
+                    await WorkflowService.set_pipeline_failed(pipeline, session)
+                
+        except Exception:
+            await session.rollback()
+    
+    # ==================== 阶段触发方法 ====================
+    
+    @classmethod
+    async def _trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+        """触发 CODING 阶段 - 优化版：不长时间持有数据库连接"""
+        design_output = None
+        coding_stage_id = None
+        target_files = {}
+
+        try:
+            # 1. 获取 DESIGN 阶段输出（短暂持有连接）
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.DESIGN
+            )
+            result = await session.execute(statement)
+            design_stage = result.scalar_one_or_none()
+
+            if not design_stage or not design_stage.output_data:
+                return {"success": False, "status": PipelineStatus.FAILED.value, "message": "No design output found"}
+
+            design_output = design_stage.output_data
+
+            # 2. 创建 CODING 阶段（短暂持有连接）
+            coding_stage = await WorkflowService.create_stage(
+                pipeline_id=pipeline_id,
+                stage_name=StageName.CODING,
+                input_data=design_output,
+                session=session
+            )
+            coding_stage_id = coding_stage.id
+
+            # 3. 读取目标文件（文件操作，不需要数据库）
+            target_path = Path(settings.TARGET_PROJECT_PATH)
+            if not target_path.is_absolute():
+                backend_dir = Path(__file__).parent.parent.parent
+                target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
+
+            code_executor = CodeExecutorService(str(target_path))
+
+            if "function_changes" in design_output:
+                for change in design_output["function_changes"]:
+                    file_path = change.get("file", "")
+                    if file_path:
+                        content = code_executor.get_file_content(file_path)
+                        if content:
+                            target_files[file_path] = content
+
+            # 4. 提交当前事务并关闭连接（关键：释放数据库连接）
+            await session.commit()
+
+        except Exception as e:
+            await session.rollback()
+            await push_log(pipeline_id, "error", f"准备代码生成阶段失败: {str(e)}", stage="CODING")
+            return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Coding preparation failed: {str(e)}"}
+
+        # 5. 调用多 Agent 协调器（不持有数据库连接，避免阻塞）
+        # 注意：此时 session 已经提交，不持有数据库连接
+        multi_agent_result = await AgentCoordinatorService.run_multi_agent_coding(
+            pipeline_id, design_output, target_files, None  # 不传递 session
+        )
+
+        # 6. 重新获取连接，保存结果
+        try:
+            if not multi_agent_result["success"]:
+                # 重新获取 stage 并更新为失败
+                statement = select(PipelineStage).where(PipelineStage.id == coding_stage_id)
+                result = await session.execute(statement)
+                coding_stage = result.scalar_one_or_none()
+
+                if coding_stage:
+                    await WorkflowService.complete_stage(
+                        stage=coding_stage,
+                        output_data={"error": multi_agent_result["error"]},
+                        success=False,
+                        session=session
+                    )
+
+                pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+                if pipeline:
+                    await WorkflowService.set_pipeline_failed(pipeline, session)
+
+                from app.core.sse_log_buffer import remove_buffer
+                remove_buffer(pipeline_id)
+
+                await session.commit()
+                return {
+                    "success": False,
+                    "status": PipelineStatus.FAILED.value,
+                    "message": f"Multi-agent execution failed: {multi_agent_result['error']}"
+                }
+
+            # 7. 成功处理
+            combined_output = multi_agent_result["output"]
+            file_count = len(combined_output.get('files', []))
+            await push_log(pipeline_id, "info", f"代码生成完成，共 {file_count} 个文件", stage="CODING")
+
+            # 重新获取 stage 并更新为成功
+            statement = select(PipelineStage).where(PipelineStage.id == coding_stage_id)
+            result = await session.execute(statement)
+            coding_stage = result.scalar_one_or_none()
+
+            if coding_stage:
+                await WorkflowService.complete_stage(
+                    stage=coding_stage,
+                    output_data={
+                        "multi_agent_output": combined_output,
+                        "tests_included": combined_output.get("tests_included", False),
+                        "target_files": target_files
+                    },
+                    success=True,
+                    session=session
+                )
+
+            # 8. 创建 CODE_REVIEW 阶段
+            await WorkflowService.create_stage(
+                pipeline_id=pipeline_id,
+                stage_name=StageName.CODE_REVIEW,
+                input_data={"coding_output": combined_output, "target_files": target_files},
+                session=session
+            )
+
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                pipeline.current_stage = StageName.CODE_REVIEW
+                await WorkflowService.set_pipeline_paused(pipeline, session)
+
+            await push_log(pipeline_id, "info", "代码生成完成，等待人工审查", stage="CODE_REVIEW")
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "status": PipelineStatus.PAUSED.value,
+                "message": "Code generated successfully",
+                "files_count": file_count
+            }
+
+        except Exception as e:
+            await push_log(pipeline_id, "error", f"保存代码生成结果失败: {str(e)}", stage="CODING")
+            await session.rollback()
+            from app.core.sse_log_buffer import remove_buffer
+            remove_buffer(pipeline_id)
+            return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Coding save failed: {str(e)}"}
+    
+    @classmethod
+    async def _trigger_delivery_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+        """触发 DELIVERY 阶段（代码交付）"""
+        git_branch = None
+        commit_hash = None
+        pr_url = None
+        
+        try:
+            # 1. 获取 Pipeline 和 CODING 阶段信息
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if not pipeline:
+                return {"success": False, "status": PipelineStatus.FAILED.value, "message": "Pipeline not found"}
+            
+            requirement_summary = pipeline.description[:80] if pipeline.description else f"Pipeline #{pipeline_id}"
+            
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.CODING
+            )
+            result = await session.execute(statement)
+            coding_stage = result.scalar_one_or_none()
+            
+            if not coding_stage or not coding_stage.output_data:
+                return {"success": False, "status": PipelineStatus.FAILED.value, "message": "No coding output found"}
+            
+            coding_output = coding_stage.output_data
+            multi_agent_output = coding_output.get("multi_agent_output", {})
+            generated_files = multi_agent_output.get("files", [])
+            
+            # 2. 使用 WorkspaceService 管理临时工作区
+            with workspace_context(pipeline_id) as ws:
+                workspace_dir = ws.get_workspace_path()
+                await push_log(pipeline_id, "info", f"创建临时工作区: {workspace_dir.name}", stage="DELIVERY")
+                
+                # 3. Git 操作
+                git_service = GitProviderService(str(workspace_dir))
+                from app.core.timezone import now
+                timestamp = now().strftime("%Y%m%d_%H%M%S")
+                git_branch = f"devflow/pipeline-{pipeline_id}-{timestamp}"
+                
+                try:
+                    git_service.create_branch(git_branch)
+                except GitProviderError as e:
+                    if "分支已存在" in str(e):
+                        git_service.checkout_branch(git_branch)
+                    else:
+                        raise
+                
+                # 4. 应用代码变更
+                code_executor = CodeExecutorService(str(workspace_dir))
+                changes_dict = {f["file_path"]: f["content"] for f in generated_files}
+                
+                await push_log(pipeline_id, "info", "应用代码变更...", stage="DELIVERY")
+                execution_result = code_executor.apply_changes(changes=changes_dict, create_if_missing=True)
+                
+                if not execution_result.success:
+                    code_executor.rollback_changes(execution_result.changes)
+                    await WorkflowService.create_stage(
+                        pipeline_id=pipeline_id, stage_name=StageName.DELIVERY,
+                        input_data=None, session=session
+                    )
+                    pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+                    if pipeline:
+                        await WorkflowService.set_pipeline_failed(pipeline, session)
+                    from app.core.sse_log_buffer import remove_buffer
+                    remove_buffer(pipeline_id)
+                    return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Code execution failed"}
+                
+                # 5. Git 提交
+                if execution_result.summary["success"] > 0:
+                    git_service.add_files()
+                    if git_service.has_changes():
+                        commit_message = f"feat(pipeline-{pipeline_id}): {multi_agent_output.get('summary', '代码生成')[:100]}"
+                        git_service.commit_changes(commit_message)
+                        commit_hash = git_service.get_last_commit_hash()
+                
+                # 6. 推送分支
+                await push_log(pipeline_id, "info", f"推送代码到远程分支 {git_branch}...", stage="DELIVERY")
+                push_result = git_service.push_branch(git_branch)
+                
+                # 7. 生成 PR 描述（委托给 PRGeneratorService）
+                pr_description = await PRGeneratorService.generate_pr_description(
+                    pipeline_id=pipeline_id,
+                    multi_agent_output=multi_agent_output,
+                    execution_summary=execution_result.summary,
+                    git_service=git_service
+                )
+                
+                # 8. 创建 PR
+                pr_title = f"OmniFlowAI: {requirement_summary}"
+                async with GitHubProviderService() as github_service:
+                    pr_result = await github_service.create_pull_request(
+                        head_branch=git_branch, title=pr_title,
+                        body=pr_description, base_branch="main"
+                    )
+                
+                if pr_result.success:
+                    pr_url = pr_result.pr_url
+                    await push_log(pipeline_id, "info", f"PR 创建成功: {pr_url}", stage="DELIVERY")
+            
+            # 9. 创建 DELIVERY 阶段
+            delivery_stage = PipelineStage(
+                pipeline_id=pipeline_id,
+                name=StageName.DELIVERY,
+                status=StageStatus.SUCCESS,
+                output_data={
+                    "git_branch": git_branch, "commit_hash": commit_hash,
+                    "pr_url": pr_url, "pr_created": pr_result.success,
+                    "execution_summary": execution_result.summary
+                }
+            )
+            session.add(delivery_stage)
+            
+            # 10. 更新 Pipeline 状态
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                pipeline.current_stage = StageName.DELIVERY
+                await WorkflowService.set_pipeline_paused(pipeline, session)
+            
+            await push_log(pipeline_id, "info", "Pipeline 执行完成！", stage="DELIVERY")
+            from app.core.sse_log_buffer import remove_buffer
+            remove_buffer(pipeline_id)
+            
+            return {
+                "success": True, "status": PipelineStatus.SUCCESS.value,
+                "message": "Delivery completed", "git_branch": git_branch,
+                "commit_hash": commit_hash, "pr_url": pr_url
+            }
+            
+        except Exception as e:
+            await push_log(pipeline_id, "error", f"代码交付失败: {str(e)}", stage="DELIVERY")
+            await session.rollback()
+            from app.core.sse_log_buffer import remove_buffer
+            remove_buffer(pipeline_id)
+            return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Delivery failed: {str(e)}"}
+    
+    # ==================== 审批方法 ====================
+
+    @classmethod
     async def approve_pipeline(
-        cls,
-        pipeline_id: int,
-        notes: Optional[str],
-        feedback: Optional[str],
-        session: AsyncSession
+        cls, pipeline_id: int, notes: Optional[str],
+        feedback: Optional[str], session: AsyncSession,
+        background_tasks=None
     ) -> Dict[str, Any]:
-        """
-        审批 Pipeline，允许进入下一阶段
-        
-        如果当前是 REQUIREMENT 阶段，触发 DesignerAgent
-        如果当前是 DESIGN 阶段，触发 CoderAgent
-        
+        """审批 Pipeline，允许进入下一阶段
+
         Args:
             pipeline_id: Pipeline ID
             notes: 审批备注
             feedback: 反馈建议
-            session: 数据库会话
-            
-        Returns:
-            Dict: 审批结果
+            session: 数据库 session
+            background_tasks: FastAPI BackgroundTasks，用于异步执行耗时任务
         """
-        from sqlmodel import select
-        
-        # 获取 Pipeline
-        statement = select(Pipeline).where(Pipeline.id == pipeline_id).options(
-            selectinload(Pipeline.stages)
-        )
-        result = await session.execute(statement)
-        pipeline = result.scalar_one_or_none()
-        
+        from fastapi import BackgroundTasks
+
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+
         if not pipeline:
             return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
-        
-        # 检查状态
-        if pipeline.status != PipelineStatus.PAUSED:
-            return {"success": False, "error": f"Pipeline is not in PAUSED state, cannot approve"}
-        
+
+        can_approve, error_msg = await WorkflowService.validate_can_approve(pipeline)
+        if not can_approve:
+            return {"success": False, "error": error_msg}
+
         current_stage = pipeline.current_stage
-        
+
         if current_stage == StageName.REQUIREMENT:
-            # 进入 DESIGN 阶段
-            pipeline.status = PipelineStatus.RUNNING
-            pipeline.current_stage = StageName.DESIGN
-            await session.commit()
-            
-            # 触发 DesignerAgent
+            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
+            if not success:
+                return {"success": False, "error": error}
+
             await cls._trigger_designer_analysis(pipeline_id, session)
-            
+
             return {
                 "success": True,
                 "data": {
@@ -250,104 +573,102 @@ class PipelineService:
                     "message": "Pipeline approved, proceeding to DESIGN stage"
                 }
             }
-        
+
         elif current_stage == StageName.DESIGN:
-            # 进入 CODING 阶段
-            pipeline.status = PipelineStatus.RUNNING
-            pipeline.current_stage = StageName.CODING
+            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
+            if not success:
+                return {"success": False, "error": error}
+
+            # 提交事务，确保阶段状态已更新
             await session.commit()
-            
-            # 触发 CoderAgent 和代码执行流程
-            coding_result = await cls._trigger_coding_phase(pipeline_id, session)
-            
+
+            # 使用后台任务异步执行代码生成，避免 HTTP 超时
+            if background_tasks:
+                from app.api.v1.pipeline import run_coding_task
+                background_tasks.add_task(run_coding_task, pipeline_id)
+
+                return {
+                    "success": True,
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "previous_stage": StageName.DESIGN.value,
+                        "next_stage": StageName.CODING.value,
+                        "status": PipelineStatus.RUNNING.value,
+                        "message": "代码生成任务已在后台启动，请通过日志监控进度",
+                        "async": True
+                    }
+                }
+            else:
+                # 如果没有 background_tasks，同步执行（兼容旧调用）
+                coding_result = await cls._trigger_coding_phase(pipeline_id, session)
+
+                return {
+                    "success": coding_result["success"],
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "previous_stage": StageName.DESIGN.value,
+                        "next_stage": StageName.CODE_REVIEW.value,
+                        "status": coding_result.get("status", PipelineStatus.PAUSED.value),
+                        "message": coding_result.get("message", "Code generated"),
+                        "files_count": coding_result.get("files_count", 0)
+                    }
+                }
+
+        elif current_stage == StageName.CODE_REVIEW:
+            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
+            if not success:
+                return {"success": False, "error": error}
+
+            delivery_result = await cls._trigger_delivery_phase(pipeline_id, session)
+
             return {
-                "success": coding_result["success"],
+                "success": delivery_result["success"],
                 "data": {
                     "pipeline_id": pipeline_id,
-                    "previous_stage": StageName.DESIGN.value,
-                    "next_stage": StageName.CODING.value,
-                    "status": coding_result.get("status", PipelineStatus.RUNNING.value),
-                    "message": coding_result.get("message", "Pipeline approved, proceeding to CODING stage"),
-                    "git_branch": coding_result.get("git_branch"),
-                    "commit_hash": coding_result.get("commit_hash")
+                    "previous_stage": StageName.CODE_REVIEW.value,
+                    "next_stage": StageName.DELIVERY.value,
+                    "status": delivery_result.get("status", PipelineStatus.SUCCESS.value),
+                    "message": delivery_result.get("message", "Code delivered"),
+                    "git_branch": delivery_result.get("git_branch"),
+                    "commit_hash": delivery_result.get("commit_hash"),
+                    "pr_url": delivery_result.get("pr_url")
                 }
             }
-        
+
         else:
             return {"success": False, "error": f"Unknown current stage: {current_stage}"}
     
     @classmethod
     async def reject_pipeline(
-        cls,
-        pipeline_id: int,
-        reason: str,
-        suggested_changes: Optional[str],
-        session: AsyncSession
+        cls, pipeline_id: int, reason: str,
+        suggested_changes: Optional[str], session: AsyncSession
     ) -> Dict[str, Any]:
-        """
-        驳回 Pipeline，退回当前阶段重新执行
-        
-        实现"自动回归"思想：携带 Reject 理由重新运行 Agent
-        
-        Args:
-            pipeline_id: Pipeline ID
-            reason: 驳回原因
-            suggested_changes: 建议修改
-            session: 数据库会话
-            
-        Returns:
-            Dict: 驳回结果
-        """
-        from sqlmodel import select
-        
-        # 获取 Pipeline
-        statement = select(Pipeline).where(Pipeline.id == pipeline_id).options(
-            selectinload(Pipeline.stages)
-        )
-        result = await session.execute(statement)
-        pipeline = result.scalar_one_or_none()
+        """驳回 Pipeline，退回当前阶段重新执行"""
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
         
         if not pipeline:
             return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
         
-        # 检查状态
-        if pipeline.status != PipelineStatus.PAUSED:
-            return {"success": False, "error": f"Pipeline is not in PAUSED state, cannot reject"}
+        can_reject, error_msg = await WorkflowService.validate_can_reject(pipeline)
+        if not can_reject:
+            return {"success": False, "error": error_msg}
         
         current_stage = pipeline.current_stage
         
-        # 记录驳回信息到当前阶段的 output_data
-        statement = select(PipelineStage).where(
-            PipelineStage.pipeline_id == pipeline_id,
-            PipelineStage.name == current_stage
+        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
+        
+        await WorkflowService.mark_stage_for_rerun(
+            pipeline_id=pipeline_id, stage_name=current_stage,
+            rejection_feedback=rejection_feedback, session=session
         )
-        result = await session.execute(statement)
-        stage = result.scalar_one_or_none()
         
-        if stage:
-            if stage.output_data is None:
-                stage.output_data = {}
-            stage.output_data["rejection_feedback"] = {
-                "reason": reason,
-                "suggested_changes": suggested_changes,
-                "rejected_at": datetime.utcnow().isoformat()
-            }
-            stage.status = StageStatus.RUNNING  # 重新设为运行中
-            session.add(stage)
+        await WorkflowService.set_pipeline_running(pipeline, session)
         
-        # 重新运行当前阶段
-        pipeline.status = PipelineStatus.RUNNING
-        await session.commit()
-        
-        # 根据当前阶段重新触发对应的 Agent
         if current_stage == StageName.REQUIREMENT:
-            # 重新触发 ArchitectAgent，携带驳回反馈
-            requirement = pipeline.description
             await cls._trigger_architect_analysis_with_feedback(
-                pipeline_id, requirement, reason, suggested_changes, session
+                pipeline_id, pipeline.description, reason, suggested_changes, session
             )
         elif current_stage == StageName.DESIGN:
-            # 重新触发 DesignerAgent，携带驳回反馈
             await cls._trigger_designer_analysis_with_feedback(
                 pipeline_id, reason, suggested_changes, session
             )
@@ -358,751 +679,56 @@ class PipelineService:
                 "pipeline_id": pipeline_id,
                 "current_stage": current_stage.value if current_stage else None,
                 "status": PipelineStatus.RUNNING.value,
-                "message": f"Pipeline rejected, re-running {current_stage.value if current_stage else 'current'} stage with feedback",
-                "feedback": {
-                    "reason": reason,
-                    "suggested_changes": suggested_changes
-                }
+                "message": f"Pipeline rejected, re-running {current_stage.value if current_stage else 'current'} stage",
+                "feedback": rejection_feedback
             }
         }
     
-    @classmethod
-    async def _trigger_designer_analysis(
-        cls,
-        pipeline_id: int,
-        session: AsyncSession
-    ) -> None:
-        """
-        触发 DesignerAgent 进行技术设计
-        
-        Args:
-            pipeline_id: Pipeline ID
-            session: 数据库会话
-        """
-        from sqlmodel import select
-        
-        design_stage = None
-        error_message = None
-        
-        try:
-            # 获取 REQUIREMENT 阶段的输出作为输入
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.REQUIREMENT
-            )
-            result = await session.execute(statement)
-            requirement_stage = result.scalar_one_or_none()
-            
-            if not requirement_stage or not requirement_stage.output_data:
-                error_message = "No requirement output found"
-                print(f"{error_message} for pipeline {pipeline_id}")
-                raise ValueError(error_message)
-            
-            architect_output = requirement_stage.output_data
-            
-            # 创建 DESIGN 阶段
-            design_stage = PipelineStage(
-                pipeline_id=pipeline_id,
-                name=StageName.DESIGN,
-                status=StageStatus.RUNNING,
-                input_data=architect_output
-            )
-            session.add(design_stage)
-            await session.commit()
-            
-            # 调用 DesignerAgent
-            agent_result = await designer_agent.design(architect_output)
-            
-            # 更新 DESIGN 阶段
-            if agent_result["success"]:
-                design_stage.status = StageStatus.SUCCESS
-                design_stage.output_data = agent_result["output"]
-            else:
-                design_stage.status = StageStatus.FAILED
-                design_stage.output_data = {"error": agent_result["error"]}
-            
-            design_stage.completed_at = datetime.utcnow()
-            session.add(design_stage)
-            
-            # 更新 Pipeline 状态为 PAUSED，等待人工审批
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            query_result = await session.execute(statement)
-            pipeline = query_result.scalar_one_or_none()
-            
-            if pipeline:
-                if agent_result["success"]:
-                    pipeline.status = PipelineStatus.PAUSED
-                else:
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
-                
-        except Exception as e:
-            # 以吞掉异常为耻：必须记录错误并更新状态
-            error_message = error_message or str(e)
-            print(f"Designer analysis failed for pipeline {pipeline_id}: {error_message}")
-            
-            try:
-                # 更新 DESIGN 阶段为 FAILED
-                if design_stage:
-                    design_stage.status = StageStatus.FAILED
-                    design_stage.output_data = {"error": error_message}
-                    design_stage.completed_at = datetime.utcnow()
-                    session.add(design_stage)
-                
-                # 更新 Pipeline 状态为 FAILED
-                statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-                result = await session.execute(statement)
-                pipeline = result.scalar_one_or_none()
-                
-                if pipeline:
-                    pipeline.status = PipelineStatus.FAILED
-                    await session.commit()
-                else:
-                    await session.rollback()
-            except Exception as update_error:
-                # 如果连状态更新都失败，至少打印错误
-                print(f"Failed to update pipeline status: {update_error}")
-                await session.rollback()
-                raise
-    
-    @classmethod
-    async def _trigger_architect_analysis_with_feedback(
-        cls,
-        pipeline_id: int,
-        requirement: str,
-        reason: str,
-        suggested_changes: Optional[str],
-        session: AsyncSession
-    ) -> None:
-        """
-        携带驳回反馈重新触发 ArchitectAgent
-        
-        Args:
-            pipeline_id: Pipeline ID
-            requirement: 原始需求
-            reason: 驳回原因
-            suggested_changes: 建议修改
-            session: 数据库会话
-        """
-        from sqlmodel import select
-        
-        try:
-            # 获取项目文件树
-            from app.service.project import get_current_project_tree
-            file_tree_node = get_current_project_tree(max_depth=4)
-            file_tree = ProjectService.file_tree_to_dict(file_tree_node) if file_tree_node else {}
-            
-            # 构建带反馈的需求
-            feedback_requirement = f"""原始需求: {requirement}
+    # ==================== 后台任务方法 ====================
 
-审批反馈:
-- 驳回原因: {reason}
-- 建议修改: {suggested_changes or '无'}
+    @classmethod
+    async def trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+        """公开方法：触发 CODING 阶段（供后台任务调用）"""
+        return await cls._trigger_coding_phase(pipeline_id, session)
 
-请根据以上反馈重新分析需求。"""
-            
-            # 调用 ArchitectAgent
-            result = await architect_agent.analyze(feedback_requirement, file_tree)
-            
-            # 获取当前阶段
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.REQUIREMENT
-            )
-            result_query = await session.execute(statement)
-            stage = result_query.scalar_one_or_none()
-            
-            if stage:
-                if result["success"]:
-                    stage.status = StageStatus.SUCCESS
-                    stage.output_data = result["output"]
-                else:
-                    stage.status = StageStatus.FAILED
-                    stage.output_data = {"error": result["error"]}
-                
-                stage.completed_at = datetime.utcnow()
-                session.add(stage)
-            
-            # 更新 Pipeline 状态
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            result_query = await session.execute(statement)
-            pipeline = result_query.scalar_one_or_none()
-            
-            if pipeline:
-                if result["success"]:
-                    pipeline.status = PipelineStatus.PAUSED
-                else:
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
-                
-        except Exception as e:
-            print(f"Architect re-analysis failed for pipeline {pipeline_id}: {e}")
-            await session.rollback()
-    
     @classmethod
-    async def _trigger_designer_analysis_with_feedback(
-        cls,
-        pipeline_id: int,
-        reason: str,
-        suggested_changes: Optional[str],
-        session: AsyncSession
-    ) -> None:
-        """
-        携带驳回反馈重新触发 DesignerAgent
-        
-        Args:
-            pipeline_id: Pipeline ID
-            reason: 驳回原因
-            suggested_changes: 建议修改
-            session: 数据库会话
-        """
-        from sqlmodel import select
-        
-        try:
-            # 获取 REQUIREMENT 阶段的输出
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.REQUIREMENT
-            )
-            result = await session.execute(statement)
-            requirement_stage = result.scalar_one_or_none()
-            
-            if not requirement_stage or not requirement_stage.output_data:
-                return
-            
-            architect_output = requirement_stage.output_data
-            
-            # 添加反馈到输入
-            architect_output_with_feedback = {
-                **architect_output,
-                "rejection_feedback": {
-                    "reason": reason,
-                    "suggested_changes": suggested_changes
-                }
-            }
-            
-            # 调用 DesignerAgent
-            result = await designer_agent.design(architect_output_with_feedback)
-            
-            # 获取 DESIGN 阶段
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.DESIGN
-            )
-            result_query = await session.execute(statement)
-            design_stage = result_query.scalar_one_or_none()
-            
-            if design_stage:
-                if result["success"]:
-                    design_stage.status = StageStatus.SUCCESS
-                    design_stage.output_data = result["output"]
-                else:
-                    design_stage.status = StageStatus.FAILED
-                    design_stage.output_data = {"error": result["error"]}
-                
-                design_stage.completed_at = datetime.utcnow()
-                session.add(design_stage)
-            
-            # 更新 Pipeline 状态
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            result_query = await session.execute(statement)
-            pipeline = result_query.scalar_one_or_none()
-            
-            if pipeline:
-                if result["success"]:
-                    pipeline.status = PipelineStatus.PAUSED
-                else:
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
-                
-        except Exception as e:
-            print(f"Designer re-analysis failed for pipeline {pipeline_id}: {e}")
-            await session.rollback()
-    
-    @classmethod
-    async def _generate_pr_description(
-        cls,
-        pipeline_id: int,
-        multi_agent_output: Dict[str, Any],
-        execution_summary: Dict[str, Any],
-        git_service: GitProviderService
-    ) -> str:
-        """
-        生成语义化的 PR 描述（支持多 Agent 输出）
-        
-        包含：
-        1. 修改了哪些文件（代码 + 测试）
-        2. 核心逻辑变动
-        3. 测试覆盖情况
-        4. 测试建议
-        
-        Args:
-            pipeline_id: Pipeline ID
-            multi_agent_output: 多 Agent 协调器输出
-            execution_summary: 代码执行摘要
-            git_service: Git 服务实例
-            
-        Returns:
-            str: PR 描述文本
-        """
-        # 获取文件变更列表
-        files_changed = []
-        test_files = []
-        
-        if "files" in multi_agent_output:
-            for file_change in multi_agent_output["files"]:
-                file_info = {
-                    "path": file_change.get("file_path", ""),
-                    "type": file_change.get("change_type", "modify"),
-                    "description": file_change.get("description", "")
-                }
-                # 区分代码文件和测试文件
-                if "test" in file_info["path"].lower() or file_info["path"].startswith("tests/"):
-                    test_files.append(file_info)
-                else:
-                    files_changed.append(file_info)
-        
-        # 获取 diff 统计
-        diff_stat = git_service.create_commit_summary()
-        
-        # 构建 PR 描述
-        lines = [
-            f"## OmniFlowAI 自动生成的 PR",
-            "",
-            f"**Pipeline ID**: #{pipeline_id}",
-            "",
-            "### 变更摘要",
-            f"{multi_agent_output.get('summary', '无描述')}",
-            "",
-            "### 代码文件",
-        ]
-        
-        # 添加代码文件列表
-        if files_changed:
-            for f in files_changed:
-                type_emoji = {"add": "➕", "modify": "📝", "delete": "🗑️"}.get(f["type"], "📝")
-                lines.append(f"- {type_emoji} `{f['path']}` - {f['description'] or '代码变更'}")
-        else:
-            lines.append("- 无代码文件变更")
-        
-        # 添加测试文件列表
-        lines.append("")
-        lines.append("### 测试文件")
-        if test_files:
-            for f in test_files:
-                type_emoji = {"add": "➕", "modify": "📝", "delete": "🗑️"}.get(f["type"], "📝")
-                lines.append(f"- {type_emoji} `{f['path']}` - {f['description'] or '测试代码'}")
-        else:
-            lines.append("- 无测试文件")
-        
-        # 添加统计信息
-        lines.extend([
-            "",
-            "### 变更统计",
-            f"- 成功写入: {execution_summary.get('success', 0)} 个文件",
-            f"- 失败: {execution_summary.get('failed', 0)} 个文件",
-            f"- 总计: {execution_summary.get('total', 0)} 个文件",
-        ])
-        
-        # 添加测试建议
-        tests_included = multi_agent_output.get("tests_included", False)
-        coverage_targets = multi_agent_output.get("coverage_targets", [])
-        dependencies = multi_agent_output.get("dependencies_added", [])
-        
-        lines.extend([
-            "",
-            "### 测试覆盖",
-        ])
-        
-        if tests_included and test_files:
-            lines.append("✅ 本次变更已包含测试代码")
-            
-            # 添加测试覆盖目标
-            if coverage_targets:
-                lines.append("")
-                lines.append("**测试覆盖目标：**")
-                for target in coverage_targets:
-                    lines.append(f"- {target}")
-            
-            lines.append("")
-            lines.append("**运行测试：**")
-            lines.append("```bash")
-            lines.append("# 运行所有测试")
-            lines.append("pytest")
-            lines.append("")
-            lines.append("# 运行特定测试文件")
-            for tf in test_files:
-                lines.append(f"pytest {tf['path']}")
-            lines.append("```")
-        else:
-            lines.append("⚠️ 本次变更未包含测试代码，建议进行以下验证：")
-            lines.append("1. 手动测试相关功能")
-            lines.append("2. 检查边界条件处理")
-            lines.append("3. 验证错误处理逻辑")
-        
-        # 添加依赖变更提示
-        if dependencies:
-            lines.extend([
-                "",
-                "### 新增依赖",
-                "以下依赖需要安装：",
-            ])
-            for dep in dependencies:
-                lines.append(f"- `{dep}`")
-            lines.extend([
-                "",
-                "```bash",
-                "# 安装依赖",
-                f"pip install {' '.join(dependencies)}",
-                "```"
-            ])
-        
-        # 添加审查清单
-        lines.extend([
-            "",
-            "---",
-            "",
-            "### 审查清单",
-            "- [ ] 代码符合项目规范",
-            "- [ ] 功能符合需求描述",
-            "- [ ] 错误处理完善",
-            "- [ ] 无安全隐患",
-            "",
-            "*此 PR 由 OmniFlowAI 自动生成* 🤖"
-        ])
-        
-        return "\n".join(lines)
-    
-    @classmethod
-    async def _trigger_coding_phase(
-        cls,
-        pipeline_id: int,
-        session: AsyncSession
-    ) -> Dict[str, Any]:
-        """
-        触发 CODING 阶段
-        
-        流程：
-        1. 创建 Git 分支 devflow/pipeline-{id}
-        2. 运行 CoderAgent 生成代码
-        3. 调用 CodeExecutorService 写入文件
-        4. 自动 git commit
-        5. 执行 git push
-        6. 调用 GitHubProviderService 创建 PR
-        7. 将 Pipeline 状态设为 SUCCESS
-        
-        Args:
-            pipeline_id: Pipeline ID
-            session: 数据库会话
-            
-        Returns:
-            Dict: 执行结果
-        """
-        from sqlmodel import select
-        
-        git_branch = None
-        commit_hash = None
-        pr_url = None
-        
-        try:
-            # 1. 创建 Git 分支
-            git_service = GitProviderService()
-            git_branch = f"devflow/pipeline-{pipeline_id}"
-            
-            try:
-                git_service.create_branch(git_branch)
-            except GitProviderError as e:
-                # 分支可能已存在，尝试切换
-                if "分支已存在" in str(e):
-                    git_service.checkout_branch(git_branch)
-                else:
-                    raise
-            
-            # 2. 获取 Pipeline 和 DESIGN 阶段信息
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            result = await session.execute(statement)
-            pipeline = result.scalar_one_or_none()
-            
-            if not pipeline:
-                return {
-                    "success": False,
-                    "status": PipelineStatus.FAILED.value,
-                    "message": "Pipeline not found",
-                    "git_branch": git_branch
-                }
-            
-            # 获取原始需求描述（用于 PR 标题）
-            requirement_summary = pipeline.description[:80] if pipeline.description else f"Pipeline #{pipeline_id}"
-            
-            # 3. 获取 DESIGN 阶段的输出
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.DESIGN
-            )
-            result = await session.execute(statement)
-            design_stage = result.scalar_one_or_none()
-            
-            if not design_stage or not design_stage.output_data:
-                return {
-                    "success": False,
-                    "status": PipelineStatus.FAILED.value,
-                    "message": "No design output found",
-                    "git_branch": git_branch
-                }
-            
-            design_output = design_stage.output_data
-            
-            # 4. 创建 CODING 阶段
-            coding_stage = PipelineStage(
-                pipeline_id=pipeline_id,
-                name=StageName.CODING,
-                status=StageStatus.RUNNING,
-                input_data=design_output
-            )
-            session.add(coding_stage)
-            await session.commit()
-            
-            # 5. 读取目标文件当前内容
-            code_executor = CodeExecutorService()
-            target_files = {}
-            
-            # 从 design_output 中提取需要修改的文件
-            if "function_changes" in design_output:
-                for change in design_output["function_changes"]:
-                    file_path = change.get("file", "")
-                    if file_path:
-                        content = code_executor.get_file_content(file_path)
-                        if content:
-                            target_files[file_path] = content
-            
-            # 6. 调用多 Agent 协调器并行生成代码和测试
-            print(f"[PipelineService] 启动多 Agent 协作 - Pipeline {pipeline_id}")
-            multi_agent_result = await multi_agent_coordinator.execute_parallel(
-                design_output, 
-                target_files
-            )
-            
-            if not multi_agent_result["success"]:
-                # 更新 CODING 阶段状态
-                coding_stage.status = StageStatus.FAILED
-                coding_stage.output_data = {
-                    "error": multi_agent_result["error"],
-                    "agent_outputs": multi_agent_result.get("output", {}).get("agent_outputs", {})
-                }
-                coding_stage.completed_at = datetime.utcnow()
-                session.add(coding_stage)
-                
-                # 更新 Pipeline 状态
-                statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-                result = await session.execute(statement)
-                pipeline = result.scalar_one_or_none()
-                if pipeline:
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
-                
-                return {
-                    "success": False,
-                    "status": PipelineStatus.FAILED.value,
-                    "message": f"Multi-agent execution failed: {multi_agent_result['error']}",
-                    "git_branch": git_branch
-                }
-            
-            # 获取合并后的输出
-            combined_output = multi_agent_result["output"]
-            print(f"[PipelineService] 多 Agent 协作完成 - 生成 {len(combined_output.get('files', []))} 个文件")
-            
-            # 6. 应用代码变更（包括代码和测试文件）
-            generated_files = combined_output["files"]
-            changes_dict = {}
-            for file_change in generated_files:
-                changes_dict[file_change["file_path"]] = file_change["content"]
-            
-            execution_result = code_executor.apply_changes(
-                changes=changes_dict,
-                create_if_missing=True
-            )
-            
-            if not execution_result.success:
-                # 回滚变更
-                code_executor.rollback_changes(execution_result.changes)
-                
-                # 更新 CODING 阶段状态
-                coding_stage.status = StageStatus.FAILED
-                coding_stage.output_data = {
-                    "error": "Code execution failed",
-                    "execution_errors": execution_result.errors
-                }
-                coding_stage.completed_at = datetime.utcnow()
-                session.add(coding_stage)
-                
-                # 更新 Pipeline 状态
-                statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-                result = await session.execute(statement)
-                pipeline = result.scalar_one_or_none()
-                if pipeline:
-                    pipeline.status = PipelineStatus.FAILED
-                await session.commit()
-                
-                return {
-                    "success": False,
-                    "status": PipelineStatus.FAILED.value,
-                    "message": f"Code execution failed: {execution_result.errors}",
-                    "git_branch": git_branch
-                }
-            
-            # 7. Git 提交
-            if execution_result.summary["success"] > 0:
-                git_service.add_files()
-                
-                if git_service.has_changes():
-                    commit_message = f"feat(pipeline-{pipeline_id}): {combined_output.get('summary', '代码和测试生成')[:100]}"
-                    git_service.commit_changes(commit_message)
-                    commit_hash = git_service.get_last_commit_hash()
-            
-            # 8. 推送分支到远程
-            print(f"[PipelineService] 推送分支: {git_branch}")
-            push_result = git_service.push_branch(git_branch)
-            
-            if not push_result.success:
-                print(f"[PipelineService] 推送分支警告: {push_result.stderr}")
-                # 推送失败不阻断流程，继续尝试创建 PR
-            
-            # 9. 生成 PR 描述
-            pr_description = await cls._generate_pr_description(
-                pipeline_id=pipeline_id,
-                multi_agent_output=combined_output,
-                execution_summary=execution_result.summary,
-                git_service=git_service
-            )
-            
-            # 10. 创建 Pull Request
-            # PR 标题格式: OmniFlowAI: ${requirement_summary}
-            pr_title = f"OmniFlowAI: {requirement_summary}"
-            
-            async with GitHubProviderService() as github_service:
-                pr_result = await github_service.create_pull_request(
-                    head_branch=git_branch,
-                    title=pr_title,
-                    body=pr_description,
-                    base_branch="main"
-                )
-            
-            if pr_result.success:
-                pr_url = pr_result.pr_url
-                print(f"[PipelineService] PR 创建成功: {pr_url}")
-            else:
-                print(f"[PipelineService] PR 创建失败: {pr_result.error}")
-                # PR 创建失败不阻断流程，继续完成 Pipeline
-            
-            # 11. 更新 CODING 阶段状态
-            coding_stage.status = StageStatus.SUCCESS
-            coding_stage.output_data = {
-                "multi_agent_output": combined_output,
-                "code_agent_log": combined_output.get("agent_outputs", {}).get("coder"),
-                "test_agent_log": combined_output.get("agent_outputs", {}).get("tester"),
-                "execution_summary": execution_result.summary,
-                "git_branch": git_branch,
-                "commit_hash": commit_hash,
-                "pr_url": pr_url,
-                "pr_created": pr_result.success,
-                "tests_included": combined_output.get("tests_included", False),
-                "coverage_targets": combined_output.get("coverage_targets", [])
-            }
-            coding_stage.completed_at = datetime.utcnow()
-            session.add(coding_stage)
-            
-            # 12. 更新 Pipeline 状态为 SUCCESS
-            statement = select(Pipeline).where(Pipeline.id == pipeline_id)
-            result = await session.execute(statement)
-            pipeline = result.scalar_one_or_none()
-            
-            if pipeline:
-                pipeline.status = PipelineStatus.SUCCESS
-                await session.commit()
-            
-            return {
-                "success": True,
-                "status": PipelineStatus.SUCCESS.value,
-                "message": "Coding phase completed successfully",
-                "git_branch": git_branch,
-                "commit_hash": commit_hash,
-                "pr_url": pr_url,
-                "files_changed": execution_result.summary
-            }
-            
-        except Exception as e:
-            print(f"Coding phase failed for pipeline {pipeline_id}: {e}")
-            await session.rollback()
-            
-            return {
-                "success": False,
-                "status": PipelineStatus.FAILED.value,
-                "message": f"Coding phase failed: {str(e)}",
-                "git_branch": git_branch
-            }
-    
-    @classmethod
-    async def get_pipeline_status(
-        cls,
-        pipeline_id: int,
-        session: AsyncSession
-    ) -> Optional[PipelineRead]:
-        """
-        获取 Pipeline 状态
-        
-        Args:
-            pipeline_id: Pipeline ID
-            session: 数据库会话
-            
-        Returns:
-            PipelineRead: Pipeline 状态信息，不存在返回 None
-        """
-        from sqlmodel import select
-        
-        statement = select(Pipeline).where(Pipeline.id == pipeline_id).options(
-            selectinload(Pipeline.stages)
-        )
-        result = await session.execute(statement)
-        pipeline = result.scalar_one_or_none()
-        
+    async def mark_pipeline_failed(cls, pipeline_id: int, error: str, session: AsyncSession) -> None:
+        """标记 Pipeline 为失败状态"""
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
         if pipeline:
-            return cls._build_pipeline_read(pipeline)
-        return None
+            await WorkflowService.set_pipeline_failed(pipeline, session)
+            # 记录错误信息到当前阶段
+            if pipeline.current_stage:
+                from app.models.pipeline import PipelineStage, StageName
+                statement = select(PipelineStage).where(
+                    PipelineStage.pipeline_id == pipeline_id,
+                    PipelineStage.name == pipeline.current_stage
+                )
+                result = await session.execute(statement)
+                stage = result.scalar_one_or_none()
+                if stage:
+                    stage.output_data = {"error": error}
+
+    # ==================== 查询方法 ====================
+
+    @classmethod
+    async def get_pipeline_status(cls, pipeline_id: int, session: AsyncSession) -> Optional[PipelineRead]:
+        """获取 Pipeline 状态"""
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+        return cls._build_pipeline_read(pipeline) if pipeline else None
     
     @classmethod
-    async def list_pipelines(
-        cls,
-        session: AsyncSession,
-        skip: int = 0,
-        limit: int = 100
-    ) -> list[PipelineRead]:
-        """
-        列出所有 Pipeline
-        
-        Args:
-            session: 数据库会话
-            skip: 跳过数量
-            limit: 返回数量限制
-            
-        Returns:
-            list[PipelineRead]: Pipeline 列表
-        """
-        from sqlmodel import select
-        
+    async def list_pipelines(cls, session: AsyncSession, skip: int = 0, limit: int = 100) -> list[PipelineRead]:
+        """列出所有 Pipeline"""
         statement = select(Pipeline).offset(skip).limit(limit)
         result = await session.execute(statement)
         pipelines = result.scalars().all()
         
-        # 对于列表，不加载 stages
         return [
             PipelineRead(
-                id=p.id,
-                description=p.description,
-                status=p.status,
-                current_stage=p.current_stage,
-                created_at=p.created_at,
-                updated_at=p.updated_at,
-                stages=None
+                id=p.id, description=p.description, status=p.status,
+                current_stage=p.current_stage, created_at=p.created_at,
+                updated_at=p.updated_at, stages=None
             )
             for p in pipelines
         ]

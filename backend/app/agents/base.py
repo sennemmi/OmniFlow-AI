@@ -89,25 +89,26 @@ class BaseAgent(ABC, Generic[T]):
         """校验输出，子类必须实现"""
         pass
     
-    def _call_llm(
+    async def _call_llm(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None
     ) -> str:
         """
-        统一 LLM 调用方法
-        
+        统一 LLM 调用方法（异步）
+
         根据配置自动选择 ModelScope 或 OpenAI
-        
+        使用 litellm.acompletion 避免阻塞事件循环
+
         Args:
             messages: 消息列表
             temperature: 温度参数
             max_tokens: 最大 Token 数
-            
+
         Returns:
             str: LLM 响应内容
-            
+
         Raises:
             LLMCallError: 调用失败
         """
@@ -116,14 +117,14 @@ class BaseAgent(ABC, Generic[T]):
             api_key = settings.llm_api_key
             api_base = settings.llm_api_base
             model = settings.llm_model
-            
+
             # 检查 API Key
             if not api_key:
                 provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
                 raise LLMCallError(f"{provider} API Key 未配置")
-            
-            # 调用 litellm
-            response = litellm.completion(
+
+            # 调用 litellm 异步接口，避免阻塞事件循环
+            response = await litellm.acompletion(
                 model=model,
                 messages=messages,
                 api_key=api_key,
@@ -131,13 +132,13 @@ class BaseAgent(ABC, Generic[T]):
                 temperature=temperature,
                 max_tokens=max_tokens
             )
-            
+
             # 提取响应内容
             if response and response.choices:
                 return response.choices[0].message.content
-            
+
             raise LLMCallError("LLM 返回空响应")
-            
+
         except Exception as e:
             raise LLMCallError(f"LLM 调用失败: {e}")
     
@@ -205,8 +206,8 @@ class BaseAgent(ABC, Generic[T]):
                         {"role": "user", "content": user_prompt}
                     ]
                     
-                    # 2. 调用 LLM
-                    response = self._call_llm(messages)
+                    # 2. 调用 LLM（异步）
+                    response = await self._call_llm(messages)
                     
                     # 3. 解析输出
                     parsed_output = self.parse_output(response)

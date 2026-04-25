@@ -9,6 +9,7 @@ Agent 必须保持原有的缩进、注释风格和分层逻辑
 """
 
 import json
+import logging
 import re
 from typing import Dict, List, Optional, TypedDict, Any
 
@@ -16,6 +17,8 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agents.base import LLMCallError
+
+logger = logging.getLogger(__name__)
 
 
 class CoderState(TypedDict):
@@ -153,8 +156,8 @@ class CoderAgent:
 
         return workflow.compile()
 
-    def _code_node(self, state: CoderState) -> CoderState:
-        """编码节点：调用 LLM 生成代码"""
+    async def _code_node(self, state: CoderState) -> CoderState:
+        """编码节点：调用 LLM 生成代码（异步）"""
 
         # 构建用户提示
         user_prompt = self._build_prompt(
@@ -163,8 +166,8 @@ class CoderAgent:
         )
 
         try:
-            # 调用 LLM
-            response = self._call_llm(self.SYSTEM_PROMPT, user_prompt)
+            # 调用 LLM（异步）
+            response = await self._call_llm(self.SYSTEM_PROMPT, user_prompt)
 
             # 尝试解析 JSON
             parsed_output = self._parse_json_response(response)
@@ -253,11 +256,12 @@ class CoderAgent:
 输出完整的文件内容（不是 diff 格式）。
 """
 
-    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+    async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """
-        调用 LLM - 使用 OpenAI 兼容接口
+        调用 LLM - 使用 OpenAI 兼容接口（异步）
 
         支持 ModelScope (魔搭) 和 OpenAI 运行时切换
+        使用异步接口避免阻塞事件循环
         """
         from app.core.config import settings
 
@@ -268,15 +272,15 @@ class CoderAgent:
 
         try:
             if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口
-                from openai import OpenAI
+                # ModelScope 使用 OpenAI 兼容接口（异步）
+                from openai import AsyncOpenAI
 
-                client = OpenAI(
+                client = AsyncOpenAI(
                     base_url=settings.llm_api_base,
                     api_key=settings.llm_api_key
                 )
 
-                response = client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=settings.llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -288,11 +292,11 @@ class CoderAgent:
                 if response and response.choices:
                     return response.choices[0].message.content
             else:
-                # OpenAI 使用 LiteLLM
+                # OpenAI 使用 LiteLLM 异步接口
                 import litellm
                 litellm.set_verbose = False
 
-                response = litellm.completion(
+                response = await litellm.acompletion(
                     model=settings.llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -328,7 +332,8 @@ class CoderAgent:
     async def generate_code(
         self,
         design_output: Dict[str, Any],
-        target_files: Dict[str, str]
+        target_files: Dict[str, str],
+        pipeline_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         根据设计方案生成代码
@@ -336,10 +341,23 @@ class CoderAgent:
         Args:
             design_output: DesignerAgent 的输出内容
             target_files: 目标文件路径到内容的映射
+            pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
             Dict: 包含生成结果或错误信息
         """
+        from app.core.sse_log_buffer import push_log
+
+        files_count = len(target_files)
+        logger.info(f"CoderAgent 开始生成代码", extra={
+            "pipeline_id": pipeline_id,
+            "files_count": files_count,
+            "target_files": list(target_files.keys())
+        })
+
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"CoderAgent 开始生成代码，共 {files_count} 个文件...", stage="CODING")
+
         initial_state: CoderState = {
             "design_output": design_output,
             "target_files": target_files,
@@ -348,15 +366,31 @@ class CoderAgent:
             "retry_count": 0
         }
 
-        # 执行状态机
-        result = self.graph.invoke(initial_state)
+        # 执行状态机（使用异步接口）
+        result = await self.graph.ainvoke(initial_state)
 
         if result["error"]:
+            logger.error(f"CoderAgent 代码生成失败", extra={
+                "pipeline_id": pipeline_id,
+                "error": result["error"]
+            })
+            if pipeline_id:
+                await push_log(pipeline_id, "error", f"代码生成失败: {result['error']}", stage="CODING")
             return {
                 "success": False,
                 "error": result["error"],
                 "output": None
             }
+
+        output_files = result["output"].get("files", [])
+        logger.info(f"CoderAgent 代码生成完成", extra={
+            "pipeline_id": pipeline_id,
+            "generated_files_count": len(output_files),
+            "generated_files": [f.get("file_path") for f in output_files]
+        })
+
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"代码生成完成，共 {len(output_files)} 个文件", stage="CODING")
 
         return {
             "success": True,

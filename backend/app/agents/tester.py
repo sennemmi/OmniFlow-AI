@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 import re
 from typing import Dict, List, Optional, TypedDict, Any
 
@@ -16,6 +17,8 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field, ValidationError
 
 from app.agents.base import LLMCallError
+
+logger = logging.getLogger(__name__)
 
 
 class TesterState(TypedDict):
@@ -160,8 +163,8 @@ class TestAgent:
 
         return workflow.compile()
 
-    def _generate_tests_node(self, state: TesterState) -> TesterState:
-        """生成测试节点：调用 LLM 生成测试代码"""
+    async def _generate_tests_node(self, state: TesterState) -> TesterState:
+        """生成测试节点：调用 LLM 生成测试代码（异步）"""
 
         # 构建用户提示
         user_prompt = self._build_prompt(
@@ -171,8 +174,8 @@ class TestAgent:
         )
 
         try:
-            # 调用 LLM
-            response = self._call_llm(self.SYSTEM_PROMPT, user_prompt)
+            # 调用 LLM（异步）
+            response = await self._call_llm(self.SYSTEM_PROMPT, user_prompt)
 
             # 尝试解析 JSON
             parsed_output = self._parse_json_response(response)
@@ -269,11 +272,12 @@ class TestAgent:
 4. 测试代码必须可以直接运行
 """
 
-    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+    async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         """
-        调用 LLM - 使用 OpenAI 兼容接口
+        调用 LLM - 使用 OpenAI 兼容接口（异步）
 
         支持 ModelScope (魔搭) 和 OpenAI 运行时切换
+        使用异步接口避免阻塞事件循环
         """
         from app.core.config import settings
 
@@ -284,15 +288,15 @@ class TestAgent:
 
         try:
             if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口
-                from openai import OpenAI
+                # ModelScope 使用 OpenAI 兼容接口（异步）
+                from openai import AsyncOpenAI
 
-                client = OpenAI(
+                client = AsyncOpenAI(
                     base_url=settings.llm_api_base,
                     api_key=settings.llm_api_key
                 )
 
-                response = client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=settings.llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -304,11 +308,11 @@ class TestAgent:
                 if response and response.choices:
                     return response.choices[0].message.content
             else:
-                # OpenAI 使用 LiteLLM
+                # OpenAI 使用 LiteLLM 异步接口
                 import litellm
                 litellm.set_verbose = False
 
-                response = litellm.completion(
+                response = await litellm.acompletion(
                     model=settings.llm_model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -345,7 +349,8 @@ class TestAgent:
         self,
         design_output: Dict[str, Any],
         code_output: Dict[str, Any],
-        target_files: Dict[str, str]
+        target_files: Dict[str, str],
+        pipeline_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         根据设计方案和生成的代码生成测试
@@ -354,10 +359,22 @@ class TestAgent:
             design_output: DesignerAgent 的输出内容
             code_output: CoderAgent 的输出内容
             target_files: 目标文件路径到内容的映射
+            pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
             Dict: 包含生成结果或错误信息
         """
+        from app.core.sse_log_buffer import push_log
+
+        code_files_count = len(code_output.get("files", [])) if isinstance(code_output, dict) else 0
+        logger.info(f"TesterAgent 开始生成测试", extra={
+            "pipeline_id": pipeline_id,
+            "code_files_count": code_files_count
+        })
+
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"TesterAgent 开始生成测试代码...", stage="CODING")
+
         initial_state: TesterState = {
             "design_output": design_output,
             "code_output": code_output,
@@ -367,15 +384,30 @@ class TestAgent:
             "retry_count": 0
         }
 
-        # 执行状态机
-        result = self.graph.invoke(initial_state)
+        # 执行状态机（使用异步接口）
+        result = await self.graph.ainvoke(initial_state)
 
         if result["error"]:
+            logger.error(f"TesterAgent 测试生成失败", extra={
+                "pipeline_id": pipeline_id,
+                "error": result["error"]
+            })
+            if pipeline_id:
+                await push_log(pipeline_id, "error", f"测试生成失败: {result['error']}", stage="CODING")
             return {
                 "success": False,
                 "error": result["error"],
                 "output": None
             }
+
+        test_files = result["output"].get("test_files", [])
+        logger.info(f"TesterAgent 测试生成完成", extra={
+            "pipeline_id": pipeline_id,
+            "test_files_count": len(test_files)
+        })
+
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"测试生成完成，共 {len(test_files)} 个测试文件", stage="CODING")
 
         return {
             "success": True,
