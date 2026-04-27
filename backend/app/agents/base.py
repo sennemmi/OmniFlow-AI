@@ -13,13 +13,14 @@ import json
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any, TypeVar, Generic
+from typing import Dict, List, Optional, Any, TypeVar, Generic, TypedDict
 
 import litellm
 from pydantic import BaseModel, ValidationError
+from langgraph.graph import StateGraph, END
 
 from app.core.config import settings
-from app.core.logging import agent_metrics_context, MetricsCollector
+from app.core.logging import agent_metrics_context, MetricsCollector, error
 from app.core.sse_log_buffer import push_log
 
 
@@ -45,15 +46,29 @@ class JSONParseError(AgentError):
 T = TypeVar('T', bound=BaseModel)
 
 
-class BaseAgent(ABC, Generic[T]):
+class BaseAgentState(TypedDict):
+    """LangGraph 状态基类"""
+    output: Optional[Dict[str, Any]]
+    error: Optional[str]
+    retry_count: int
+
+
+class LangGraphAgent(ABC, Generic[T]):
     """
-    Agent 基类
+    基于 LangGraph 的 Agent 基类
     
     统一 LLM 调用逻辑，支持：
     - ModelScope (魔搭) 和 OpenAI 运行时切换
     - 自动 Token 和耗时统计
     - JSON 输出解析和校验
     - 重试机制
+    - LangGraph 状态机
+    
+    子类只需实现：
+    - system_prompt: 系统 Prompt
+    - build_user_prompt(): 构建用户 Prompt
+    - parse_output(): 解析 LLM 输出
+    - validate_output(): 校验输出为 Pydantic 模型
     
     八荣八耻：
     - 严禁在 agents/ 之外的地方编写模型调用逻辑
@@ -70,6 +85,7 @@ class BaseAgent(ABC, Generic[T]):
         """
         self.agent_name = agent_name
         self.metrics_collector = MetricsCollector()
+        self.graph = self._build_graph()
     
     @property
     @abstractmethod
@@ -78,26 +94,184 @@ class BaseAgent(ABC, Generic[T]):
         pass
     
     @abstractmethod
-    def build_user_prompt(self, **kwargs) -> str:
-        """构建用户 Prompt，子类必须实现"""
+    def build_user_prompt(self, state: Dict[str, Any]) -> str:
+        """
+        构建用户 Prompt，子类必须实现
+        
+        Args:
+            state: 当前 LangGraph 状态
+            
+        Returns:
+            str: 用户 Prompt
+        """
         pass
     
     @abstractmethod
     def parse_output(self, response: str) -> Dict[str, Any]:
-        """解析 LLM 输出，子类必须实现"""
+        """
+        解析 LLM 输出，子类必须实现
+        
+        Args:
+            response: LLM 原始响应
+            
+        Returns:
+            Dict: 解析后的输出
+        """
         pass
     
     @abstractmethod
     def validate_output(self, output: Dict[str, Any]) -> T:
-        """校验输出，子类必须实现"""
+        """
+        校验输出，子类必须实现
+        
+        Args:
+            output: 解析后的输出字典
+            
+        Returns:
+            T: 校验后的 Pydantic 模型实例
+        """
         pass
+    
+    def _build_graph(self) -> StateGraph:
+        """
+        构建 LangGraph 状态机（模板方法）
+        
+        统一的执行流程：
+        entry_point -> process -> validate -> (success/retry/failed) -> END
+        
+        Returns:
+            StateGraph: 编译后的状态图
+        """
+        # 定义状态图 - 使用基类状态类型
+        workflow = StateGraph(BaseAgentState)
+        
+        # 添加节点
+        workflow.add_node("process", self._process_node)
+        workflow.add_node("validate", self._validate_node)
+        workflow.add_node("retry", self._retry_node)
+        
+        # 添加边
+        workflow.set_entry_point("process")
+        workflow.add_edge("process", "validate")
+        
+        # 条件边：验证成功 -> END，失败且未超次 -> retry，失败且超次 -> END
+        workflow.add_conditional_edges(
+            "validate",
+            self._should_retry,
+            {
+                "success": END,
+                "retry": "retry",
+                "failed": END
+            }
+        )
+        workflow.add_edge("retry", "process")
+        
+        return workflow.compile()
+    
+    async def _process_node(self, state: BaseAgentState) -> BaseAgentState:
+        """
+        处理节点：调用 LLM 生成输出
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            BaseAgentState: 更新后的状态
+        """
+        try:
+            # 构建用户提示
+            user_prompt = self.build_user_prompt(state)
+            
+            # 调用 LLM
+            response = await self._call_llm(self.system_prompt, user_prompt)
+            
+            # 尝试解析输出
+            parsed_output = self.parse_output(response)
+            
+            return {
+                **state,
+                "output": parsed_output,
+                "error": None
+            }
+        except Exception as e:
+            return {
+                **state,
+                "output": None,
+                "error": str(e)
+            }
+    
+    def _validate_node(self, state: BaseAgentState) -> BaseAgentState:
+        """
+        验证节点：使用 Pydantic 校验输出
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            BaseAgentState: 更新后的状态
+        """
+        if state["error"]:
+            return state
+        
+        if not state["output"]:
+            return {
+                **state,
+                "error": "No output generated"
+            }
+        
+        try:
+            # 使用 Pydantic 校验
+            validated = self.validate_output(state["output"])
+            return {
+                **state,
+                "output": validated.model_dump(),
+                "error": None
+            }
+        except ValidationError as e:
+            return {
+                **state,
+                "error": f"Validation error: {e}"
+            }
+    
+    def _retry_node(self, state: BaseAgentState) -> BaseAgentState:
+        """
+        重试节点：增加重试计数
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            BaseAgentState: 更新后的状态
+        """
+        return {
+            **state,
+            "retry_count": state["retry_count"] + 1
+        }
+    
+    def _should_retry(self, state: BaseAgentState) -> str:
+        """
+        判断是否需要重试
+        
+        Args:
+            state: 当前状态
+            
+        Returns:
+            str: "success" | "retry" | "failed"
+        """
+        if state["error"] is None:
+            return "success"
+        elif state["retry_count"] < self.MAX_RETRIES:
+            return "retry"
+        else:
+            return "failed"
     
     async def _call_llm(
         self,
-        messages: List[Dict[str, str]],
+        system_prompt: str,
+        user_prompt: str,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ) -> str:
         """
         统一 LLM 调用方法（异步）
 
@@ -105,63 +279,69 @@ class BaseAgent(ABC, Generic[T]):
         使用 litellm.acompletion 避免阻塞事件循环
 
         Args:
-            messages: 消息列表
+            system_prompt: 系统提示
+            user_prompt: 用户提示
             temperature: 温度参数
             max_tokens: 最大 Token 数
 
         Returns:
-            Dict: 包含 content, usage, reasoning 的完整响应
+            str: LLM 响应内容
 
         Raises:
             LLMCallError: 调用失败
         """
         try:
-            # 从配置获取 API 参数
-            api_key = settings.llm_api_key
-            api_base = settings.llm_api_base
-            model = settings.llm_model
-
             # 检查 API Key
-            if not api_key:
+            if not settings.llm_api_key:
                 provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
                 raise LLMCallError(f"{provider} API Key 未配置")
 
-            # 调用 litellm 异步接口，避免阻塞事件循环
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                api_key=api_key,
-                api_base=api_base,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-
-            # 提取响应内容
-            if not response or not response.choices:
-                raise LLMCallError("LLM 返回空响应")
-
-            # 构建返回结果
-            result = {
-                "content": response.choices[0].message.content,
-                "usage": response.usage if hasattr(response, 'usage') else None,
-                "reasoning": None
-            }
-
-            # 尝试提取推理过程（如果模型支持）
-            message = response.choices[0].message
-            if hasattr(message, 'reasoning_content') and message.reasoning_content:
-                result["reasoning"] = message.reasoning_content
-            elif hasattr(message, 'reasoning') and message.reasoning:
-                result["reasoning"] = message.reasoning
-
-            return result
+            if settings.USE_MODELSCOPE:
+                # ModelScope 使用 OpenAI 兼容接口（异步）
+                from openai import AsyncOpenAI
+                
+                client = AsyncOpenAI(
+                    base_url=settings.llm_api_base,
+                    api_key=settings.llm_api_key
+                )
+                
+                response = await client.chat.completions.create(
+                    model=settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+                if response and response.choices:
+                    return response.choices[0].message.content
+            else:
+                # OpenAI 使用 LiteLLM 异步接口
+                response = await litellm.acompletion(
+                    model=settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    api_key=settings.llm_api_key,
+                    api_base=settings.llm_api_base,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                
+                if response and response.choices:
+                    return response.choices[0].message.content
+            
+            raise LLMCallError("LLM 返回空响应")
 
         except Exception as e:
             raise LLMCallError(f"LLM 调用失败: {e}")
     
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """
-        解析 LLM 返回的 JSON
+        解析 LLM 返回的 JSON（工具方法）
         
         剥离 Markdown 代码块，提取纯 JSON
         
@@ -189,28 +369,25 @@ class BaseAgent(ABC, Generic[T]):
         self,
         pipeline_id: int,
         stage_name: str,
-        **prompt_kwargs
+        initial_state: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         执行 Agent
 
         完整的执行流程：
-        1. 构建 Prompt
-        2. 调用 LLM（带重试）
-        3. 解析 JSON
-        4. 校验输出
-        5. 记录指标（Token、耗时、推理过程）
+        1. 初始化状态
+        2. 执行 LangGraph 状态机
+        3. 记录指标（Token、耗时、推理过程）
 
         Args:
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
-            **prompt_kwargs: Prompt 构建参数
+            initial_state: 初始状态（包含业务相关字段）
 
         Returns:
-            Dict: {success, output, error, metrics, input_tokens, output_tokens, duration_ms, reasoning}
+            Dict: {success, output, error, retry_count, input_tokens, output_tokens, duration_ms, reasoning}
         """
         retry_count = 0
-        last_error = None
         total_input_tokens = 0
         total_output_tokens = 0
         reasoning_content = None
@@ -220,106 +397,123 @@ class BaseAgent(ABC, Generic[T]):
 
         # 使用上下文管理器记录指标
         with agent_metrics_context(self.agent_name, stage_name, pipeline_id) as metrics:
-            while retry_count <= self.MAX_RETRIES:
-                try:
-                    # 1. 构建 Prompt
-                    user_prompt = self.build_user_prompt(**prompt_kwargs)
-                    messages = [
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]
-
-                    # 推送思考开始日志
+            # 推送开始日志
+            await push_log(
+                pipeline_id,
+                "thought",
+                f"[{self.agent_name}] 开始执行...",
+                stage=stage_name
+            )
+            
+            # 构建完整初始状态
+            full_initial_state: BaseAgentState = {
+                "output": None,
+                "error": None,
+                "retry_count": 0,
+                **initial_state  # 合并业务状态
+            }
+            
+            try:
+                # 执行状态机（异步）
+                result = await self.graph.ainvoke(full_initial_state)
+                
+                # 计算耗时
+                end_time = time.perf_counter()
+                duration_ms = int((end_time - start_time) * 1000)
+                
+                # 记录指标
+                metrics.input_tokens = total_input_tokens
+                metrics.output_tokens = total_output_tokens
+                metrics.retry_count = result.get("retry_count", 0)
+                
+                if result.get("error"):
+                    # 执行失败
+                    error_msg = result["error"]
+                    error(
+                        f"[{self.agent_name}] 执行失败",
+                        pipeline_id=pipeline_id,
+                        stage=stage_name,
+                        error=error_msg
+                    )
                     await push_log(
                         pipeline_id,
-                        "thought",
-                        f"[{self.agent_name}] 开始分析需求...",
+                        "error",
+                        f"[{self.agent_name}] 执行失败: {error_msg[:200]}",
                         stage=stage_name
                     )
-
-                    # 2. 调用 LLM（异步）
-                    llm_response = await self._call_llm(messages)
-                    response_content = llm_response["content"]
-
-                    # 3. 提取 Token 和推理过程
-                    if llm_response.get("usage"):
-                        total_input_tokens = llm_response["usage"].prompt_tokens
-                        total_output_tokens = llm_response["usage"].completion_tokens
-
-                    if llm_response.get("reasoning"):
-                        reasoning_content = llm_response["reasoning"]
-                        # 推送推理过程
-                        await push_log(
-                            pipeline_id,
-                            "thought",
-                            f"[{self.agent_name}] 推理过程:\n{reasoning_content[:500]}",
-                            stage=stage_name
-                        )
-
-                    # 4. 解析输出
-                    parsed_output = self.parse_output(response_content)
-
-                    # 5. 校验输出
-                    validated_output = self.validate_output(parsed_output)
-
-                    # 6. 计算耗时
-                    end_time = time.perf_counter()
-                    duration_ms = int((end_time - start_time) * 1000)
-
-                    # 7. 记录指标
-                    metrics.input_tokens = total_input_tokens
-                    metrics.output_tokens = total_output_tokens
-                    metrics.retry_count = retry_count
-
-                    # 推送完成日志
-                    await push_log(
-                        pipeline_id,
-                        "thought",
-                        f"[{self.agent_name}] 分析完成，耗时 {duration_ms}ms，输入 {total_input_tokens} tokens，输出 {total_output_tokens} tokens",
-                        stage=stage_name
-                    )
-
+                    
                     return {
-                        "success": True,
-                        "output": validated_output.model_dump(),
-                        "error": None,
-                        "retry_count": retry_count,
+                        "success": False,
+                        "output": None,
+                        "error": error_msg,
+                        "retry_count": result.get("retry_count", 0),
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
                         "duration_ms": duration_ms,
                         "reasoning": reasoning_content
                     }
+                
+                # 执行成功
+                await push_log(
+                    pipeline_id,
+                    "thought",
+                    f"[{self.agent_name}] 执行完成，耗时 {duration_ms}ms",
+                    stage=stage_name
+                )
+                
+                return {
+                    "success": True,
+                    "output": result["output"],
+                    "error": None,
+                    "retry_count": result.get("retry_count", 0),
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "duration_ms": duration_ms,
+                    "reasoning": reasoning_content
+                }
+                
+            except Exception as e:
+                # 状态机执行异常
+                end_time = time.perf_counter()
+                duration_ms = int((end_time - start_time) * 1000)
+                error_msg = f"执行异常: {str(e)}"
+                
+                error(
+                    f"[{self.agent_name}] 状态机执行异常",
+                    pipeline_id=pipeline_id,
+                    stage=stage_name,
+                    error=str(e),
+                    exc_info=True
+                )
+                
+                # 推送错误日志到前端
+                await push_log(
+                    pipeline_id,
+                    "error",
+                    f"[{self.agent_name}] 执行异常: {error_msg[:500]}",
+                    stage=stage_name
+                )
+                
+                return {
+                    "success": False,
+                    "output": None,
+                    "error": error_msg,
+                    "retry_count": retry_count,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "duration_ms": duration_ms,
+                    "reasoning": reasoning_content
+                }
 
-                except (LLMCallError, JSONParseError, ValidationError) as e:
-                    last_error = str(e)
-                    retry_count += 1
-                    metrics.retry_count = retry_count
 
-                    # 推送错误日志
-                    await push_log(
-                        pipeline_id,
-                        "thought",
-                        f"[{self.agent_name}] 第 {retry_count} 次尝试失败: {str(e)[:200]}",
-                        stage=stage_name
-                    )
-
-                    if retry_count > self.MAX_RETRIES:
-                        break
-
-            # 所有重试失败
-            end_time = time.perf_counter()
-            duration_ms = int((end_time - start_time) * 1000)
-
-            return {
-                "success": False,
-                "output": None,
-                "error": f"执行失败（重试{retry_count}次）: {last_error}",
-                "retry_count": retry_count,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "duration_ms": duration_ms,
-                "reasoning": reasoning_content
-            }
+# 保留旧的 BaseAgent 以兼容现有代码
+class BaseAgent(LangGraphAgent[T]):
+    """
+    向后兼容的 BaseAgent 别名
+    
+    新代码应直接使用 LangGraphAgent
+    """
+    pass
 
 
 class MockAgent(BaseAgent[BaseModel]):
@@ -337,7 +531,7 @@ class MockAgent(BaseAgent[BaseModel]):
     def system_prompt(self) -> str:
         return "Mock system prompt"
     
-    def build_user_prompt(self, **kwargs) -> str:
+    def build_user_prompt(self, state: Dict[str, Any]) -> str:
         return "Mock user prompt"
     
     def parse_output(self, response: str) -> Dict[str, Any]:
@@ -346,12 +540,8 @@ class MockAgent(BaseAgent[BaseModel]):
     def validate_output(self, output: Dict[str, Any]) -> BaseModel:
         return BaseModel(**output)
     
-    async def _call_llm(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
-        return {
-            "content": json.dumps(self._mock_response),
-            "usage": None,
-            "reasoning": None
-        }
+    async def _call_llm(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
+        return json.dumps(self._mock_response)
 
 
 def get_llm_provider_info() -> Dict[str, str]:

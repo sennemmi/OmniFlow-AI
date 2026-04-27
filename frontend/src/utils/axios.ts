@@ -48,9 +48,8 @@ apiClient.interceptors.response.use(
       return Promise.reject(error);
     }
 
-    // 返回 data 部分，剥离外层包装
-    // 直接返回 data.data，让 apiPost/apiGet 能正确获取
-    return { ...response, data: data.data } as AxiosResponse<unknown>;
+    // ★ 直接返回业务数据，而不是放入 data 字段
+    return data.data as any;
   },
   (error: AxiosError<ApiResponse<unknown>>) => {
     // HTTP 错误处理
@@ -76,25 +75,21 @@ function generateRequestId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// 包装响应类型
+// 包装响应类型 - 拦截器已返回业务数据，直接使用
 export async function apiGet<T>(url: string, params?: Record<string, unknown>): Promise<T> {
-  const response = await apiClient.get<T>(url, { params });
-  return response.data;
+  return apiClient.get<any, T>(url, { params });
 }
 
 export async function apiPost<T>(url: string, data?: Record<string, unknown>): Promise<T> {
-  const response = await apiClient.post<T>(url, data);
-  return response.data;
+  return apiClient.post<any, T>(url, data);
 }
 
 export async function apiPut<T>(url: string, data?: Record<string, unknown>): Promise<T> {
-  const response = await apiClient.put<T>(url, data);
-  return response.data;
+  return apiClient.put<any, T>(url, data);
 }
 
 export async function apiDelete<T>(url: string): Promise<T> {
-  const response = await apiClient.delete<T>(url);
-  return response.data;
+  return apiClient.delete<any, T>(url);
 }
 
 export default apiClient;

@@ -2,6 +2,19 @@
 // OmniFlowAI 类型定义
 // ============================================
 
+// ---------- 全局 Window 扩展 ----------
+declare global {
+  interface Window {
+    __OMNIFLOW_API_URL__?: string;
+    OmniFlowAI?: {
+      toggle: () => void;
+      isActive: () => boolean;
+      version: string;
+      config: Record<string, unknown>;
+    };
+  }
+}
+
 // ---------- API 响应类型 ----------
 export interface ApiResponse<T> {
   success: boolean;

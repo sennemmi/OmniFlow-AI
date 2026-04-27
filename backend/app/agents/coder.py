@@ -1,72 +1,38 @@
 """
 编码 Agent
-唯一能调用 LLM 的地方 - 代码生成实现
+基于 LangGraph 状态机实现，继承 BaseAgent 统一调用逻辑
 
-铁律：System Prompt 强调"以破坏架构为耻"
-Agent 必须保持原有的缩进、注释风格和分层逻辑
-
-使用 LiteLLM 统一接口，支持 ModelScope (魔搭) 和 OpenAI 切换
+职责：
+1. 分析 DesignerAgent 的技术方案
+2. 读取目标文件当前内容
+3. 生成符合项目风格的代码
 """
 
 import json
 import logging
-import re
-from typing import Dict, List, Optional, TypedDict, Any
+from typing import Dict, Optional, Any
 
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field, ValidationError
-
-from app.agents.base import LLMCallError
+from app.agents.base import LangGraphAgent
+from app.agents.schemas import CoderOutput
 
 logger = logging.getLogger(__name__)
 
 
-class CoderState(TypedDict):
-    """编码 Agent 状态"""
-    design_output: Dict[str, Any]
-    target_files: Dict[str, str]  # 文件路径 -> 当前内容
-    output: Optional[Dict[str, Any]]
-    error: Optional[str]
-    retry_count: int
-    error_context: Optional[str]  # 测试失败时的错误上下文
-
-
-class FileChange(BaseModel):
-    """文件变更"""
-    file_path: str = Field(description="文件相对路径")
-    content: str = Field(description="完整的文件内容")
-    change_type: str = Field(default="modify", description="变更类型: add/modify/delete")
-    description: str = Field(default="", description="变更说明")
-
-
-class CoderOutput(BaseModel):
-    """编码 Agent 输出结构 - Pydantic 校验"""
-    files: List[FileChange] = Field(description="变更的文件列表")
-    summary: str = Field(description="变更摘要")
-    dependencies_added: List[str] = Field(default_factory=list, description="新增依赖")
-    tests_included: bool = Field(default=False, description="是否包含测试代码")
-
-
-class CoderAgent:
+class CoderAgent(LangGraphAgent[CoderOutput]):
     """
     编码 Agent
-
-    基于 LangGraph 的状态机实现，负责：
-    1. 分析 DesignerAgent 的技术方案
-    2. 读取目标文件当前内容
-    3. 生成符合项目风格的代码
-
-    铁律：
-    - 以破坏架构为耻
-    - 保持原有缩进和注释风格
-    - 保持分层逻辑
-    - 优先复用现有代码模式
-
-    使用 LiteLLM 统一接口，支持 ModelScope (魔搭) 和 OpenAI 切换
+    
+    根据设计方案生成代码变更
+    继承 LangGraphAgent，只需实现业务差异部分
     """
-
-    # 系统 Prompt - 强调保持架构和风格
-    SYSTEM_PROMPT = """你是 OmniFlowAI 的编码 Agent，负责根据技术设计方案生成代码。
+    
+    def __init__(self):
+        super().__init__(agent_name="CoderAgent")
+    
+    @property
+    def system_prompt(self) -> str:
+        """系统 Prompt - 强调保持架构和风格"""
+        return """你是 OmniFlowAI 的编码 Agent，负责根据技术设计方案生成代码。
 
 【八荣八耻准则】
 以架构分层为荣，以循环依赖为耻
@@ -86,7 +52,7 @@ class CoderAgent:
 2. 分析目标文件的当前内容和代码风格
 3. 生成代码时必须遵守：
    - 保持原有的缩进风格（空格/Tab 数量）
-   - 保持原有的注释风格（# 或 \"\"\"）
+   - 保持原有的注释风格（# 或三引号）
    - 保持架构分层（api/service/model 分离）
    - 复用现有的工具函数和模式
    - 遵循项目的命名规范
@@ -97,7 +63,7 @@ class CoderAgent:
 {
     "files": [
         {
-            "file_path": "backend/app/api/v1/example.py",
+            "file_path": "app/api/v1/example.py",
             "content": "完整的文件内容...",
             "change_type": "add",
             "description": "新增示例 API"
@@ -115,13 +81,24 @@ class CoderAgent:
 - 如果原文件使用特定的错误处理方式，保持相同方式
 - 遵循 FastAPI 和 SQLModel 的最佳实践
 
+【Import 铁律 - 违反视为严重错误】
+项目的包结构是 backend/app/...，pytest 从 backend/ 目录运行，PYTHONPATH 包含 backend/。
+
+所有业务代码文件必须使用如下 import 方式：
+  from app.core.database import get_session
+  from app.models.user import User
+  from app.service.user import UserService
+
+绝对不允许使用以下错误的 import 方式：
+  from core.database import get_session     # ❌ 错误！缺少 app 前缀
+  from models.user import User              # ❌ 错误！缺少 app 前缀
+  from service.user import UserService      # ❌ 错误！缺少 app 前缀
+  import core.database                      # ❌ 错误！不能这样导入
+
 【环境约束 - 重要】
 - 仅允许使用 Python 标准库和项目已有的库（FastAPI, SQLModel, Pydantic, pytest 等）
 - 严禁引入未安装的第三方库（如 numpy, pandas, PIL, requests 等），除非需求明确要求且你确定环境已提供
-- 测试文件必须使用相对导入或直接从工作区根目录导入被测模块
-- 示例正确用法：
-  - 被测文件在根目录：直接 `import math_utils`
-  - 被测文件在子目录：`from app.service import user_service`
+- 必须使用 target_files 中提供的完整文件路径（包含 backend/ 前缀，如 backend/app/xxx.py）
 
 【注意事项】
 - 只输出 JSON，不要有其他解释性文字
@@ -130,122 +107,20 @@ class CoderAgent:
 - 优先复用现有的接口和模式
 - 保持代码的可读性和可维护性
 """
-
-    MAX_RETRIES = 3
-
-    def __init__(self):
-        self.graph = self._build_graph()
-
-    def _build_graph(self) -> StateGraph:
-        """构建 LangGraph 状态机"""
-
-        # 定义状态图
-        workflow = StateGraph(CoderState)
-
-        # 添加节点
-        workflow.add_node("code", self._code_node)
-        workflow.add_node("validate", self._validate_node)
-        workflow.add_node("retry", self._retry_node)
-
-        # 添加边
-        workflow.set_entry_point("code")
-        workflow.add_edge("code", "validate")
-
-        # 条件边
-        workflow.add_conditional_edges(
-            "validate",
-            self._should_retry,
-            {
-                "success": END,
-                "retry": "retry",
-                "failed": END
-            }
-        )
-        workflow.add_edge("retry", "code")
-
-        return workflow.compile()
-
-    async def _code_node(self, state: CoderState) -> CoderState:
-        """编码节点：调用 LLM 生成代码（异步）"""
-
-        # 构建用户提示，传入错误上下文（如果有）
-        user_prompt = self._build_prompt(
-            state["design_output"],
-            state["target_files"],
-            error_context=state.get("error_context")
-        )
-
-        try:
-            # 调用 LLM（异步）
-            response = await self._call_llm(self.SYSTEM_PROMPT, user_prompt)
-
-            # 尝试解析 JSON
-            parsed_output = self._parse_json_response(response)
-
-            return {
-                **state,
-                "output": parsed_output,
-                "error": None
-            }
-        except Exception as e:
-            return {
-                **state,
-                "output": None,
-                "error": str(e)
-            }
-
-    def _validate_node(self, state: CoderState) -> CoderState:
-        """验证节点：使用 Pydantic 校验输出"""
-
-        if state["error"]:
-            return state
-
-        if not state["output"]:
-            return {
-                **state,
-                "error": "No output generated"
-            }
-
-        try:
-            # 使用 Pydantic 校验
-            validated = CoderOutput(**state["output"])
-            return {
-                **state,
-                "output": validated.model_dump(),
-                "error": None
-            }
-        except ValidationError as e:
-            return {
-                **state,
-                "error": f"Validation error: {e}"
-            }
-
-    def _retry_node(self, state: CoderState) -> CoderState:
-        """重试节点：增加重试计数"""
-        return {
-            **state,
-            "retry_count": state["retry_count"] + 1
-        }
-
-    def _should_retry(self, state: CoderState) -> str:
-        """判断是否需要重试"""
-        if state["error"] is None:
-            return "success"
-        elif state["retry_count"] < self.MAX_RETRIES:
-            return "retry"
-        else:
-            return "failed"
-
-    def _build_prompt(
-        self,
-        design_output: Dict[str, Any],
-        target_files: Dict[str, str],
-        error_context: Optional[str] = None
-    ) -> str:
-        """构建 LLM 提示"""
-
+    
+    def build_user_prompt(self, state: Dict[str, Any]) -> str:
+        """
+        构建用户 Prompt
+        
+        Args:
+            state: 包含 design_output, target_files, error_context 的状态
+        """
+        design_output = state.get("design_output", {})
+        target_files = state.get("target_files", {})
+        error_context = state.get("error_context")
+        
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
-
+        
         # 构建文件内容部分
         files_content = []
         for file_path, content in target_files.items():
@@ -253,9 +128,9 @@ class CoderAgent:
 ```python
 {content}
 ```""")
-
+        
         files_str = "\n\n".join(files_content)
-
+        
         # 基础提示
         prompt = f"""【技术设计方案】
 {design_str}
@@ -267,7 +142,7 @@ class CoderAgent:
 注意保持原有代码的缩进风格、注释风格和架构分层。
 输出完整的文件内容（不是 diff 格式）。
 """
-
+        
         # 如果有报错上下文，注入到 Prompt 头部，强制 Agent 进入修复模式
         if error_context:
             prompt = f"""【！！！修复任务！！！】
@@ -282,82 +157,17 @@ class CoderAgent:
 ---
 
 {prompt}"""
-
+        
         return prompt
-
-    async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        调用 LLM - 使用 OpenAI 兼容接口（异步）
-
-        支持 ModelScope (魔搭) 和 OpenAI 运行时切换
-        使用异步接口避免阻塞事件循环
-        """
-        from app.core.config import settings
-
-        # 检查 API Key
-        if not settings.llm_api_key:
-            provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
-            raise LLMCallError(f"{provider} API Key 未配置")
-
-        try:
-            if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口（异步）
-                from openai import AsyncOpenAI
-
-                client = AsyncOpenAI(
-                    base_url=settings.llm_api_base,
-                    api_key=settings.llm_api_key
-                )
-
-                response = await client.chat.completions.create(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.7
-                )
-
-                if response and response.choices:
-                    return response.choices[0].message.content
-            else:
-                # OpenAI 使用 LiteLLM 异步接口
-                import litellm
-                litellm.set_verbose = False
-
-                response = await litellm.acompletion(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base,
-                    temperature=0.7
-                )
-
-                if response and response.choices:
-                    return response.choices[0].message.content
-
-            raise LLMCallError("LLM 返回空响应")
-
-        except Exception as e:
-            raise LLMCallError(f"LLM 调用失败: {e}")
-
-    def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """
-        解析 LLM 返回的 JSON
-
-        剥离 Markdown 代码块，提取纯 JSON
-        """
-        # 去除 Markdown 代码块标记
-        json_str = re.sub(r'^```json\s*', '', response.strip())
-        json_str = re.sub(r'^```\s*', '', json_str)
-        json_str = re.sub(r'```\s*$', '', json_str)
-        json_str = json_str.strip()
-
-        return json.loads(json_str)
-
+    
+    def parse_output(self, response: str) -> Dict[str, Any]:
+        """解析 LLM 输出为字典"""
+        return self._parse_json_response(response)
+    
+    def validate_output(self, output: Dict[str, Any]) -> CoderOutput:
+        """校验输出为 CoderOutput 模型"""
+        return CoderOutput(**output)
+    
     async def generate_code(
         self,
         design_output: Dict[str, Any],
@@ -372,12 +182,13 @@ class CoderAgent:
             design_output: DesignerAgent 的输出内容
             target_files: 目标文件路径到内容的映射
             pipeline_id: Pipeline ID，用于日志记录
+            error_context: 测试失败的错误上下文（用于修复模式）
 
         Returns:
             Dict: 包含生成结果或错误信息
         """
         from app.core.sse_log_buffer import push_log
-
+        
         files_count = len(target_files)
         logger.info(f"CoderAgent 开始生成代码", extra={
             "pipeline_id": pipeline_id,
@@ -387,47 +198,37 @@ class CoderAgent:
 
         if pipeline_id:
             await push_log(pipeline_id, "info", f"CoderAgent 开始生成代码，共 {files_count} 个文件...", stage="CODING")
-
-        initial_state: CoderState = {
+        
+        initial_state = {
             "design_output": design_output,
             "target_files": target_files,
-            "output": None,
-            "error": None,
-            "retry_count": 0,
             "error_context": error_context
         }
-
-        # 执行状态机（使用异步接口）
-        result = await self.graph.ainvoke(initial_state)
-
-        if result["error"]:
-            logger.error(f"CoderAgent 代码生成失败", extra={
+        
+        result = await self.execute(
+            pipeline_id=pipeline_id or 0,
+            stage_name="CODING",
+            initial_state=initial_state
+        )
+        
+        if result.get("success"):
+            output_files = result.get("output", {}).get("files", [])
+            logger.info(f"CoderAgent 代码生成完成", extra={
                 "pipeline_id": pipeline_id,
-                "error": result["error"]
+                "generated_files_count": len(output_files),
+                "generated_files": [f.get("file_path") for f in output_files]
             })
             if pipeline_id:
-                await push_log(pipeline_id, "error", f"代码生成失败: {result['error']}", stage="CODING")
-            return {
-                "success": False,
-                "error": result["error"],
-                "output": None
-            }
-
-        output_files = result["output"].get("files", [])
-        logger.info(f"CoderAgent 代码生成完成", extra={
-            "pipeline_id": pipeline_id,
-            "generated_files_count": len(output_files),
-            "generated_files": [f.get("file_path") for f in output_files]
-        })
-
-        if pipeline_id:
-            await push_log(pipeline_id, "info", f"代码生成完成，共 {len(output_files)} 个文件", stage="CODING")
-
-        return {
-            "success": True,
-            "error": None,
-            "output": result["output"]
-        }
+                await push_log(pipeline_id, "info", f"代码生成完成，共 {len(output_files)} 个文件", stage="CODING")
+        else:
+            logger.error(f"CoderAgent 代码生成失败", extra={
+                "pipeline_id": pipeline_id,
+                "error": result.get("error")
+            })
+            if pipeline_id:
+                await push_log(pipeline_id, "error", f"代码生成失败: {result.get('error', '')}", stage="CODING")
+        
+        return result
 
 
 # 单例实例

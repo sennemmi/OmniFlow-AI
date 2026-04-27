@@ -9,8 +9,23 @@
   // ============================================
   // 配置
   // ============================================
+  // 动态获取 API 基础地址：优先使用父窗口配置，降级到当前 origin
+  const getApiBaseUrl = () => {
+    // 尝试从父窗口获取配置（iframe 场景）
+    if (window.parent !== window && window.parent.__OMNIFLOW_API_URL__) {
+      return window.parent.__OMNIFLOW_API_URL__;
+    }
+    // 从当前脚本标签的 data-api-url 属性获取
+    const currentScript = document.currentScript;
+    if (currentScript && currentScript.dataset.apiUrl) {
+      return currentScript.dataset.apiUrl;
+    }
+    // 降级：使用当前页面的 origin（适用于同域或通过代理访问）
+    return window.location.origin;
+  };
+
   const CONFIG = {
-    API_BASE_URL: 'http://localhost:8000',
+    API_BASE_URL: getApiBaseUrl(),
     API_ENDPOINT: '/api/v1/pipeline/create',
     POLL_INTERVAL: 3000,
     ICON_SIZE: 48,
@@ -52,6 +67,47 @@
 
     getElementInfo: (el) => {
       const rect = el.getBoundingClientRect();
+
+      // 获取源码位置信息（支持多种属性名）
+      // vite-plugin-component-debugger 使用 data-source-id
+      // 格式: filepath:line:column
+      let dataSource = el.getAttribute('data-source-id') ||
+                       el.getAttribute('data-source') || '';
+      let sourceElement = el;
+
+      // 如果当前元素没有源码信息，尝试向上查找
+      if (!dataSource) {
+        const closestWithSource = el.closest('[data-source-id], [data-source]');
+        if (closestWithSource) {
+          dataSource = closestWithSource.getAttribute('data-source-id') ||
+                       closestWithSource.getAttribute('data-source') || '';
+          sourceElement = closestWithSource;
+        }
+      }
+
+      // 解析源码位置信息：格式为 "filepath:line:column"
+      let sourceFile = '';
+      let sourceLine = 0;
+      let sourceColumn = 0;
+
+      if (dataSource) {
+        const parts = dataSource.split(':');
+        if (parts.length >= 2) {
+          // 处理 Windows 路径（如 D:\project\file.tsx:10:5）
+          if (parts[0].length === 1 && parts[1].startsWith('\\')) {
+            // Windows 绝对路径：D:\path\to\file.tsx:10:5
+            sourceFile = parts[0] + ':' + parts[1];
+            sourceLine = parseInt(parts[2]) || 0;
+            sourceColumn = parseInt(parts[3]) || 0;
+          } else {
+            // Unix 路径或相对路径：src/file.tsx:10:5
+            sourceFile = parts[0];
+            sourceLine = parseInt(parts[1]) || 0;
+            sourceColumn = parseInt(parts[2]) || 0;
+          }
+        }
+      }
+
       return {
         tag: el.tagName.toLowerCase(),
         id: el.id,
@@ -60,9 +116,13 @@
         outerHTML: el.outerHTML?.slice(0, 2000) || '',
         xpath: getXPath(el),
         selector: getUniqueSelector(el),
-        dataSource: el.getAttribute('data-source') || '',
+        dataSource: dataSource,
         dataComponent: el.getAttribute('data-component') || '',
         dataFile: el.getAttribute('data-file') || '',
+        // 新增：精确的源码位置信息
+        sourceFile: sourceFile,
+        sourceLine: sourceLine,
+        sourceColumn: sourceColumn,
         rect: {
           x: rect.x,
           y: rect.y,
@@ -223,17 +283,44 @@
         color: '#fff',
         fontSize: '12px',
         fontFamily: 'monospace',
-        maxWidth: '300px',
+        maxWidth: '320px',
         zIndex: CONFIG.Z_INDEX,
         boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
       });
 
-      const hasSource = info.dataSource || info.dataFile;
+      // 判断是否成功获取到精确的源码位置
+      const hasPreciseSource = info.sourceFile && info.sourceLine > 0;
+      const hasLegacySource = info.dataSource || info.dataFile;
+
+      let sourceInfoHtml = '';
+      let sourceStatusHtml = '';
+
+      if (hasPreciseSource) {
+        // 显示精确的源码位置
+        const displayPath = info.sourceFile.includes('src/')
+          ? info.sourceFile.substring(info.sourceFile.indexOf('src/'))
+          : info.sourceFile;
+        sourceInfoHtml = `<div style="color: #00B42A; font-size: 11px;">📍 ${displayPath}:${info.sourceLine}</div>`;
+        sourceStatusHtml = '<div style="color: #00B42A; font-size: 11px; margin-top: 4px;">✅ 已精确定位源码</div>';
+      } else if (hasLegacySource) {
+        // 显示旧的 source 信息
+        sourceInfoHtml = `<div style="color: #FF7D00; font-size: 11px;">📄 ${info.dataSource || info.dataFile}</div>`;
+        sourceStatusHtml = '<div style="color: #FF7D00; font-size: 11px; margin-top: 4px;">⚠️ 未精确定位（生产构建模式）</div>';
+      } else {
+        // 生产构建无源码信息时的提示
+        sourceStatusHtml = `
+          <div style="color: #646A73; font-size: 11px; margin-top: 4px;">
+            ❓ 无源码信息（生产构建）<br/>
+            <span style="font-size: 10px;">提示：在开发模式下使用可精确定位</span>
+          </div>
+        `;
+      }
+
       tooltip.innerHTML = `
         <div style="margin-bottom: 4px; color: #3370FF; font-weight: bold;">${info.tag}${info.id ? `#${info.id}` : ''}</div>
         <div style="color: #8F959E; margin-bottom: 4px;">${info.class.slice(0, 50)}${info.class.length > 50 ? '...' : ''}</div>
-        ${hasSource ? `<div style="color: #00B42A; font-size: 11px;">📄 ${info.dataSource || info.dataFile}</div>` : ''}
-        <div style="color: #646A73; font-size: 11px;">点击锁定此元素</div>
+        ${sourceInfoHtml}
+        ${sourceStatusHtml}
       `;
 
       return tooltip;
@@ -263,21 +350,42 @@
         flexDirection: 'column',
       });
 
-      const hasSource = elementInfo.dataSource || elementInfo.dataFile;
-      
+      const hasPreciseSource = elementInfo.sourceFile && elementInfo.sourceLine > 0;
+      const hasLegacySource = elementInfo.dataSource || elementInfo.dataFile;
+
+      // 构建源码位置显示
+      let sourceDisplayHtml = '';
+      if (hasPreciseSource) {
+        const displayPath = elementInfo.sourceFile.includes('src/')
+          ? elementInfo.sourceFile.substring(elementInfo.sourceFile.indexOf('src/'))
+          : elementInfo.sourceFile;
+        sourceDisplayHtml = `<span style="color: #00B42A; margin-left: 8px;">📍 ${displayPath}:${elementInfo.sourceLine}</span>`;
+      } else if (hasLegacySource) {
+        sourceDisplayHtml = `<span style="color: #FF7D00; margin-left: 8px;">📄 ${elementInfo.dataSource || elementInfo.dataFile}</span>`;
+      }
+
       dialog.innerHTML = `
         <div style="padding: 20px 24px; border-bottom: 1px solid #E8E9EB;">
           <h3 style="margin: 0; font-size: 18px; font-weight: 600; color: #1F2329;">修改元素</h3>
           <p style="margin: 8px 0 0; font-size: 13px; color: #646A73;">
             ${elementInfo.tag}${elementInfo.id ? `#${elementInfo.id}` : ''}
-            ${hasSource ? `<span style="color: #3370FF; margin-left: 8px;">📄 ${elementInfo.dataSource || elementInfo.dataFile}</span>` : ''}
+            ${sourceDisplayHtml}
           </p>
+          ${hasPreciseSource ? `
+          <div style="margin-top: 8px; padding: 8px 12px; background: #F0FFF5; border-radius: 6px; border: 1px solid #00B42A;">
+            <span style="font-size: 12px; color: #00B42A;">✅ 已精确定位到源码位置，AI 将直接修改此文件</span>
+          </div>
+          ` : hasLegacySource ? `
+          <div style="margin-top: 8px; padding: 8px 12px; background: #FFF7F0; border-radius: 6px; border: 1px solid #FF7D00;">
+            <span style="font-size: 12px; color: #FF7D00;">⚠️ 未精确定位源码，AI 将尝试猜测对应代码</span>
+          </div>
+          ` : ''}
         </div>
         <div style="padding: 20px 24px; overflow-y: auto; flex: 1;">
           <label style="display: block; margin-bottom: 8px; font-size: 14px; font-weight: 500; color: #1F2329;">
             你想如何修改此元素？
           </label>
-          <textarea 
+          <textarea
             id="omni-edit-input"
             placeholder="例如：将按钮颜色改为红色，增加点击动画效果..."
             style="
@@ -291,12 +399,16 @@
               box-sizing: border-box;
             "
           ></textarea>
-          
+
           <div style="margin-top: 12px; padding: 12px; background: #F5F6F7; border-radius: 8px;">
             <div style="font-size: 12px; color: #646A73; margin-bottom: 4px;">元素上下文信息：</div>
             <div style="font-size: 11px; color: #1F2329; font-family: monospace; overflow: hidden;">
               <div>XPath: ${elementInfo.xpath}</div>
-              ${elementInfo.dataSource ? `<div>Source: ${elementInfo.dataSource}</div>` : ''}
+              ${hasPreciseSource ? `
+                <div style="color: #00B42A;">📍 Source: ${elementInfo.sourceFile}:${elementInfo.sourceLine}:${elementInfo.sourceColumn}</div>
+              ` : elementInfo.dataSource ? `
+                <div>Source: ${elementInfo.dataSource}</div>
+              ` : ''}
               ${elementInfo.dataComponent ? `<div>Component: ${elementInfo.dataComponent}</div>` : ''}
             </div>
           </div>
@@ -528,6 +640,21 @@
     try {
       // 构建请求体 - 适配后端 API
       const requirement = `修复: ${elementInfo.tag}${elementInfo.id ? `#${elementInfo.id}` : ''}\n\n${feedback}`;
+
+      // 构建 sourceContext（如果有精确的源码位置信息）
+      let sourceContext = null;
+      if (elementInfo.sourceFile && elementInfo.sourceLine > 0) {
+        sourceContext = {
+          file: elementInfo.sourceFile,
+          line: elementInfo.sourceLine,
+          column: elementInfo.sourceColumn,
+          // 转换为相对路径（如果可能）
+          relativePath: elementInfo.sourceFile.includes('src/')
+            ? elementInfo.sourceFile.substring(elementInfo.sourceFile.indexOf('src/'))
+            : elementInfo.sourceFile,
+        };
+      }
+
       const payload = {
         requirement: requirement,
         elementContext: {
@@ -543,6 +670,8 @@
           dataFile: elementInfo.dataFile,
           rect: elementInfo.rect,
         },
+        // 新增：精确的源码位置上下文
+        sourceContext: sourceContext,
       };
 
       // 发送请求

@@ -1,52 +1,35 @@
 """
 架构师 Agent
-唯一能调用 LLM 的地方 - LangGraph 状态机实现
+基于 LangGraph 状态机实现，继承 BaseAgent 统一调用逻辑
 
-使用 BaseAgent 统一调用逻辑，支持 ModelScope (魔搭) 和 OpenAI 切换
+职责：
+1. 分析用户需求
+2. 结合项目上下文（文件树）
+3. 输出结构化设计方案
 """
 
 import json
-from typing import Dict, List, Optional, TypedDict, Any
+from typing import Dict, List, Optional, Any
 
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field, ValidationError
-
-from app.agents.base import BaseAgent, LLMCallError, JSONParseError
+from app.agents.base import LangGraphAgent
+from app.agents.schemas import ArchitectOutput
 
 
-class ArchitectOutput(BaseModel):
-    """架构师输出结构 - Pydantic 校验"""
-    feature_description: str = Field(description="功能描述")
-    affected_files: List[str] = Field(description="受影响文件列表")
-    estimated_effort: str = Field(description="预估工作量")
-    technical_design: Optional[str] = Field(default=None, description="技术设计方案")
-
-
-class ArchitectState(TypedDict):
-    """架构师 Agent 状态"""
-    requirement: str
-    file_tree: Dict[str, Any]
-    element_context: Optional[Dict[str, Any]]
-    output: Optional[Dict[str, Any]]
-    error: Optional[str]
-    retry_count: int
-
-
-class ArchitectAgent:
+class ArchitectAgent(LangGraphAgent[ArchitectOutput]):
     """
     架构师 Agent
     
-    基于 LangGraph 的状态机实现，负责：
-    1. 分析用户需求
-    2. 结合项目上下文（文件树）
-    3. 输出结构化设计方案
-    
-    遵循"八荣八耻"准则
-    使用 BaseAgent 统一 LLM 调用逻辑
+    分析需求并输出技术设计方案
+    继承 LangGraphAgent，只需实现业务差异部分
     """
     
-    # 系统 Prompt - 包含八荣八耻准则
-    SYSTEM_PROMPT = """你是 OmniFlowAI 的架构师 Agent，负责分析需求并输出技术设计方案。
+    def __init__(self):
+        super().__init__(agent_name="ArchitectAgent")
+    
+    @property
+    def system_prompt(self) -> str:
+        """系统 Prompt - 包含八荣八耻准则"""
+        return """你是 OmniFlowAI 的架构师 Agent，负责分析需求并输出技术设计方案。
 
 【八荣八耻准则】
 以架构分层为荣，以循环依赖为耻
@@ -83,116 +66,16 @@ class ArchitectAgent:
 - 遵循项目现有的架构分层规范
 """
     
-    MAX_RETRIES = 3
-    
-    def __init__(self):
-        self.graph = self._build_graph()
-    
-    def _build_graph(self) -> StateGraph:
-        """构建 LangGraph 状态机"""
+    def build_user_prompt(self, state: Dict[str, Any]) -> str:
+        """
+        构建用户 Prompt
         
-        # 定义状态图
-        workflow = StateGraph(ArchitectState)
-        
-        # 添加节点
-        workflow.add_node("analyze", self._analyze_node)
-        workflow.add_node("validate", self._validate_node)
-        workflow.add_node("retry", self._retry_node)
-        
-        # 添加边
-        workflow.set_entry_point("analyze")
-        workflow.add_edge("analyze", "validate")
-        
-        # 条件边：验证成功 -> END，失败且未超次 -> retry，失败且超次 -> END
-        workflow.add_conditional_edges(
-            "validate",
-            self._should_retry,
-            {
-                "success": END,
-                "retry": "retry",
-                "failed": END
-            }
-        )
-        workflow.add_edge("retry", "analyze")
-        
-        return workflow.compile()
-    
-    def _analyze_node(self, state: ArchitectState) -> ArchitectState:
-        """分析节点：调用 LLM 生成方案"""
-        
-        try:
-            # 使用 BaseAgent 的统一调用逻辑
-            from app.agents.base import BaseAgent
-            
-            # 构建用户提示
-            user_prompt = self._build_prompt(
-                state["requirement"],
-                state["file_tree"],
-                state.get("element_context")
-            )
-            
-            # 调用 LLM
-            response = self._call_llm(self.SYSTEM_PROMPT, user_prompt)
-            
-            # 尝试解析 JSON
-            parsed_output = self._parse_json_response(response)
-            
-            return {
-                **state,
-                "output": parsed_output,
-                "error": None
-            }
-        except Exception as e:
-            return {
-                **state,
-                "output": None,
-                "error": str(e)
-            }
-    
-    def _validate_node(self, state: ArchitectState) -> ArchitectState:
-        """验证节点：使用 Pydantic 校验输出"""
-        
-        if state["error"]:
-            return state
-        
-        if not state["output"]:
-            return {
-                **state,
-                "error": "No output generated"
-            }
-        
-        try:
-            # 使用 Pydantic 校验 - 铁律检查
-            validated = ArchitectOutput(**state["output"])
-            return {
-                **state,
-                "output": validated.model_dump(),
-                "error": None
-            }
-        except ValidationError as e:
-            return {
-                **state,
-                "error": f"Validation error: {e}"
-            }
-    
-    def _retry_node(self, state: ArchitectState) -> ArchitectState:
-        """重试节点：增加重试计数"""
-        return {
-            **state,
-            "retry_count": state["retry_count"] + 1
-        }
-    
-    def _should_retry(self, state: ArchitectState) -> str:
-        """判断是否需要重试"""
-        if state["error"] is None:
-            return "success"
-        elif state["retry_count"] < self.MAX_RETRIES:
-            return "retry"
-        else:
-            return "failed"
-    
-    def _build_prompt(self, requirement: str, file_tree: Dict[str, Any], element_context: Optional[Dict[str, Any]] = None) -> str:
-        """构建 LLM 提示"""
+        Args:
+            state: 包含 requirement, file_tree, element_context 的状态
+        """
+        requirement = state.get("requirement", "")
+        file_tree = state.get("file_tree", {})
+        element_context = state.get("element_context")
         
         file_tree_str = json.dumps(file_tree, indent=2, ensure_ascii=False)
         
@@ -220,81 +103,21 @@ class ArchitectAgent:
 请根据以上信息，输出结构化的技术设计方案（JSON 格式）。
 """
     
-    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        调用 LLM - 使用 LiteLLM 统一接口
-        
-        支持 ModelScope (魔搭) 和 OpenAI 运行时切换
-        """
-        from app.core.config import settings
-        
-        # 检查 API Key
-        if not settings.llm_api_key:
-            provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
-            raise LLMCallError(f"{provider} API Key 未配置")
-        
-        try:
-            if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口
-                from openai import OpenAI
-                
-                client = OpenAI(
-                    base_url=settings.llm_api_base,
-                    api_key=settings.llm_api_key
-                )
-                
-                response = client.chat.completions.create(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.7
-                )
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            else:
-                # OpenAI 使用 LiteLLM
-                import litellm
-                litellm.set_verbose = False
-                
-                response = litellm.completion(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base,
-                    temperature=0.7
-                )
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            
-            raise LLMCallError("LLM 返回空响应")
-            
-        except Exception as e:
-            raise LLMCallError(f"LLM 调用失败: {e}")
+    def parse_output(self, response: str) -> Dict[str, Any]:
+        """解析 LLM 输出为字典"""
+        return self._parse_json_response(response)
     
-    def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """
-        解析 LLM 返回的 JSON
-        
-        剥离 Markdown 代码块，提取纯 JSON
-        """
-        import re
-        
-        # 去除 Markdown 代码块标记
-        json_str = re.sub(r'^```json\s*', '', response.strip())
-        json_str = re.sub(r'^```\s*', '', json_str)
-        json_str = re.sub(r'```\s*$', '', json_str)
-        json_str = json_str.strip()
-        
-        return json.loads(json_str)
+    def validate_output(self, output: Dict[str, Any]) -> ArchitectOutput:
+        """校验输出为 ArchitectOutput 模型"""
+        return ArchitectOutput(**output)
     
-    async def analyze(self, requirement: str, file_tree: Dict[str, Any], element_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def analyze(
+        self,
+        requirement: str,
+        file_tree: Dict[str, Any],
+        element_context: Optional[Dict[str, Any]] = None,
+        pipeline_id: int = 0
+    ) -> Dict[str, Any]:
         """
         分析需求并输出方案
         
@@ -302,34 +125,24 @@ class ArchitectAgent:
             requirement: 用户需求描述
             file_tree: 项目文件树字典
             element_context: 页面元素上下文（可选）
+            pipeline_id: Pipeline ID
             
         Returns:
             Dict: 包含分析结果或错误信息
         """
-        initial_state: ArchitectState = {
+        initial_state = {
             "requirement": requirement,
             "file_tree": file_tree,
-            "element_context": element_context,
-            "output": None,
-            "error": None,
-            "retry_count": 0
+            "element_context": element_context
         }
         
-        # 执行状态机
-        result = self.graph.invoke(initial_state)
+        result = await self.execute(
+            pipeline_id=pipeline_id,
+            stage_name="ARCHITECT",
+            initial_state=initial_state
+        )
         
-        if result["error"]:
-            return {
-                "success": False,
-                "error": result["error"],
-                "output": None
-            }
-        
-        return {
-            "success": True,
-            "error": None,
-            "output": result["output"]
-        }
+        return result
 
 
 # 单例实例

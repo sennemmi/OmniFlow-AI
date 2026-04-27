@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Sparkles, Pause, Info, Brain } from 'lucide-react';
+import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Sparkles, Pause, Brain } from 'lucide-react';
 
 // ============================================
-// Agent 终端 - SSE 实时日志流组件
+// Agent 终端 - SSE 实时日志流组件（浅色主题）
 // ============================================
 
 interface LogEntry {
@@ -40,6 +40,9 @@ function stageToLabel(stage: string): string {
     REQUIREMENT: '需求分析',
     DESIGN: '技术设计',
     CODING: '代码生成',
+    UNIT_TESTING: '单元测试',
+    CODE_REVIEW: '代码审查',
+    DELIVERY: '代码交付',
   };
   return map[stage] ?? stage;
 }
@@ -56,25 +59,36 @@ const typeIcons = {
 };
 
 const typeColors = {
-  info: 'text-text-secondary',
-  thinking: 'text-brand-primary',
-  action: 'text-status-warning',
-  warning: 'text-status-warning',
-  success: 'text-status-success',
-  error: 'text-status-error',
-  paused: 'text-brand-primary',
-  thought: 'text-purple-400',
+  info: 'text-slate-600',
+  thinking: 'text-blue-600',
+  action: 'text-amber-600',
+  warning: 'text-amber-600',
+  success: 'text-emerald-600',
+  error: 'text-red-600',
+  paused: 'text-blue-600',
+  thought: 'text-purple-600',
 };
 
 const typeBgColors = {
-  info: 'bg-bg-tertiary',
-  thinking: 'bg-brand-primary/10',
-  action: 'bg-status-warning/10',
-  warning: 'bg-status-warning/10',
-  success: 'bg-status-success/10',
-  error: 'bg-status-error/10',
-  paused: 'bg-brand-primary/20',
-  thought: 'bg-purple-500/10',
+  info: 'bg-slate-50',
+  thinking: 'bg-blue-50',
+  action: 'bg-amber-50',
+  warning: 'bg-amber-50',
+  success: 'bg-emerald-50',
+  error: 'bg-red-50',
+  paused: 'bg-blue-50',
+  thought: 'bg-purple-50',
+};
+
+const typeBorderColors = {
+  info: 'border-slate-200',
+  thinking: 'border-blue-200',
+  action: 'border-amber-200',
+  warning: 'border-amber-200',
+  success: 'border-emerald-200',
+  error: 'border-red-200',
+  paused: 'border-blue-200',
+  thought: 'border-purple-200',
 };
 
 // 打字机效果组件
@@ -201,24 +215,24 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
     if (status === 'paused') {
       return (
         <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-brand-primary animate-pulse" />
-          <span className="text-xs text-text-tertiary">等待审批</span>
+          <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+          <span className="text-xs text-slate-500">等待审批</span>
         </span>
       );
     }
     if (isRunning && connectionStatus === 'connected') {
       return (
         <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-status-success animate-pulse" />
-          <span className="text-xs text-text-tertiary">实时接收中</span>
+          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+          <span className="text-xs text-slate-500">实时接收中</span>
         </span>
       );
     }
     if (connectionStatus === 'connecting') {
       return (
         <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-status-warning animate-pulse" />
-          <span className="text-xs text-text-tertiary">连接中...</span>
+          <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          <span className="text-xs text-slate-500">连接中...</span>
         </span>
       );
     }
@@ -226,39 +240,38 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
   };
 
   return (
-    <div className="bg-hero-dark-1 rounded-xl border border-border-default/20 overflow-hidden">
-      {/* 终端头部 */}
-      <div className="flex items-center justify-between px-4 py-3 bg-black/30 border-b border-border-default/20">
+    <div className="h-full flex flex-col bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+      {/* 终端头部 - 浅色主题 */}
+      <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
         <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-brand-primary" />
-          <span className="text-sm font-medium text-text-white">Agent 终端</span>
-          {getStatusDisplay()}
+          <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center">
+            <Terminal className="w-4 h-4 text-blue-600" />
+          </div>
+          <div>
+            <span className="text-sm font-semibold text-slate-900">Agent 终端</span>
+            {getStatusDisplay()}
+          </div>
         </div>
         <div className="flex items-center gap-1.5">
-          <div className="w-3 h-3 rounded-full bg-status-error/80" />
-          <div className="w-3 h-3 rounded-full bg-status-warning/80" />
-          <div className="w-3 h-3 rounded-full bg-status-success/80" />
+          <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
+          <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
         </div>
       </div>
 
-      {/* 日志内容区 */}
+      {/* 日志内容区 - 浅色背景 */}
       <div
         ref={scrollRef}
-        className="h-64 overflow-y-auto p-4 font-mono text-sm space-y-2 scrollbar-hide"
+        className="flex-1 overflow-y-auto p-3 font-mono text-sm space-y-2 scrollbar-hide bg-slate-50/50"
       >
         {logs.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-text-tertiary">
-            {connectionStatus === 'connecting' ? (
-              <>
-                <Sparkles className="w-4 h-4 mr-2 animate-pulse" />
-                正在连接日志流...
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-4 h-4 mr-2 animate-pulse" />
-                等待 Agent 启动...
-              </>
-            )}
+          <div className="flex flex-col items-center justify-center h-full text-slate-400">
+            <div className="w-12 h-12 rounded-xl bg-slate-100 flex items-center justify-center mb-3">
+              <Sparkles className="w-6 h-6 text-slate-400" />
+            </div>
+            <p className="text-sm">
+              {connectionStatus === 'connecting' ? '正在连接日志流...' : '等待 Agent 启动...'}
+            </p>
           </div>
         ) : (
           logs.map((log, index) => {
@@ -268,33 +281,35 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
             return (
               <div
                 key={log.id}
-                className={`flex items-start gap-3 p-2.5 rounded-lg transition-all duration-300 ${
+                className={`flex items-start gap-3 p-3 rounded-lg border transition-all duration-300 ${
                   typeBgColors[log.type]
-                } ${isLast ? 'animate-in fade-in slide-in-from-left-2' : ''} ${
-                  log.type === 'paused' ? 'border border-brand-primary/30' : ''
+                } ${typeBorderColors[log.type]} ${
+                  isLast ? 'ring-1 ring-blue-200 shadow-sm' : ''
                 }`}
               >
-                <Icon className={`w-4 h-4 mt-0.5 flex-shrink-0 ${typeColors[log.type]}`} />
+                <div className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 ${typeBgColors[log.type]}`}>
+                  <Icon className={`w-3.5 h-3.5 ${typeColors[log.type]}`} />
+                </div>
                 <div className="flex-1 min-w-0">
-                  <div className={`font-medium ${typeColors[log.type]}`}>
+                  <div className={`text-sm ${typeColors[log.type]}`}>
                     {isLast && isTyping && log.type !== 'paused' ? (
                       <TypewriterText text={log.message} />
                     ) : (
                       log.message
                     )}
                     {isLast && isRunning && log.type !== 'paused' && (
-                      <span className="inline-block w-2 h-4 ml-1 bg-brand-primary animate-pulse" />
+                      <span className="inline-block w-1.5 h-4 ml-1 bg-blue-500 animate-pulse rounded-sm" />
                     )}
                   </div>
                   {log.details && (
-                    <div className={`text-xs mt-1 truncate ${
-                      log.type === 'paused' ? 'text-brand-primary font-medium' : 'text-text-tertiary'
+                    <div className={`text-xs mt-1 ${
+                      log.type === 'paused' ? 'text-blue-600 font-medium' : 'text-slate-500'
                     }`}>
                       {log.details}
                     </div>
                   )}
                 </div>
-                <span className="text-xs text-text-tertiary flex-shrink-0">
+                <span className="text-xs text-slate-400 flex-shrink-0 font-mono">
                   {log.timestamp.toLocaleTimeString('zh-CN', {
                     hour: '2-digit',
                     minute: '2-digit',
@@ -307,19 +322,19 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         )}
       </div>
 
-      {/* 底部状态栏 */}
-      <div className="flex items-center justify-between px-4 py-2 bg-black/20 border-t border-border-default/20 text-xs">
+      {/* 底部状态栏 - 浅色 */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-white border-t border-slate-200 text-xs">
         <div className="flex items-center gap-4">
-          <span className="text-text-tertiary">
-            日志: <span className="text-text-white">{logs.length}</span>
+          <span className="text-slate-500">
+            日志: <span className="text-slate-900 font-medium">{logs.length}</span>
           </span>
-          <span className="text-text-tertiary">
-            阶段: <span className="text-brand-primary">{stageId ? stageToLabel(stageId) : '初始化'}</span>
+          <span className="text-slate-500">
+            阶段: <span className="text-blue-600 font-medium">{stageId ? stageToLabel(stageId) : '初始化'}</span>
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <Search className="w-3 h-3 text-text-tertiary" />
-          <span className="text-text-tertiary">实时观测</span>
+        <div className="flex items-center gap-1.5">
+          <Search className="w-3 h-3 text-slate-400" />
+          <span className="text-slate-500">实时观测</span>
         </div>
       </div>
     </div>

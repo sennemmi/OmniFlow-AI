@@ -7,11 +7,41 @@ import type { Pipeline, PipelineStage } from '@types';
 // ============================================
 
 // 状态配置 - 与后端 PipelineStatus 枚举保持一致
-export const statusConfig: Record<string, { icon: string; class: string; label: string }> = {
-  running: { icon: 'Loader2', class: 'text-brand-primary animate-spin', label: '执行中' },
-  paused: { icon: 'Clock', class: 'text-brand-primary', label: '等待审批' },
-  success: { icon: 'CheckCircle2', class: 'text-status-success', label: '成功' },
-  failed: { icon: 'AlertCircle', class: 'text-status-error', label: '失败' },
+export const statusConfig: Record<string, { 
+  icon: string; 
+  class: string; 
+  label: string;
+  bgClass?: string;
+  borderClass?: string;
+}> = {
+  running: { 
+    icon: 'Loader2', 
+    class: 'text-blue-600', 
+    label: '执行中',
+    bgClass: 'bg-blue-50',
+    borderClass: 'border-blue-200'
+  },
+  paused: { 
+    icon: 'Clock', 
+    class: 'text-amber-600', 
+    label: '等待审批',
+    bgClass: 'bg-amber-50',
+    borderClass: 'border-amber-200'
+  },
+  success: { 
+    icon: 'CheckCircle2', 
+    class: 'text-emerald-600', 
+    label: '成功',
+    bgClass: 'bg-emerald-50',
+    borderClass: 'border-emerald-200'
+  },
+  failed: { 
+    icon: 'AlertCircle', 
+    class: 'text-red-600', 
+    label: '失败',
+    bgClass: 'bg-red-50',
+    borderClass: 'border-red-200'
+  },
 };
 
 // 阶段配置 - 更新拓扑结构
@@ -31,6 +61,7 @@ export const stageMapping: Record<string, string> = {
   'REQUIREMENT': 'REQUIREMENT',
   'DESIGN': 'DESIGN',
   'CODING': 'CODER',
+  'UNIT_TESTING': 'TESTER',  // 新增：单元测试阶段映射到 TESTER 节点
   'CODE_REVIEW': 'CODER',
   'DELIVERY': 'DELIVERY',
 };
@@ -46,39 +77,49 @@ export const getLayouts = (nodeWidth: number, horizontalGap: number, verticalGap
 
 // 获取阶段状态 - 修复状态映射
 export function getStageStatus(
-  stageName: string,
+  stageName: string, // 这是前端的节点名称 (REQUIREMENT, DESIGN, CODER, TESTER, DELIVERY)
   backendStages: PipelineStage[],
-  currentStage: string | null,
+  currentStage: string | null, // 后端当前阶段
   pipelineStatus: string
 ): string {
-  // 优先以后端实际 stage 记录为准
-  const backendStage = backendStages.find(s => s.name === stageName);
-  
-  if (backendStage) {
-    // 当前阶段 + pipeline paused = 等待审批
-    if (stageName === currentStage && pipelineStatus === 'paused') {
-      return 'paused';
-    }
-    // 当前阶段 + pipeline running = 运行中
-    if (stageName === currentStage && pipelineStatus === 'running') {
-      return 'running';
-    }
-    return backendStage.status;
-  }
-  
-  // 后端无记录时根据 current_stage 推断
-  const currentIndex = STAGE_ORDER.indexOf(currentStage || '');
-  const thisIndex = STAGE_ORDER.indexOf(stageName);
-  
-  if (currentIndex === -1) return 'pending';
-  
-  if (thisIndex < currentIndex) return 'success';       // 已完成的阶段
-  if (thisIndex === currentIndex) {                     // 当前阶段
+  // 建立后端真实名称到前端阶段的映射关系
+  const backendToFrontendMap: Record<string, string> = {
+    'REQUIREMENT': 'REQUIREMENT',
+    'DESIGN': 'DESIGN',
+    'CODING': 'CODER',
+    'UNIT_TESTING': 'TESTER', // 新增：单元测试阶段
+    'CODE_REVIEW': 'CODER', // Code review 也在前端 CODER 节点展示
+    'DELIVERY': 'DELIVERY'
+  };
+
+  // 找到此前端节点对应的后端 Stage 记录
+  const backendStage = backendStages.slice().reverse().find(
+    s => backendToFrontendMap[s.name] === stageName
+  );
+
+  // 获取当前后端阶段对应的前端节点名称
+  const mappedCurrentStage = currentStage ? backendToFrontendMap[currentStage] : null;
+
+  // 1. 如果这个节点正是【当前正在进行的节点】
+  if (mappedCurrentStage === stageName) {
     if (pipelineStatus === 'paused') return 'paused';
     if (pipelineStatus === 'running') return 'running';
-    return 'running';
   }
-  return 'pending';                                     // 未来阶段
+
+  // 2. 如果后端有这个阶段的明确记录，返回它的真实状态
+  if (backendStage) {
+    // 把后端 "success" 映射到前端 "completed"（PipelineNode 的 statusConfig 用 completed）
+    if (backendStage.status === 'success') return 'completed';
+    return backendStage.status;
+  }
+
+  // 3. 如果没记录，根据顺序推断
+  const currentIndex = STAGE_ORDER.indexOf(mappedCurrentStage || '');
+  const thisIndex = STAGE_ORDER.indexOf(stageName);
+
+  if (currentIndex === -1) return 'pending';
+  if (thisIndex < currentIndex) return 'completed'; // 已完成的阶段用 completed
+  return 'pending';
 }
 
 // 构建 React Flow 节点和边 - 支持分叉拓扑结构

@@ -8,12 +8,17 @@
 3. 解析测试结果
 4. 支持超时控制
 5. 智能错误分析（语法错误 vs 测试失败）
+6. 详细日志记录（前后端同步）
 """
 
 import asyncio
+import logging
 import os
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+
+# 获取 logger
+logger = logging.getLogger(__name__)
 
 
 class TestRunnerService:
@@ -23,7 +28,7 @@ class TestRunnerService:
     async def run_tests(
         cls,
         project_path: str,
-        timeout: int = 60,
+        timeout: int = 120,  # 放宽超时时间到 120 秒
         test_path: Optional[str] = None,
         verbose: bool = True
     ) -> Dict[str, Any]:
@@ -61,46 +66,166 @@ class TestRunnerService:
                 "failed_tests": []
             }
 
-        # 【新增补丁】强制创建 __init__.py 确保 Python 识别路径
-        # 先确保目录存在，再创建 __init__.py
+        # 确保目录存在
         cwd.mkdir(parents=True, exist_ok=True)
-        (cwd / "__init__.py").touch(exist_ok=True)
 
-        tests_dir = cwd / "tests"
-        if tests_dir.exists() or not tests_dir.exists():
-            tests_dir.mkdir(parents=True, exist_ok=True)
-            (tests_dir / "__init__.py").touch(exist_ok=True)
+        # --- 核心修复 1：严格限制 __init__.py 的生成范围 ---
+        def ensure_init_files(current_dir: Path):
+            # 必须跳过虚拟环境、隐藏目录、前端构建目录等！
+            skip_dirs = {"__pycache__", "venv", ".venv", "env", "node_modules", "dist", "build", ".git", ".idea", ".vscode"}
+            for item in current_dir.iterdir():
+                if item.is_dir() and item.name not in skip_dirs and not item.name.startswith("."):
+                    (item / "__init__.py").touch(exist_ok=True)
+                    ensure_init_files(item)
+
+        # 【修改】智能检测项目结构，找到真正的根目录和 tests/
+        # 情况1: cwd 是项目根目录 (包含 tests/ 和 backend/)
+        # 情况2: cwd 是 backend/ 子目录 (父目录包含 tests/)
+        # 情况3: cwd 只有 tests/ 子目录
+
+        root_tests_path = cwd / "tests"
+        backend_path = cwd / "backend" if (cwd / "backend").exists() else None
+
+        # 检测父目录是否有 tests/ (处理 cwd 是 backend/ 的情况)
+        parent_tests_path = cwd.parent / "tests" if cwd.name == "backend" else None
+        if parent_tests_path and parent_tests_path.exists():
+            # cwd 是 backend/，但测试在父目录的 tests/
+            project_root = cwd.parent
+            root_tests_path = parent_tests_path
+        else:
+            project_root = cwd
+
+        # 确定 backend 路径
+        if backend_path is None and (project_root / "backend").exists():
+            backend_path = project_root / "backend"
+        elif backend_path is None:
+            backend_path = project_root
+
+        # 给 backend/app 和 backend/tests 打补丁
+        if (backend_path / "app").exists():
+            ensure_init_files(backend_path / "app")
+        if (backend_path / "tests").exists():
+            ensure_init_files(backend_path / "tests")
+        # 也给根目录 tests/ 打补丁
+        if root_tests_path.exists():
+            ensure_init_files(root_tests_path)
+
+        # 绝对不要在根目录或者 backend/ 下放 __init__.py
+        for bad_init in [project_root / "__init__.py", backend_path / "__init__.py"]:
+            if bad_init.exists():
+                bad_init.unlink()
+
+        # 确保根目录 tests/ 存在
+        if not root_tests_path.exists():
+            root_tests_path.mkdir(parents=True, exist_ok=True)
+            (root_tests_path / "__init__.py").touch(exist_ok=True)
 
         # 构造命令 - 使用 python -m pytest 更可靠
         # -v: 详细模式
         # --tb=long: 长堆栈打印，获取更详细的错误信息
         # --color=no: 禁用颜色代码，便于解析
+
+        # 【修改】智能选择测试路径
+        # 优先使用 project_root/tests/ (如果存在且有测试文件)
+        if root_tests_path.exists() and any(root_tests_path.iterdir()):
+            # 使用项目根目录的 tests/
+            run_dir = project_root
+            tests_path = root_tests_path
+        elif (backend_path / "tests").exists():
+            # 回退到 backend/tests/
+            run_dir = backend_path
+            tests_path = backend_path / "tests"
+        else:
+            # 最后尝试根目录 tests/
+            run_dir = project_root
+            tests_path = root_tests_path
+
         cmd = ["python", "-m", "pytest"]
 
         if verbose:
             cmd.append("-v")
 
-        # 使用 long traceback 获取更详细的错误信息
-        cmd.extend(["--tb=long", "--color=no"])
+        # 核心修改：
+        # --tb=short 减少堆栈长度，防止日志撑爆
+        # -x 遇到第一个错误立即停止，光速暴露问题
+        # --maxfail=1 确保只运行到第一个失败
+        # -m "not integration" 绝对不要跑集成测试
+        cmd.extend(["--tb=short", "--color=no", "-x", "--maxfail=1", "-m", "not integration"])
 
         # 如果指定了测试路径，添加到命令
         if test_path:
             cmd.append(test_path)
+        elif tests_path.exists():
+            # 默认运行 tests 目录下的测试
+            cmd.append(str(tests_path))
 
         try:
-            # 准备环境变量 - 将当前工作区路径加入 PYTHONPATH
+            # --- 核心修复 2：强化 PYTHONPATH 隔离 ---
             env = os.environ.copy()
-            # 关键：将当前工作区路径加入 PYTHONPATH，确保 Python 能找到本地模块
-            env["PYTHONPATH"] = str(cwd) + os.pathsep + env.get("PYTHONPATH", "")
+
+            # 【修改】根据运行目录设置 PYTHONPATH
+            # 如果在项目根目录运行测试（使用 workspace/feishutemp/tests），
+            # 需要把 backend/ 加入 PYTHONPATH 以便导入 app 模块
+            python_path_parts = []
+            if run_dir == project_root and backend_path.exists():
+                # 在根目录运行，需要添加 backend/ 到路径
+                python_path_parts.append(str(backend_path))
+            python_path_parts.append(str(run_dir))
+            if env.get('PYTHONPATH'):
+                python_path_parts.append(env['PYTHONPATH'])
+
+            env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+
+            # 记录测试执行开始
+            logger.info(
+                f"[TestRunner] 开始执行测试",
+                extra={
+                    "project_path": str(cwd),
+                    "project_root": str(project_root),
+                    "run_dir": str(run_dir),
+                    "tests_path": str(tests_path),
+                    "command": " ".join(cmd),
+                    "timeout": timeout,
+                    "pythonpath": env["PYTHONPATH"][:200],  # 只记录前200字符
+                    "event_loop": type(asyncio.get_event_loop()).__name__
+                }
+            )
 
             # 使用 asyncio 创建子进程
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env  # <--- 注入环境变量
-            )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(run_dir),  # 从 backend/ 目录运行
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env  # <--- 注入环境变量
+                )
+            except NotImplementedError as e:
+                # Windows 事件循环兼容性错误
+                error_msg = (
+                    "当前事件循环不支持子进程。"
+                    "在 Windows 上，请确保使用了 ProactorEventLoop。"
+                    "请在 main.py 开头添加: asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())"
+                )
+                logger.error(
+                    f"[TestRunner] 事件循环不支持子进程",
+                    extra={
+                        "project_path": str(cwd),
+                        "error": str(e),
+                        "event_loop": type(asyncio.get_event_loop()).__name__,
+                        "solution": "在 main.py 中设置 WindowsProactorEventLoopPolicy"
+                    },
+                    exc_info=True
+                )
+                return {
+                    "success": False,
+                    "exit_code": -1,
+                    "logs": error_msg,
+                    "summary": "环境兼容性错误: 事件循环不支持子进程",
+                    "error": error_msg,
+                    "error_type": "environment_error",
+                    "failed_tests": []
+                }
 
             # 等待执行完成，带超时
             stdout, stderr = await asyncio.wait_for(
@@ -129,18 +254,54 @@ class TestRunnerService:
             # 提取失败的测试
             failed_tests = cls._extract_failed_tests(full_logs) if not success else []
 
+            # 记录测试执行结果
+            if success:
+                logger.info(
+                    f"[TestRunner] 测试执行成功",
+                    extra={
+                        "project_path": str(cwd),
+                        "exit_code": process.returncode,
+                        "summary": summary,
+                        "logs_preview": full_logs[:500] if full_logs else ""
+                    }
+                )
+            else:
+                # 测试失败 - 记录详细错误信息
+                error_message = cls._extract_error_message(full_logs)
+                logger.error(
+                    f"[TestRunner] 测试执行失败",
+                    extra={
+                        "project_path": str(cwd),
+                        "exit_code": process.returncode,
+                        "error_type": error_type,
+                        "summary": summary,
+                        "error_message": error_message,
+                        "failed_tests": failed_tests,
+                        "logs": full_logs[:3000],  # 记录前3000字符的日志
+                        "stderr": error_logs[:1000] if error_logs else ""
+                    }
+                )
+
             return {
                 "success": success,
                 "exit_code": process.returncode,
                 "logs": full_logs,
                 "summary": summary,
-                "error": None if success else cls._extract_error_message(full_logs),
+                "error": None if success else error_message,
                 "error_type": error_type,
                 "failed_tests": failed_tests
             }
 
         except asyncio.TimeoutError:
             # 超时处理：尝试终止进程
+            logger.error(
+                f"[TestRunner] 测试执行超时",
+                extra={
+                    "project_path": str(cwd),
+                    "timeout": timeout,
+                    "command": " ".join(cmd)
+                }
+            )
             try:
                 process.kill()
                 await process.wait()
@@ -159,6 +320,14 @@ class TestRunnerService:
 
         except FileNotFoundError:
             # pytest 未安装
+            logger.error(
+                f"[TestRunner] pytest 未找到",
+                extra={
+                    "project_path": str(cwd),
+                    "command": " ".join(cmd),
+                    "suggestion": "请安装 pytest: pip install pytest pytest-asyncio"
+                }
+            )
             return {
                 "success": False,
                 "exit_code": -1,
@@ -170,6 +339,16 @@ class TestRunnerService:
             }
 
         except Exception as e:
+            logger.error(
+                f"[TestRunner] 测试执行异常",
+                extra={
+                    "project_path": str(cwd),
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "command": " ".join(cmd)
+                },
+                exc_info=True
+            )
             return {
                 "success": False,
                 "exit_code": -1,

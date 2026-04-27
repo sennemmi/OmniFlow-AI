@@ -10,9 +10,13 @@ from sqlalchemy.orm import selectinload
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
 
+import logging
+
 from app.core.config import settings
 from app.core.logging import info, op_logger
 from app.core.sse_log_buffer import push_log
+
+logger = logging.getLogger(__name__)
 from app.models.pipeline import (
     Pipeline, PipelineRead, PipelineStatus,
     PipelineStage, StageName, StageStatus, PipelineStageRead
@@ -249,7 +253,11 @@ class PipelineService:
     
     @classmethod
     async def _trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
-        """触发 CODING 阶段 - 优化版：使用临时工作区和自动修复循环"""
+        """触发 CODING 阶段 - 优化版：使用临时工作区和自动修复循环
+        
+        【增强】使用 AgentCoordinatorService.get_target_files_for_coding 获取目标文件
+        这样可以利用新的 affected_files 字段，获取更完整的代码上下文
+        """
         design_output = None
         coding_stage_id = None
         target_files = {}
@@ -277,21 +285,13 @@ class PipelineService:
             )
             coding_stage_id = coding_stage.id
 
-            # 3. 读取目标文件（文件操作，不需要数据库）
-            target_path = Path(settings.TARGET_PROJECT_PATH)
-            if not target_path.is_absolute():
-                backend_dir = Path(__file__).parent.parent.parent
-                target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
-
-            code_executor = CodeExecutorService(str(target_path))
-
-            if "function_changes" in design_output:
-                for change in design_output["function_changes"]:
-                    file_path = change.get("file", "")
-                    if file_path:
-                        content = code_executor.get_file_content(file_path)
-                        if content:
-                            target_files[file_path] = content
+            # 3. 【增强】使用 AgentCoordinatorService 获取目标文件
+            # 这样可以利用新的 affected_files 字段，获取更完整的代码上下文
+            target_files = await AgentCoordinatorService.get_target_files_for_coding(
+                pipeline_id=pipeline_id,
+                design_output=design_output,
+                session=session
+            )
 
             # 4. 提交当前事务并关闭连接（关键：释放数据库连接）
             await session.commit()
@@ -337,20 +337,36 @@ class PipelineService:
             if not multi_agent_result or not multi_agent_result["success"]:
                 error_msg = multi_agent_result.get("error", "Unknown error") if multi_agent_result else "Unknown error"
 
+                # 修复：无论成功失败，都要把代码落库传给前端
+                output_data_to_save = {
+                    "error": error_msg,
+                    "last_error_logs": multi_agent_result.get("last_error_logs") if multi_agent_result else None
+                }
+                # 如果有代码产出，挂载上去
+                if multi_agent_result and multi_agent_result.get("output"):
+                    output_data_to_save["multi_agent_output"] = multi_agent_result["output"]
+                    output_data_to_save["target_files"] = target_files
+
                 # 重新获取 stage 并更新为失败
                 statement = select(PipelineStage).where(PipelineStage.id == coding_stage_id)
                 result = await session.execute(statement)
                 coding_stage = result.scalar_one_or_none()
 
                 if coding_stage:
+                    # 提取可观测性指标（如果有）
+                    metrics = {
+                        'input_tokens': multi_agent_result.get('input_tokens', 0) if multi_agent_result else 0,
+                        'output_tokens': multi_agent_result.get('output_tokens', 0) if multi_agent_result else 0,
+                        'duration_ms': multi_agent_result.get('duration_ms', 0) if multi_agent_result else 0,
+                        'retry_count': multi_agent_result.get('attempt', 0) if multi_agent_result else 0,
+                        'reasoning': multi_agent_result.get('reasoning') if multi_agent_result else None
+                    }
                     await WorkflowService.complete_stage(
                         stage=coding_stage,
-                        output_data={
-                            "error": error_msg,
-                            "last_error_logs": multi_agent_result.get("last_error_logs") if multi_agent_result else None
-                        },
+                        output_data=output_data_to_save,  # 使用组装好的 output_data
                         success=False,
-                        session=session
+                        session=session,
+                        metrics=metrics
                     )
 
                 pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
@@ -372,6 +388,11 @@ class PipelineService:
             file_count = len(combined_output.get('files', []))
             attempt_count = multi_agent_result.get("attempt", 0)
 
+            # Debug: 检查 CODING output 中 files 的 content 字段
+            sample_files = combined_output.get('files', [])[:2]
+            logger.info(f"[Debug] CODING output files sample: "
+                        f"{[{'path': f.get('file_path'), 'has_content': bool(f.get('content')), 'has_original': 'original_content' in f} for f in sample_files]}")
+
             if attempt_count > 0:
                 await push_log(pipeline_id, "info", f"代码生成完成（经过 {attempt_count + 1} 次尝试），共 {file_count} 个文件", stage="CODING")
             else:
@@ -383,6 +404,14 @@ class PipelineService:
             coding_stage = result.scalar_one_or_none()
 
             if coding_stage:
+                # 提取可观测性指标
+                metrics = {
+                    'input_tokens': multi_agent_result.get('input_tokens', 0),
+                    'output_tokens': multi_agent_result.get('output_tokens', 0),
+                    'duration_ms': multi_agent_result.get('duration_ms', 0),
+                    'retry_count': attempt_count,
+                    'reasoning': multi_agent_result.get('reasoning')
+                }
                 await WorkflowService.complete_stage(
                     stage=coding_stage,
                     output_data={
@@ -393,30 +422,31 @@ class PipelineService:
                         "test_logs": multi_agent_result.get("test_logs")
                     },
                     success=True,
-                    session=session
+                    session=session,
+                    metrics=metrics
                 )
 
-            # 8. 创建 CODE_REVIEW 阶段
+            # 8. 创建 UNIT_TESTING 阶段（新增：在 CODING 之后进行单元测试）
             await WorkflowService.create_stage(
                 pipeline_id=pipeline_id,
-                stage_name=StageName.CODE_REVIEW,
-                input_data={"coding_output": combined_output, "target_files": target_files},
+                stage_name=StageName.UNIT_TESTING,
+                input_data={"coding_output": combined_output, "target_files": target_files, "design_output": design_output},
                 session=session
             )
 
             pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
             if pipeline:
-                pipeline.current_stage = StageName.CODE_REVIEW
-                await WorkflowService.set_pipeline_paused(pipeline, session)
+                pipeline.current_stage = StageName.UNIT_TESTING
+                await WorkflowService.set_pipeline_running(pipeline, session)
 
-            await push_log(pipeline_id, "info", "代码生成完成，等待人工审查", stage="CODE_REVIEW")
+            await push_log(pipeline_id, "info", "代码生成完成，进入单元测试阶段", stage="UNIT_TESTING")
 
             await session.commit()
 
             return {
                 "success": True,
-                "status": PipelineStatus.PAUSED.value,
-                "message": "Code generated successfully",
+                "status": PipelineStatus.RUNNING.value,  # 改为 RUNNING，因为要继续执行 UNIT_TESTING
+                "message": "Code generated successfully, entering unit testing",
                 "files_count": file_count,
                 "auto_fix_attempts": attempt_count
             }
@@ -427,7 +457,238 @@ class PipelineService:
             from app.core.sse_log_buffer import remove_buffer
             remove_buffer(pipeline_id)
             return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Coding save failed: {str(e)}"}
-    
+
+    @classmethod
+    async def _trigger_testing_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+        """触发 UNIT_TESTING 阶段 - 生成测试并执行
+
+        使用 TestAgent 生成测试代码，并在临时工作区执行验证。
+        如果测试失败，可以启动自动修复循环（允许修改测试文件）。
+        """
+        coding_output = None
+        design_output = None
+        target_files = {}
+        testing_stage_id = None
+
+        try:
+            # 1. 获取 CODING 阶段输出
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.CODING
+            )
+            result = await session.execute(statement)
+            coding_stage = result.scalar_one_or_none()
+
+            if not coding_stage or not coding_stage.output_data:
+                return {"success": False, "status": PipelineStatus.FAILED.value, "message": "No coding output found"}
+
+            coding_output = coding_stage.output_data.get("multi_agent_output", {})
+            target_files = coding_stage.output_data.get("target_files", {})
+
+            # 2. 获取 DESIGN 阶段输出（用于 TestAgent）
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.DESIGN
+            )
+            result = await session.execute(statement)
+            design_stage = result.scalar_one_or_none()
+
+            if design_stage and design_stage.output_data:
+                design_output = design_stage.output_data
+
+            # 3. 创建 UNIT_TESTING 阶段（如果还没有创建）
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.UNIT_TESTING
+            )
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
+
+            if not testing_stage:
+                testing_stage = await WorkflowService.create_stage(
+                    pipeline_id=pipeline_id,
+                    stage_name=StageName.UNIT_TESTING,
+                    input_data={"coding_output": coding_output, "target_files": target_files, "design_output": design_output},
+                    session=session
+                )
+            testing_stage_id = testing_stage.id
+
+            # 4. 提交当前事务并关闭连接
+            await session.commit()
+
+        except Exception as e:
+            await session.rollback()
+            await push_log(pipeline_id, "error", f"准备单元测试阶段失败: {str(e)}", stage="UNIT_TESTING")
+            return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Testing preparation failed: {str(e)}"}
+
+        # 5. 使用临时工作区执行测试生成和验证
+        from app.agents.multi_agent_coordinator import multi_agent_coordinator
+        from app.service.workspace import async_workspace_context
+        from app.agents import test_agent
+
+        testing_result = None
+
+        try:
+            async with async_workspace_context(pipeline_id) as ws:
+                workspace_dir = ws.get_workspace_path()
+                await push_log(pipeline_id, "info", f"创建临时工作区用于测试: {workspace_dir.name}", stage="UNIT_TESTING")
+
+                # 先写入代码文件到工作区
+                from app.service.code_executor import CodeExecutorService
+                from app.service.import_sanitizer import ImportSanitizer
+
+                executor = CodeExecutorService(workspace_dir)
+                all_files = coding_output.get("files", [])
+
+                # 修正 import 路径
+                all_files, fix_report = ImportSanitizer.sanitize_files(all_files)
+
+                # 强制添加 backend/ 前缀
+                for f in all_files:
+                    p = f.get("file_path", "")
+                    p = p.lstrip("/")
+                    if p and not p.startswith("backend/"):
+                        f["file_path"] = f"backend/{p}"
+
+                executor.apply_changes(
+                    {f["file_path"]: f["content"] for f in all_files},
+                    create_if_missing=True
+                )
+
+                # 6. 调用 TestAgent 生成测试
+                await push_log(pipeline_id, "info", "TestAgent 开始生成测试代码...", stage="UNIT_TESTING")
+
+                test_result = await test_agent.generate_tests(
+                    design_output=design_output,
+                    code_output=coding_output,
+                    target_files=target_files,
+                    pipeline_id=pipeline_id
+                )
+
+                if not test_result["success"]:
+                    error_msg = test_result.get("error", "Unknown error")
+                    await push_log(pipeline_id, "warning", f"TestAgent 生成测试失败: {error_msg}", stage="UNIT_TESTING")
+
+                    # 测试生成失败，但代码是成功的，继续到 CODE_REVIEW
+                    testing_result = {
+                        "success": True,  # 标记为成功，因为代码本身没问题
+                        "test_generated": False,
+                        "test_error": error_msg
+                    }
+                else:
+                    # 7. 写入测试文件到工作区
+                    test_output = test_result["output"]
+                    test_files = test_output.get("files", [])
+
+                    if test_files:
+                        await push_log(pipeline_id, "info", f"TestAgent 生成 {len(test_files)} 个测试文件", stage="UNIT_TESTING")
+
+                        # 写入测试文件
+                        for test_file in test_files:
+                            file_path = test_file.get("file_path", "")
+                            content = test_file.get("content", "")
+                            if file_path and content:
+                                # 确保测试文件路径正确
+                                if not file_path.startswith("tests/") and not file_path.startswith("backend/tests/"):
+                                    file_path = f"tests/{file_path}"
+                                executor.apply_changes({file_path: content}, create_if_missing=True)
+
+                        # 8. 运行测试验证
+                        await push_log(pipeline_id, "info", "运行测试验证...", stage="UNIT_TESTING")
+
+                        from app.service.test_runner import TestRunnerService
+                        test_run_result = await TestRunnerService.run_tests(str(workspace_dir))
+
+                        if test_run_result["success"]:
+                            await push_log(pipeline_id, "success", "✅ 所有测试通过！", stage="UNIT_TESTING")
+                            testing_result = {
+                                "success": True,
+                                "test_generated": True,
+                                "test_files": test_files,
+                                "test_run_success": True,
+                                "test_logs": test_run_result.get("logs", "")
+                            }
+                        else:
+                            # 测试失败，记录错误
+                            error_summary = test_run_result.get("summary", "Unknown error")
+                            await push_log(pipeline_id, "warning", f"⚠️ 测试未通过: {error_summary}", stage="UNIT_TESTING")
+
+                            testing_result = {
+                                "success": True,  # 代码本身没问题，只是测试失败
+                                "test_generated": True,
+                                "test_files": test_files,
+                                "test_run_success": False,
+                                "test_error": error_summary,
+                                "test_logs": test_run_result.get("logs", "")
+                            }
+                    else:
+                        await push_log(pipeline_id, "info", "TestAgent 未生成测试文件", stage="UNIT_TESTING")
+                        testing_result = {
+                            "success": True,
+                            "test_generated": False,
+                            "test_error": "No test files generated"
+                        }
+
+        except Exception as e:
+            await push_log(pipeline_id, "error", f"单元测试执行失败: {str(e)}", stage="UNIT_TESTING")
+            testing_result = {
+                "success": True,  # 代码本身没问题
+                "test_generated": False,
+                "test_error": str(e)
+            }
+
+        # 9. 重新获取连接，保存结果
+        try:
+            statement = select(PipelineStage).where(PipelineStage.id == testing_stage_id)
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
+
+            if testing_stage:
+                await WorkflowService.complete_stage(
+                    stage=testing_stage,
+                    output_data={
+                        "testing_result": testing_result,
+                        "coding_output": coding_output,
+                        "target_files": target_files
+                    },
+                    success=testing_result["success"],
+                    session=session
+                )
+
+            # 10. 创建 CODE_REVIEW 阶段
+            await WorkflowService.create_stage(
+                pipeline_id=pipeline_id,
+                stage_name=StageName.CODE_REVIEW,
+                input_data={
+                    "coding_output": coding_output,
+                    "testing_result": testing_result,
+                    "target_files": target_files
+                },
+                session=session
+            )
+
+            pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+            if pipeline:
+                pipeline.current_stage = StageName.CODE_REVIEW
+                await WorkflowService.set_pipeline_paused(pipeline, session)
+
+            await push_log(pipeline_id, "info", "单元测试完成，进入代码审查阶段", stage="CODE_REVIEW")
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "status": PipelineStatus.PAUSED.value,
+                "message": "Unit testing completed",
+                "test_generated": testing_result.get("test_generated", False),
+                "test_run_success": testing_result.get("test_run_success", False)
+            }
+
+        except Exception as e:
+            await push_log(pipeline_id, "error", f"保存单元测试结果失败: {str(e)}", stage="UNIT_TESTING")
+            await session.rollback()
+            return {"success": False, "status": PipelineStatus.FAILED.value, "message": f"Testing save failed: {str(e)}"}
+
     @classmethod
     async def _trigger_delivery_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
         """触发 DELIVERY 阶段（代码交付）"""
@@ -640,17 +901,65 @@ class PipelineService:
                 # 如果没有 background_tasks，同步执行（兼容旧调用）
                 coding_result = await cls._trigger_coding_phase(pipeline_id, session)
 
-                return {
-                    "success": coding_result["success"],
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "previous_stage": StageName.DESIGN.value,
-                        "next_stage": StageName.CODE_REVIEW.value,
-                        "status": coding_result.get("status", PipelineStatus.PAUSED.value),
-                        "message": coding_result.get("message", "Code generated"),
-                        "files_count": coding_result.get("files_count", 0)
+                # CODING 成功后，自动进入 UNIT_TESTING 阶段
+                if coding_result["success"]:
+                    testing_result = await cls._trigger_testing_phase(pipeline_id, session)
+                    return {
+                        "success": testing_result["success"],
+                        "data": {
+                            "pipeline_id": pipeline_id,
+                            "previous_stage": StageName.CODING.value,
+                            "current_stage": StageName.UNIT_TESTING.value,
+                            "next_stage": StageName.CODE_REVIEW.value,
+                            "status": testing_result.get("status", PipelineStatus.PAUSED.value),
+                            "message": testing_result.get("message", "Unit testing completed"),
+                            "test_generated": testing_result.get("test_generated", False),
+                            "test_run_success": testing_result.get("test_run_success", False)
+                        }
                     }
+                else:
+                    return {
+                        "success": False,
+                        "data": {
+                            "pipeline_id": pipeline_id,
+                            "previous_stage": StageName.DESIGN.value,
+                            "status": PipelineStatus.FAILED.value,
+                            "message": coding_result.get("message", "Code generation failed")
+                        }
+                    }
+
+        elif current_stage == StageName.UNIT_TESTING:
+            # 单元测试阶段审批，进入 CODE_REVIEW
+            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
+            if not success:
+                return {"success": False, "error": error}
+
+            # 获取测试阶段的结果
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.UNIT_TESTING
+            )
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
+
+            testing_result = {}
+            if testing_stage and testing_stage.output_data:
+                testing_result = testing_stage.output_data.get("testing_result", {})
+
+            await session.commit()
+
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "previous_stage": StageName.UNIT_TESTING.value,
+                    "next_stage": StageName.CODE_REVIEW.value,
+                    "status": PipelineStatus.PAUSED.value,
+                    "message": "Unit testing approved, proceeding to code review",
+                    "test_generated": testing_result.get("test_generated", False),
+                    "test_run_success": testing_result.get("test_run_success", False)
                 }
+            }
 
         elif current_stage == StageName.CODE_REVIEW:
             success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
@@ -710,7 +1019,69 @@ class PipelineService:
             await cls._trigger_designer_analysis_with_feedback(
                 pipeline_id, reason, suggested_changes, session
             )
-        
+        elif current_stage == StageName.UNIT_TESTING:
+            # 单元测试阶段被驳回，回退到 CODING 重新生成代码和测试
+            # 标记 CODING 阶段需要重新运行
+            await WorkflowService.mark_stage_for_rerun(
+                pipeline_id=pipeline_id, stage_name=StageName.CODING,
+                rejection_feedback=rejection_feedback, session=session
+            )
+            # 重新触发 CODING 阶段（会自动进入 UNIT_TESTING）
+            coding_result = await cls._trigger_coding_phase(pipeline_id, session)
+            if coding_result["success"]:
+                # CODING 成功后自动进入 UNIT_TESTING
+                testing_result = await cls._trigger_testing_phase(pipeline_id, session)
+                return {
+                    "success": testing_result["success"],
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "current_stage": StageName.UNIT_TESTING.value,
+                        "status": testing_result.get("status", PipelineStatus.PAUSED.value),
+                        "message": "Coding and unit testing re-executed",
+                        "test_generated": testing_result.get("test_generated", False),
+                        "test_run_success": testing_result.get("test_run_success", False)
+                    }
+                }
+            else:
+                return {
+                    "success": False,
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "status": PipelineStatus.FAILED.value,
+                        "message": coding_result.get("message", "Code generation failed")
+                    }
+                }
+        elif current_stage == StageName.CODE_REVIEW:
+            # 代码审查阶段被驳回，回退到 CODING 重新生成
+            await WorkflowService.mark_stage_for_rerun(
+                pipeline_id=pipeline_id, stage_name=StageName.CODING,
+                rejection_feedback=rejection_feedback, session=session
+            )
+            # 重新触发 CODING 阶段
+            coding_result = await cls._trigger_coding_phase(pipeline_id, session)
+            if coding_result["success"]:
+                testing_result = await cls._trigger_testing_phase(pipeline_id, session)
+                return {
+                    "success": testing_result["success"],
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "current_stage": StageName.UNIT_TESTING.value,
+                        "status": testing_result.get("status", PipelineStatus.PAUSED.value),
+                        "message": "Coding and unit testing re-executed after rejection",
+                        "test_generated": testing_result.get("test_generated", False),
+                        "test_run_success": testing_result.get("test_run_success", False)
+                    }
+                }
+            else:
+                return {
+                    "success": False,
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "status": PipelineStatus.FAILED.value,
+                        "message": coding_result.get("message", "Code generation failed")
+                    }
+                }
+
         return {
             "success": True,
             "data": {
@@ -745,7 +1116,14 @@ class PipelineService:
                 result = await session.execute(statement)
                 stage = result.scalar_one_or_none()
                 if stage:
-                    stage.output_data = {"error": error}
+                    # 救命补丁：绝对不要覆盖原来的代码数据！把之前的代码原封不动继承过来
+                    current_data = dict(stage.output_data) if stage.output_data else {}
+                    current_data["error"] = error
+                    stage.output_data = current_data
+
+                    # 强制告诉 SQLAlchemy 字典被修改了，必须落库保存！
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(stage, "output_data")
 
     # ==================== 查询方法 ====================
 

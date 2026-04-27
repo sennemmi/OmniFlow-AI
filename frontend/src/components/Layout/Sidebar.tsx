@@ -7,6 +7,9 @@ import {
   BarChart3,
   ChevronLeft,
   ChevronRight,
+  Monitor,
+  Home,
+  Zap,
 } from 'lucide-react';
 import { useUIStore } from '@stores/uiStore';
 
@@ -17,6 +20,7 @@ import { useUIStore } from '@stores/uiStore';
 const sidebarItems = [
   { id: 'dashboard', label: '概览', icon: LayoutDashboard, path: '/console' },
   { id: 'pipelines', label: '流水线', icon: GitBranch, path: '/console/pipelines' },
+  { id: 'workspace', label: '工作区看板', icon: Monitor, path: '/console/workspace', badge: 'New' },
   { id: 'analytics', label: '统计', icon: BarChart3, path: '/console/analytics' },
   { id: 'documents', label: '文档', icon: FileText, path: '/console/documents' },
   { id: 'settings', label: '设置', icon: Settings, path: '/console/settings' },
@@ -39,8 +43,16 @@ export function Sidebar() {
         isSidebarCollapsed ? 'w-16' : 'w-64'
       }`}
     >
-      {/* 折叠按钮 */}
-      <div className="flex items-center justify-end p-3 border-b border-border-default/50">
+      {/* Logo 区域 */}
+      <div className="flex items-center justify-between p-4 border-b border-border-default/50">
+        <Link to="/" className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-lg bg-brand-primary flex items-center justify-center flex-shrink-0">
+            <Zap className="w-5 h-5 text-white" />
+          </div>
+          {!isSidebarCollapsed && (
+            <span className="font-semibold text-text-primary">OmniFlowAI</span>
+          )}
+        </Link>
         <button
           onClick={toggleSidebar}
           className="p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-bg-secondary transition-colors"
@@ -67,7 +79,15 @@ export function Sidebar() {
               title={isSidebarCollapsed ? item.label : undefined}
             >
               <Icon className={`w-5 h-5 flex-shrink-0 ${active ? 'text-brand-primary' : 'text-text-tertiary group-hover:text-text-secondary'}`} />
-              {!isSidebarCollapsed && <span className="text-sm truncate">{item.label}</span>}
+              {!isSidebarCollapsed && (
+                <span className="text-sm truncate flex-1">{item.label}</span>
+              )}
+              {/* Badge */}
+              {!isSidebarCollapsed && item.badge && (
+                <span className="px-1.5 py-0.5 text-[10px] font-medium bg-brand-primary text-white rounded-full">
+                  {item.badge}
+                </span>
+              )}
             </Link>
           );
         })}

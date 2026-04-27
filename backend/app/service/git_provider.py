@@ -191,7 +191,8 @@ class GitProviderService:
             else:
                 raise GitProviderError(f"基础分支不存在: {base_branch}")
         
-        # 切换到基础分支并更新
+        # 切换到基础分支并更新（先 stash 本地修改）
+        self._run_git_command(["stash", "push", "-m", "Auto-stash before creating branch"], check=False)
         self._run_git_command(["checkout", base_branch])
         self._run_git_command(["pull", "origin", base_branch], check=False)
         
@@ -200,17 +201,27 @@ class GitProviderService:
         
         return result
     
-    def checkout_branch(self, branch_name: str) -> GitResult:
+    def checkout_branch(self, branch_name: str, force: bool = False) -> GitResult:
         """
         切换到指定分支
         
         Args:
             branch_name: 分支名
+            force: 是否强制切换（会丢弃本地修改）
             
         Returns:
             GitResult: 操作结果
         """
-        return self._run_git_command(["checkout", branch_name])
+        if force:
+            # 强制切换，丢弃本地修改
+            return self._run_git_command(["checkout", "-f", branch_name])
+        else:
+            # 先尝试 stash 本地修改
+            self._run_git_command(["stash", "push", "-m", "Auto-stash before checkout"], check=False)
+            result = self._run_git_command(["checkout", branch_name])
+            # 尝试恢复 stash（如果切换成功且 stash 存在）
+            self._run_git_command(["stash", "pop"], check=False)
+            return result
     
     def add_files(self, files: Optional[List[str]] = None) -> GitResult:
         """

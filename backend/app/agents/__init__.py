@@ -3,13 +3,31 @@
 from app.agents.architect import architect_agent
 from app.agents.designer import designer_agent
 from app.agents.coder import coder_agent
-from app.agents.tester import test_agent
-from app.agents.multi_agent_coordinator import multi_agent_coordinator
+from app.agents.tester import tester_agent, test_agent
+from app.agents.schemas import (
+    BaseAgentOutput,
+    ArchitectOutput,
+    DesignerOutput,
+    CoderOutput,
+    TesterOutput,
+    FileChange,
+    TestFile,
+)
 
 __all__ = [
+    # Agent 实例
     "architect_agent",
     "designer_agent",
     "coder_agent",
-    "test_agent",
-    "multi_agent_coordinator",
+    "tester_agent",
+    "test_agent",  # 向后兼容
+    # 输出模型
+    "BaseAgentOutput",
+    "ArchitectOutput",
+    "DesignerOutput",
+    "CoderOutput",
+    "TesterOutput",
+    # 辅助模型
+    "FileChange",
+    "TestFile",
 ]

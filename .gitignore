@@ -72,3 +72,13 @@ htmlcov/
 repomix-output.xml
 .devflow_backups/
 .trae/
+
+.vite/
+node_modules/
+dist/
+
+
+backend/app/.omniflow_index/
+repomix-output.md
+
+backend/.omniflow_index/code_index.json

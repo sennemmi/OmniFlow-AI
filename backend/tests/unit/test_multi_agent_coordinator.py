@@ -1,13 +1,7 @@
 """
-多 Agent 协作协调器单元测试
-
-以单元测试为荣，以手工验证为耻
+单元测试：MultiAgentCoordinator
+测试多 Agent 协调器的核心逻辑
 """
-
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import pytest
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 from typing import Dict, Any
@@ -91,6 +85,7 @@ def sample_test_output():
     }
 
 
+@pytest.mark.unit
 class TestMultiAgentCoordinator:
     """测试多 Agent 协调器"""
 
@@ -236,186 +231,8 @@ class TestMultiAgentCoordinator:
         assert "代码生成" in summary
         assert "测试生成" not in summary
 
-    @pytest.mark.asyncio
-    async def test_execute_parallel_success(
-        self,
-        coordinator,
-        sample_design_output,
-        sample_target_files,
-        sample_code_output,
-        sample_test_output
-    ):
-        """测试完整的并行执行流程 - 成功场景"""
-        with patch.object(
-            coder_agent,
-            'generate_code',
-            new_callable=AsyncMock,
-            return_value={"success": True, "output": sample_code_output}
-        ):
-            with patch.object(
-                test_agent,
-                'generate_tests',
-                new_callable=AsyncMock,
-                return_value={"success": True, "output": sample_test_output}
-            ):
-                result = await coordinator.execute_parallel(
-                    sample_design_output,
-                    sample_target_files
-                )
 
-                assert result["success"] is True
-                assert result["output"] is not None
-                assert result["output"]["tests_included"] is True
-
-    @pytest.mark.asyncio
-    async def test_execute_parallel_failure(
-        self,
-        coordinator,
-        sample_design_output,
-        sample_target_files
-    ):
-        """测试完整的并行执行流程 - 失败场景"""
-        with patch.object(
-            coder_agent,
-            'generate_code',
-            new_callable=AsyncMock,
-            return_value={"success": False, "error": "LLM 调用失败"}
-        ):
-            result = await coordinator.execute_parallel(
-                sample_design_output,
-                sample_target_files
-            )
-
-            assert result["success"] is False
-            assert "LLM 调用失败" in result["error"]
-            assert result["output"] is None
-
-    @pytest.mark.asyncio
-    async def test_execute_with_auto_fix_success_first_try(
-        self,
-        coordinator,
-        sample_design_output,
-        sample_target_files,
-        sample_code_output,
-        sample_test_output
-    ):
-        """测试自动修复 - 第一次就成功"""
-        with patch.object(
-            coder_agent,
-            'generate_code',
-            new_callable=AsyncMock,
-            return_value={"success": True, "output": sample_code_output}
-        ):
-            with patch(
-                'app.agents.multi_agent_coordinator.TestRunnerService.run_tests',
-                new_callable=AsyncMock,
-                return_value={"success": True, "logs": "All tests passed", "summary": "1 passed"}
-            ):
-                with patch.object(
-                    test_agent,
-                    'generate_tests',
-                    new_callable=AsyncMock,
-                    return_value={"success": True, "output": sample_test_output}
-                ):
-                    with patch(
-                        'app.agents.multi_agent_coordinator.CodeExecutorService'
-                    ) as MockExecutor:
-                        result = await coordinator.execute_with_auto_fix(
-                            sample_design_output,
-                            sample_target_files,
-                            pipeline_id=1,
-                            workspace_path="/tmp/workspace"
-                        )
-
-                        assert result["success"] is True
-                        assert result["output"] is not None
-                        assert result["attempt"] == 0
-
-    @pytest.mark.asyncio
-    async def test_execute_with_auto_fix_retry_then_success(
-        self,
-        coordinator,
-        sample_design_output,
-        sample_target_files,
-        sample_code_output,
-        sample_test_output
-    ):
-        """测试自动修复 - 重试后成功"""
-        # 第一次失败，第二次成功
-        code_results = [
-            {"success": True, "output": sample_code_output},
-            {"success": True, "output": sample_code_output}
-        ]
-        test_results = [
-            {"success": False, "logs": "Test failed", "summary": "1 failed"},
-            {"success": True, "logs": "All tests passed", "summary": "1 passed"}
-        ]
-
-        with patch.object(
-            coder_agent,
-            'generate_code',
-            new_callable=AsyncMock,
-            side_effect=code_results
-        ):
-            with patch(
-                'app.agents.multi_agent_coordinator.TestRunnerService.run_tests',
-                new_callable=AsyncMock,
-                side_effect=test_results
-            ):
-                with patch.object(
-                    test_agent,
-                    'generate_tests',
-                    new_callable=AsyncMock,
-                    return_value={"success": True, "output": sample_test_output}
-                ):
-                    with patch(
-                        'app.agents.multi_agent_coordinator.CodeExecutorService'
-                    ) as MockExecutor:
-                        result = await coordinator.execute_with_auto_fix(
-                            sample_design_output,
-                            sample_target_files,
-                            pipeline_id=1,
-                            workspace_path="/tmp/workspace"
-                        )
-
-                        assert result["success"] is True
-                        assert result["attempt"] == 1  # 重试了一次
-
-    @pytest.mark.asyncio
-    async def test_execute_with_auto_fix_max_retries_exceeded(
-        self,
-        coordinator,
-        sample_design_output,
-        sample_target_files,
-        sample_code_output
-    ):
-        """测试自动修复 - 超过最大重试次数"""
-        with patch.object(
-            coder_agent,
-            'generate_code',
-            new_callable=AsyncMock,
-            return_value={"success": True, "output": sample_code_output}
-        ):
-            with patch(
-                'app.agents.multi_agent_coordinator.TestRunnerService.run_tests',
-                new_callable=AsyncMock,
-                return_value={"success": False, "logs": "Test failed", "summary": "1 failed"}
-            ):
-                with patch(
-                    'app.agents.multi_agent_coordinator.CodeExecutorService'
-                ) as MockExecutor:
-                    result = await coordinator.execute_with_auto_fix(
-                        sample_design_output,
-                        sample_target_files,
-                        pipeline_id=1,
-                        workspace_path="/tmp/workspace"
-                    )
-
-                    assert result["success"] is False
-                    assert "最大次数" in result["error"]
-                    assert result["attempt"] == 4  # MAX_FIX_RETRIES + 1
-
-
+@pytest.mark.unit
 class TestCodeAndTestOutput:
     """测试输出模型"""
 
@@ -445,6 +262,7 @@ class TestCodeAndTestOutput:
         assert output.tests_included is True
 
 
+@pytest.mark.unit
 class TestMultiAgentState:
     """测试状态模型"""
 

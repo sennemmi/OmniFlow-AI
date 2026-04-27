@@ -1,53 +1,36 @@
 """
 设计师 Agent
-唯一能调用 LLM 的地方 - 技术设计实现
+基于 LangGraph 状态机实现，继承 BaseAgent 统一调用逻辑
 
-使用 OpenAI 兼容接口，支持 ModelScope (魔搭) 和 OpenAI 切换
+职责：
+1. 分析 ArchitectAgent 的输出
+2. 结合项目文件树（特别是 backend/app/api/ 风格）
+3. 结合代码库上下文（语义检索 + 完整文件内容）
+4. 输出详细的技术设计方案
 """
 
 import json
-import re
-from typing import Dict, List, Optional, TypedDict, Any
+from typing import Dict, Optional, Any
 
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field, ValidationError
-
-from app.agents.base import LLMCallError
+from app.agents.base import LangGraphAgent
+from app.agents.schemas import DesignerOutput
 
 
-class DesignerState(TypedDict):
-    """设计师 Agent 状态"""
-    architect_output: Dict[str, Any]
-    file_tree: Dict[str, Any]
-    output: Optional[Dict[str, Any]]
-    error: Optional[str]
-    retry_count: int
-
-
-class DesignerOutput(BaseModel):
-    """设计师输出结构 - Pydantic 校验"""
-    technical_design: str = Field(description="技术设计方案概述")
-    api_endpoints: List[Dict[str, str]] = Field(description="API 端点列表")
-    function_changes: List[Dict[str, Any]] = Field(description="函数修改列表")
-    logic_flow: str = Field(description="逻辑流图（文本描述）")
-    dependencies: List[str] = Field(default_factory=list, description="新增依赖")
-
-
-class DesignerAgent:
+class DesignerAgent(LangGraphAgent[DesignerOutput]):
     """
     设计师 Agent
     
-    基于 LangGraph 的状态机实现，负责：
-    1. 分析 ArchitectAgent 的输出
-    2. 结合项目文件树（特别是 backend/app/api/ 风格）
-    3. 输出详细的技术设计方案
-    
-    原则：以创造接口为耻，以复用现有为荣
-    使用 OpenAI 兼容接口，支持 ModelScope (魔搭) 和 OpenAI 切换
+    根据架构师输出进行详细技术设计
+    继承 LangGraphAgent，只需实现业务差异部分
     """
     
-    # 系统 Prompt - 强调复用现有风格
-    SYSTEM_PROMPT = """你是 OmniFlowAI 的设计师 Agent，负责根据架构师的分析输出详细的技术设计方案。
+    def __init__(self):
+        super().__init__(agent_name="DesignerAgent")
+    
+    @property
+    def system_prompt(self) -> str:
+        """系统 Prompt - 强调复用现有风格"""
+        return """你是 OmniFlowAI 的设计师 Agent，负责根据架构师的分析输出详细的技术设计方案。
 
 【八荣八耻准则】
 以架构分层为荣，以循环依赖为耻
@@ -65,13 +48,15 @@ class DesignerAgent:
 【任务要求】
 1. 仔细阅读 ArchitectAgent 的输出（功能描述、受影响文件列表）
 2. 分析项目文件树，特别是 backend/app/api/ 目录下的现有 API 风格
-3. 参考现有代码的组织方式和命名规范
-4. 输出详细的技术设计方案，包含：
+3. 【重要】仔细阅读提供的代码上下文（related_code_context 和 full_files_context）
+4. 参考现有代码的组织方式、命名规范和实现风格
+5. 输出详细的技术设计方案，包含：
    - technical_design: 技术设计方案概述
    - api_endpoints: API 端点列表（包含 method, path, description）
    - function_changes: 函数修改列表（包含 file, function, action: add/modify/delete, description）
    - logic_flow: 逻辑流图（文本描述形式）
    - dependencies: 新增依赖列表
+   - affected_files: 受影响文件列表（相对路径）
 
 【输出格式】
 必须严格输出 JSON 格式，不要包含 Markdown 代码块标记：
@@ -84,7 +69,8 @@ class DesignerAgent:
         {"file": "backend/app/...", "function": "...", "action": "add", "description": "..."}
     ],
     "logic_flow": "...",
-    "dependencies": ["..."]
+    "dependencies": ["..."],
+    "affected_files": ["backend/app/..."]
 }
 
 【风格参考】
@@ -95,12 +81,14 @@ class DesignerAgent:
 
 【代码上下文参考 - 重要】
 我们为你检索了项目中相关的现有代码片段（在 related_code_context 字段中）。
+同时提供了完整文件内容（在 full_files_context 字段中）。
 
 核心铁律：
 - 以复用现有逻辑为荣，以重复造轮子为耻！
 - 请务必参考这些片段的风格、类定义和工具函数来设计你的方案
 - 如果检索到的代码中有类似的实现，请优先复用或扩展，而不是从头创建
 - 注意保持与现有代码的命名规范、参数风格和错误处理方式一致
+- 仔细阅读完整文件内容，理解现有代码的架构和模式
 
 【项目结构参考】
 在 project_structure_summary 字段中提供了项目整体结构摘要，帮助你理解代码库规模和组织方式。
@@ -111,117 +99,58 @@ class DesignerAgent:
 - 优先复用现有的接口和模式（参考 related_code_context）
 - 遵循项目现有的架构分层规范
 - 如果检索到的代码中有可用的工具函数或类，请在设计中明确引用
+- affected_files 必须包含所有需要修改或新增的文件路径
 """
     
-    MAX_RETRIES = 3
-    
-    def __init__(self):
-        self.graph = self._build_graph()
-    
-    def _build_graph(self) -> StateGraph:
-        """构建 LangGraph 状态机"""
+    def build_user_prompt(self, state: Dict[str, Any]) -> str:
+        """
+        构建用户 Prompt
         
-        # 定义状态图
-        workflow = StateGraph(DesignerState)
-        
-        # 添加节点
-        workflow.add_node("design", self._design_node)
-        workflow.add_node("validate", self._validate_node)
-        workflow.add_node("retry", self._retry_node)
-        
-        # 添加边
-        workflow.set_entry_point("design")
-        workflow.add_edge("design", "validate")
-        
-        # 条件边
-        workflow.add_conditional_edges(
-            "validate",
-            self._should_retry,
-            {
-                "success": END,
-                "retry": "retry",
-                "failed": END
-            }
-        )
-        workflow.add_edge("retry", "design")
-        
-        return workflow.compile()
-    
-    def _design_node(self, state: DesignerState) -> DesignerState:
-        """设计节点：调用 LLM 生成技术方案"""
-        
-        # 构建用户提示
-        user_prompt = self._build_prompt(
-            state["architect_output"],
-            state["file_tree"]
-        )
-        
-        try:
-            # 调用 LLM
-            response = self._call_llm(self.SYSTEM_PROMPT, user_prompt)
-            
-            # 尝试解析 JSON
-            parsed_output = self._parse_json_response(response)
-            
-            return {
-                **state,
-                "output": parsed_output,
-                "error": None
-            }
-        except Exception as e:
-            return {
-                **state,
-                "output": None,
-                "error": str(e)
-            }
-    
-    def _validate_node(self, state: DesignerState) -> DesignerState:
-        """验证节点：使用 Pydantic 校验输出"""
-        
-        if state["error"]:
-            return state
-        
-        if not state["output"]:
-            return {
-                **state,
-                "error": "No output generated"
-            }
-        
-        try:
-            # 使用 Pydantic 校验
-            validated = DesignerOutput(**state["output"])
-            return {
-                **state,
-                "output": validated.model_dump(),
-                "error": None
-            }
-        except ValidationError as e:
-            return {
-                **state,
-                "error": f"Validation error: {e}"
-            }
-    
-    def _retry_node(self, state: DesignerState) -> DesignerState:
-        """重试节点：增加重试计数"""
-        return {
-            **state,
-            "retry_count": state["retry_count"] + 1
-        }
-    
-    def _should_retry(self, state: DesignerState) -> str:
-        """判断是否需要重试"""
-        if state["error"] is None:
-            return "success"
-        elif state["retry_count"] < self.MAX_RETRIES:
-            return "retry"
-        else:
-            return "failed"
-    
-    def _build_prompt(self, architect_output: Dict[str, Any], file_tree: Dict[str, Any]) -> str:
-        """构建 LLM 提示"""
+        Args:
+            state: 包含 architect_output, file_tree, related_code_context, full_files_context 的状态
+        """
+        architect_output = state.get("architect_output", {})
+        file_tree = state.get("file_tree", {})
+        related_code_context = state.get("related_code_context")
+        full_files_context = state.get("full_files_context")
         
         architect_str = json.dumps(architect_output, indent=2, ensure_ascii=False)
         file_tree_str = json.dumps(file_tree, indent=2, ensure_ascii=False)
+        
+        # 构建代码上下文部分
+        code_context_section = ""
+        
+        # 第一层：语义检索结果
+        if related_code_context:
+            code_context_section += f"""
+【相关代码片段 - 语义检索结果】
+以下是通过 RAG 检索到的与需求相关的代码片段：
+
+{related_code_context}
+"""
+        
+        # 第二层：完整文件内容
+        if full_files_context:
+            files_content = []
+            for file_path, content in full_files_context.items():
+                # 限制每个文件的内容长度，避免超出 token 限制
+                max_content_length = 3000  # 约 1000 tokens
+                truncated_content = content[:max_content_length]
+                if len(content) > max_content_length:
+                    truncated_content += f"\n... (文件剩余 {len(content) - max_content_length} 字符已省略)"
+                
+                files_content.append(f"""--- 文件: {file_path} ---
+```python
+{truncated_content}
+```""")
+            
+            full_files_str = "\n\n".join(files_content)
+            code_context_section += f"""
+【完整文件内容】
+以下是相关文件的完整内容（用于理解代码风格和架构）：
+
+{full_files_str}
+"""
         
         return f"""【ArchitectAgent 输出】
 {architect_str}
@@ -230,128 +159,55 @@ class DesignerAgent:
 ```
 {file_tree_str}
 ```
+{code_context_section}
 
 请根据以上信息，输出详细的技术设计方案（JSON 格式）。
 注意参考 backend/app/api/ 目录下的现有 API 风格，优先复用现有接口和模式。
 """
     
-    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        调用 LLM - 使用 OpenAI 兼容接口
-        
-        支持 ModelScope (魔搭) 和 OpenAI 运行时切换
-        """
-        from app.core.config import settings
-        from app.core.logging import logger
-        
-        # 检查 API Key
-        if not settings.llm_api_key:
-            provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
-            raise LLMCallError(f"{provider} API Key 未配置")
-        
-        try:
-            if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口
-                from openai import OpenAI
-                
-                client = OpenAI(
-                    base_url=settings.llm_api_base,
-                    api_key=settings.llm_api_key
-                )
-                
-                logger.info("DesignerAgent 正在请求模型...")
-                response = client.chat.completions.create(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.7,
-                    timeout=90
-                )
-                logger.info("DesignerAgent 模型响应成功")
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            else:
-                # OpenAI 使用 LiteLLM
-                import litellm
-                litellm.set_verbose = False
-                
-                logger.info("DesignerAgent 正在请求模型...")
-                response = litellm.completion(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base,
-                    temperature=0.7,
-                    timeout=90
-                )
-                logger.info("DesignerAgent 模型响应成功")
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            
-            raise LLMCallError("LLM 返回空响应")
-            
-        except Exception as e:
-            raise LLMCallError(f"LLM 调用失败: {e}")
+    def parse_output(self, response: str) -> Dict[str, Any]:
+        """解析 LLM 输出为字典"""
+        return self._parse_json_response(response)
     
-    def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """
-        解析 LLM 返回的 JSON
-        
-        剥离 Markdown 代码块，提取纯 JSON
-        """
-        # 去除 Markdown 代码块标记
-        json_str = re.sub(r'^```json\s*', '', response.strip())
-        json_str = re.sub(r'^```\s*', '', json_str)
-        json_str = re.sub(r'```\s*$', '', json_str)
-        json_str = json_str.strip()
-        
-        return json.loads(json_str)
+    def validate_output(self, output: Dict[str, Any]) -> DesignerOutput:
+        """校验输出为 DesignerOutput 模型"""
+        return DesignerOutput(**output)
     
-    async def design(self, architect_output: Dict[str, Any]) -> Dict[str, Any]:
+    async def design(
+        self,
+        architect_output: Dict[str, Any],
+        file_tree: Dict[str, Any],
+        related_code_context: Optional[str] = None,
+        full_files_context: Optional[Dict[str, str]] = None,
+        pipeline_id: int = 0
+    ) -> Dict[str, Any]:
         """
         根据架构师输出进行技术设计
         
         Args:
             architect_output: ArchitectAgent 的输出内容
+            file_tree: 项目文件树
+            related_code_context: 语义检索结果（代码片段）
+            full_files_context: 完整文件内容映射
+            pipeline_id: Pipeline ID
             
         Returns:
             Dict: 包含设计结果或错误信息
         """
-        # 获取项目文件树
-        from app.service.project import get_current_project_tree, ProjectService
-        file_tree_node = get_current_project_tree(max_depth=4)
-        file_tree = ProjectService.file_tree_to_dict(file_tree_node) if file_tree_node else {}
-        
-        initial_state: DesignerState = {
+        initial_state = {
             "architect_output": architect_output,
             "file_tree": file_tree,
-            "output": None,
-            "error": None,
-            "retry_count": 0
+            "related_code_context": related_code_context,
+            "full_files_context": full_files_context
         }
         
-        # 执行状态机
-        result = self.graph.invoke(initial_state)
+        result = await self.execute(
+            pipeline_id=pipeline_id,
+            stage_name="DESIGN",
+            initial_state=initial_state
+        )
         
-        if result["error"]:
-            return {
-                "success": False,
-                "error": result["error"],
-                "output": None
-            }
-        
-        return {
-            "success": True,
-            "error": None,
-            "output": result["output"]
-        }
+        return result
 
 
 # 单例实例

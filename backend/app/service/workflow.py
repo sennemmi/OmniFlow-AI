@@ -1,20 +1,23 @@
 """
 工作流状态管理服务
 负责 Pipeline 的状态流转（Status Check, Approve, Reject 状态切换逻辑）
+
+【优化】使用 Repository 模式统一数据访问，消除重复代码
 """
 
 from typing import Optional, Dict, Any, Tuple
-from datetime import datetime
 
-from sqlalchemy.orm import selectinload
 from sqlmodel.ext.asyncio.session import AsyncSession
-from sqlmodel import select
 
-from app.core.timezone import now
 from app.core.logging import info, error
 from app.models.pipeline import (
     Pipeline, PipelineStatus,
     PipelineStage, StageName, StageStatus
+)
+from app.service.repositories import (
+    PipelineRepository,
+    PipelineStageRepository,
+    StageTransitionService
 )
 
 
@@ -26,16 +29,12 @@ class WorkflowService:
     1. Pipeline 状态检查和验证
     2. 状态流转（Approve/Reject）
     3. 阶段管理和转换
+    
+    【优化】所有数据访问委托给 Repository，本层只保留业务逻辑
     """
     
-    # 阶段流转顺序
-    STAGE_FLOW = [
-        StageName.REQUIREMENT,
-        StageName.DESIGN,
-        StageName.CODING,
-        StageName.CODE_REVIEW,
-        StageName.DELIVERY,
-    ]
+    # 阶段流转顺序（委托给 StageTransitionService）
+    STAGE_FLOW = StageTransitionService.STAGE_FLOW
     
     @classmethod
     async def get_pipeline_with_stages(
@@ -53,11 +52,7 @@ class WorkflowService:
         Returns:
             Pipeline: Pipeline 对象（包含 stages），不存在返回 None
         """
-        statement = select(Pipeline).where(Pipeline.id == pipeline_id).options(
-            selectinload(Pipeline.stages)
-        )
-        result = await session.execute(statement)
-        return result.scalar_one_or_none()
+        return await PipelineRepository.get_by_id(pipeline_id, session, load_stages=True)
     
     @classmethod
     async def validate_can_approve(
@@ -114,13 +109,7 @@ class WorkflowService:
         Returns:
             Optional[StageName]: 下一阶段，如果是最后阶段返回 None
         """
-        try:
-            current_index = cls.STAGE_FLOW.index(current_stage)
-            if current_index < len(cls.STAGE_FLOW) - 1:
-                return cls.STAGE_FLOW[current_index + 1]
-            return None
-        except ValueError:
-            return None
+        return StageTransitionService.get_next_stage(current_stage)
     
     @classmethod
     async def transition_to_next_stage(
@@ -130,43 +119,34 @@ class WorkflowService:
     ) -> Tuple[bool, Optional[StageName], Optional[str]]:
         """
         流转到下一阶段
-        
+
         Args:
             pipeline: Pipeline 对象
             session: 数据库会话
-            
+
         Returns:
-            Tuple[bool, Optional[StageName], Optional[str]]: 
+            Tuple[bool, Optional[StageName], Optional[str]]:
                 (是否成功, 新阶段, 错误信息)
         """
-        next_stage = await cls.get_next_stage(pipeline.current_stage)
+        success, next_stage, error = await StageTransitionService.transition(
+            pipeline, session
+        )
         
-        if next_stage is None:
-            # 已经是最后阶段，标记为成功
-            pipeline.status = PipelineStatus.SUCCESS
-            pipeline.current_stage = StageName.DELIVERY
-            await session.commit()
-            
+        if success and next_stage:
+            info(
+                "Pipeline 进入下一阶段",
+                pipeline_id=pipeline.id,
+                previous_stage=pipeline.current_stage.value if pipeline.current_stage else None,
+                next_stage=next_stage.value
+            )
+        elif success and not next_stage:
             info(
                 "Pipeline 完成所有阶段",
                 pipeline_id=pipeline.id,
                 status="SUCCESS"
             )
-            return True, None, None
         
-        # 更新 Pipeline 状态
-        pipeline.status = PipelineStatus.RUNNING
-        pipeline.current_stage = next_stage
-        await session.commit()
-        
-        info(
-            "Pipeline 进入下一阶段",
-            pipeline_id=pipeline.id,
-            previous_stage=pipeline.current_stage.value if pipeline.current_stage else None,
-            next_stage=next_stage.value
-        )
-        
-        return True, next_stage, None
+        return success, next_stage, error
     
     @classmethod
     async def create_stage(
@@ -188,14 +168,9 @@ class WorkflowService:
         Returns:
             PipelineStage: 创建的阶段
         """
-        stage = PipelineStage(
-            pipeline_id=pipeline_id,
-            name=stage_name,
-            status=StageStatus.RUNNING,
-            input_data=input_data
+        stage = await PipelineStageRepository.create(
+            pipeline_id, stage_name, input_data, session
         )
-        session.add(stage)
-        await session.commit()
         
         info(
             "创建 Pipeline 阶段",
@@ -211,28 +186,37 @@ class WorkflowService:
         stage: PipelineStage,
         output_data: Dict[str, Any],
         success: bool,
-        session: AsyncSession
+        session: AsyncSession,
+        metrics: Optional[Dict[str, Any]] = None
     ) -> None:
         """
         完成阶段
-        
+
         Args:
             stage: 阶段对象
             output_data: 输出数据
             success: 是否成功
             session: 数据库会话
+            metrics: 可观测性指标（可选）
+                - input_tokens: 输入 Token 数
+                - output_tokens: 输出 Token 数
+                - duration_ms: 执行耗时（毫秒）
+                - retry_count: 重试次数
+                - reasoning: AI 推理过程
         """
-        stage.status = StageStatus.SUCCESS if success else StageStatus.FAILED
-        stage.output_data = output_data
-        stage.completed_at = now()
-        session.add(stage)
-        await session.commit()
+        await PipelineStageRepository.complete(
+            stage, output_data, success, session, metrics
+        )
         
         info(
             "Pipeline 阶段完成",
             pipeline_id=stage.pipeline_id,
             stage=stage.name.value,
-            status=stage.status.value
+            status=stage.status.value,
+            input_tokens=stage.input_tokens,
+            output_tokens=stage.output_tokens,
+            duration_ms=stage.duration_ms,
+            retry_count=stage.retry_count
         )
     
     @classmethod
@@ -255,25 +239,11 @@ class WorkflowService:
         Returns:
             Optional[PipelineStage]: 阶段对象
         """
-        statement = select(PipelineStage).where(
-            PipelineStage.pipeline_id == pipeline_id,
-            PipelineStage.name == stage_name
+        stage = await PipelineStageRepository.mark_for_rerun(
+            pipeline_id, stage_name, rejection_feedback, session
         )
-        result = await session.execute(statement)
-        stage = result.scalar_one_or_none()
         
         if stage:
-            # 记录驳回信息
-            if stage.output_data is None:
-                stage.output_data = {}
-            stage.output_data["rejection_feedback"] = {
-                **rejection_feedback,
-                "rejected_at": now().isoformat()
-            }
-            stage.status = StageStatus.RUNNING
-            session.add(stage)
-            await session.commit()
-            
             info(
                 "Pipeline 阶段标记为重新运行",
                 pipeline_id=pipeline_id,
@@ -295,8 +265,7 @@ class WorkflowService:
             pipeline: Pipeline 对象
             session: 数据库会话
         """
-        pipeline.status = PipelineStatus.RUNNING
-        await session.commit()
+        await PipelineRepository.set_running(pipeline, session)
         
         info(
             "Pipeline 状态更新为 RUNNING",
@@ -317,8 +286,7 @@ class WorkflowService:
             pipeline: Pipeline 对象
             session: 数据库会话
         """
-        pipeline.status = PipelineStatus.PAUSED
-        await session.commit()
+        await PipelineRepository.set_paused(pipeline, session)
         
         info(
             "Pipeline 状态更新为 PAUSED",
@@ -339,8 +307,7 @@ class WorkflowService:
             pipeline: Pipeline 对象
             session: 数据库会话
         """
-        pipeline.status = PipelineStatus.FAILED
-        await session.commit()
+        await PipelineRepository.set_failed(pipeline, session)
         
         info(
             "Pipeline 状态更新为 FAILED",

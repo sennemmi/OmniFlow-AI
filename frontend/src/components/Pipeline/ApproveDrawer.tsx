@@ -1,13 +1,14 @@
-import { useState, useRef, useEffect } from 'react';
-import { X, CheckCircle2, XCircle, FileText, User, Clock, AlertCircle, Loader2 } from 'lucide-react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useState, useRef, useMemo } from 'react';
+import { X, CheckCircle2, XCircle, FileText, User, Clock, AlertCircle, Loader2, BarChart3 } from 'lucide-react';
+import { useQueryClient, useQuery } from '@tanstack/react-query';
 import { usePipelineStore } from '@stores/pipelineStore';
 import { useUIStore } from '@stores/uiStore';
-import { apiPost } from '@utils/axios';
+import { apiPost, apiGet } from '@utils/axios';
 import { getLanguageFromPath, extractTechnicalDesign } from '@utils/formatters';
-import { extractAllCodeChanges, isCodeStage, type CodeChange } from '@utils/pipelineHelpers';
+import { extractAllCodeChanges, isCodeStage } from '@utils/pipelineHelpers';
 import { DiffViewer } from './DiffViewer';
-import type { ApproveRequest, RejectRequest } from '@types';
+import { MetricsPanel } from './MetricsPanel';
+import type { PipelineStage } from '@types';
 
 // 审批请求超时时间（毫秒）
 const APPROVE_TIMEOUT = 10000; // 10秒
@@ -26,16 +27,42 @@ export function ApproveDrawer() {
   const [showDiff, setShowDiff] = useState(true);
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
   const [showTimeoutWarning, setShowTimeoutWarning] = useState(false);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [showMetrics, setShowMetrics] = useState(true);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 判断是否是代码阶段（包括 CODE_REVIEW）
   const codeStage = isCodeStage(selectedStage);
 
-  // 提取所有代码变更（支持多文件，增强容错）
-  const allCodeChanges = extractAllCodeChanges(
-    selectedStage?.output_data as Record<string, unknown> | undefined,
-    selectedStage?.input_data as Record<string, unknown> | undefined
-  );
+  // 使用 diff 接口获取完整代码数据（解决 API 截断问题）
+  const { data: diffData, isLoading: isDiffLoading } = useQuery({
+    queryKey: ['pipeline-diff', selectedPipeline?.id],
+    queryFn: () => apiGet(`/pipeline/${selectedPipeline?.id}/diff`),
+    enabled: !!selectedPipeline?.id && (selectedStage?.name === 'CODE_REVIEW' || selectedStage?.name === 'CODING'),
+  });
+
+  // 提取所有代码变更（优先使用 diff 接口数据）
+  const allCodeChanges = useMemo(() => {
+    // 修复：axios 拦截器已经去掉了外层包装，直接读取 files 即可
+    const diffPayload = diffData as any;
+    const files = diffPayload?.files || diffPayload?.data?.files;
+
+    if (files && Array.isArray(files)) {
+      return files.map((f: any) => ({
+        fileName: f.file_path,
+        newCode: f.content ?? '',
+        oldCode: f.original_content ?? '',
+        isNew: !f.original_content,
+        changeType: f.change_type || 'modify',
+      }));
+    }
+
+    // 否则使用原来的逻辑（从 stage 数据中提取）
+    return extractAllCodeChanges(
+      selectedStage?.output_data as Record<string, unknown> | undefined,
+      selectedStage?.input_data as Record<string, unknown> | undefined
+    );
+  }, [diffData, selectedStage]);
+
   const currentChange = allCodeChanges[selectedFileIndex];
 
   // 提取技术设计文档
@@ -198,6 +225,25 @@ export function ApproveDrawer() {
                 : '待定'}
               </span>
             </div>
+          </div>
+
+          {/* 可观测性指标面板 */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-medium text-text-primary flex items-center gap-2">
+                <BarChart3 className="w-4 h-4 text-brand-primary" />
+                执行指标
+              </h4>
+              <button
+                onClick={() => setShowMetrics(!showMetrics)}
+                className="text-xs text-brand-primary hover:underline"
+              >
+                {showMetrics ? '隐藏' : '显示'}
+              </button>
+            </div>
+            {showMetrics && (
+              <MetricsPanel stage={selectedStage} />
+            )}
           </div>
 
           {/* 代码 Diff 对比（如果是代码阶段且有代码变更） */}

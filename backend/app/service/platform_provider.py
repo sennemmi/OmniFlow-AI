@@ -14,6 +14,9 @@ from typing import Optional, Dict, Any
 
 import httpx
 
+from app.core.config import settings
+from app.core.logging import error
+
 
 @dataclass
 class PullRequestResult:
@@ -89,9 +92,10 @@ class GitHubProviderService(BasePlatformProvider):
             owner: 仓库所有者，默认从环境变量 GITHUB_OWNER 读取
             repo: 仓库名，默认从环境变量 GITHUB_REPO 读取
         """
-        self.token = token or os.getenv("GITHUB_TOKEN")
-        self.owner = owner or os.getenv("GITHUB_OWNER")
-        self.repo = repo or os.getenv("GITHUB_REPO")
+        # 优先使用传入的参数，其次从 settings 读取，最后从环境变量读取
+        self.token = token or settings.GITHUB_TOKEN or os.getenv("GITHUB_TOKEN")
+        self.owner = owner or settings.GITHUB_OWNER or os.getenv("GITHUB_OWNER")
+        self.repo = repo or settings.GITHUB_REPO or os.getenv("GITHUB_REPO")
         
         self.base_url = "https://api.github.com"
         self.api_version = "2022-11-28"
@@ -236,7 +240,7 @@ class GitHubProviderService(BasePlatformProvider):
             )
         except httpx.HTTPError as e:
             error_msg = f"HTTP 错误: {str(e)}"
-            print(f"[GitHubProviderService] {error_msg}")
+            error("GitHub PR 创建 HTTP 错误", exc_info=True)
             return PullRequestResult(
                 success=False,
                 pr_url=None,
@@ -245,7 +249,7 @@ class GitHubProviderService(BasePlatformProvider):
             )
         except Exception as e:
             error_msg = f"未知错误: {str(e)}"
-            print(f"[GitHubProviderService] {error_msg}")
+            error("GitHub PR 创建失败", exc_info=True)
             return PullRequestResult(
                 success=False,
                 pr_url=None,

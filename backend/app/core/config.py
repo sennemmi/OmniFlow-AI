@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "OmniFlowAI"
     VERSION: str = "0.1.0"
     ENV: str = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False  # 默认 INFO 级别，减少日志噪音
     
     # 服务器配置
     HOST: str = "0.0.0.0"

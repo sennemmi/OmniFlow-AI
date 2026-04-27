@@ -14,9 +14,18 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.database import get_session, async_session_factory
 from app.core.response import ResponseModel, success_response, error_response
 from app.core.sse_log_buffer import get_or_create_buffer, remove_buffer
+from app.core.logging import error
 from app.service.pipeline import PipelineService
 
 router = APIRouter()
+
+
+class SourceContext(BaseModel):
+    """源码位置上下文 - 用于精确定位 DOM 元素对应的源代码"""
+    file: str = Field(..., description="源文件路径（绝对路径或相对路径）")
+    line: int = Field(..., description="行号", ge=1)
+    column: int = Field(default=0, description="列号", ge=0)
+    relativePath: Optional[str] = Field(default=None, description="相对于项目根目录的路径")
 
 
 class PipelineCreateRequest(BaseModel):
@@ -30,6 +39,11 @@ class PipelineCreateRequest(BaseModel):
         default=None,
         description="页面元素上下文（HTML、XPath、数据源等）",
         example={"html": "<div>...</div>", "xpath": "//div[@id='app']", "data_source": "api/v1/users"}
+    )
+    sourceContext: Optional[SourceContext] = Field(
+        default=None,
+        description="精确的源码位置上下文（用于绕过 LLM 猜测，直接定位代码）",
+        example={"file": "src/components/Button.tsx", "line": 45, "column": 4}
     )
 
 
@@ -139,101 +153,158 @@ class PipelineRejectResponse(BaseModel):
 
 async def run_architect_task(pipeline_id: int, requirement: str, element_context: Optional[Dict[str, Any]]) -> None:
     """后台任务：使用独立 session，确保事务完整性"""
-    async with async_session_factory() as session:
+    session = async_session_factory()
+    try:
+        await PipelineService.run_architect_task(
+            pipeline_id=pipeline_id,
+            requirement=requirement,
+            element_context=element_context,
+            session=session
+        )
+        # 显式提交
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        # 记录结构化日志，同时记录完整堆栈
+        from app.core.logging import op_logger, error
+        error(
+            "Pipeline REQUIREMENT 阶段失败",
+            pipeline_id=pipeline_id,
+            exc_info=True
+        )
+        op_logger.log_pipeline_status_change(
+            pipeline_id=pipeline_id,
+            old_status='running',
+            new_status='failed',
+            stage='REQUIREMENT',
+            error=str(e)
+        )
+        # 更新 pipeline 状态为 failed，让前端感知
         try:
-            await PipelineService.run_architect_task(
-                pipeline_id=pipeline_id,
-                requirement=requirement,
-                element_context=element_context,
-                session=session
-            )
-            # 显式提交（不依赖上下文管理器的隐式行为）
-            await session.commit()
-        except Exception as e:
-            await session.rollback()
-            # 记录结构化日志，而不是 print
-            from app.core.logging import op_logger
-            op_logger.log_pipeline_status_change(
-                pipeline_id=pipeline_id,
-                old_status='running',
-                new_status='failed',
-                stage='REQUIREMENT',
-                error=str(e)
-            )
-            # 更新 pipeline 状态为 failed，让前端感知
-            try:
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=str(e),
-                        session=err_session
-                    )
-                    await err_session.commit()
-            except Exception:
-                pass
+            async with async_session_factory() as err_session:
+                await PipelineService.mark_pipeline_failed(
+                    pipeline_id=pipeline_id,
+                    error=str(e),
+                    session=err_session
+                )
+                await err_session.commit()
+        except Exception:
+            pass
+    finally:
+        await session.close()
 
 
 async def run_coding_task(pipeline_id: int) -> None:
-    """后台任务：触发 CODING 阶段，使用独立 session"""
-    async with async_session_factory() as session:
-        try:
-            from app.core.logging import op_logger
-            from app.core.sse_log_buffer import push_log
+    """后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，使用独立 session"""
+    session = async_session_factory()
+    try:
+        from app.core.logging import op_logger
+        from app.core.sse_log_buffer import push_log
 
-            await push_log(pipeline_id, "info", "后台任务启动：开始执行代码生成...", stage="CODING")
+        await push_log(pipeline_id, "info", "后台任务启动：开始执行代码生成...", stage="CODING")
 
-            result = await PipelineService.trigger_coding_phase(
+        # 1. 执行 CODING 阶段
+        coding_result = await PipelineService.trigger_coding_phase(
+            pipeline_id=pipeline_id,
+            session=session
+        )
+
+        if coding_result["success"]:
+            await session.commit()
+            await push_log(pipeline_id, "info", "代码生成完成，开始单元测试阶段...", stage="UNIT_TESTING")
+
+            # 2. 【新增】执行 UNIT_TESTING 阶段
+            testing_result = await PipelineService._trigger_testing_phase(
                 pipeline_id=pipeline_id,
                 session=session
             )
 
-            if result["success"]:
+            if testing_result["success"]:
                 await session.commit()
-                await push_log(pipeline_id, "info", "代码生成任务已完成，等待人工审查", stage="CODE_REVIEW")
-            else:
-                await session.rollback()
-                op_logger.log_pipeline_status_change(
-                    pipeline_id=pipeline_id,
-                    old_status='running',
-                    new_status='failed',
-                    stage='CODING',
-                    error=result.get("message", "Unknown error")
-                )
-                # 更新 pipeline 状态为 failed
-                try:
-                    async with async_session_factory() as err_session:
-                        await PipelineService.mark_pipeline_failed(
-                            pipeline_id=pipeline_id,
-                            error=result.get("message", "Coding phase failed"),
-                            session=err_session
-                        )
-                        await err_session.commit()
-                except Exception:
-                    pass
-        except Exception as e:
-            await session.rollback()
-            from app.core.logging import op_logger
-            from app.core.sse_log_buffer import push_log
+                test_generated = testing_result.get("test_generated", False)
+                test_run_success = testing_result.get("test_run_success", False)
 
+                if test_generated and test_run_success:
+                    await push_log(
+                        pipeline_id,
+                        "success",
+                        f"单元测试完成（生成测试并全部通过），等待人工审查",
+                        stage="CODE_REVIEW"
+                    )
+                elif test_generated:
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"单元测试完成（生成测试但部分未通过），等待人工审查",
+                        stage="CODE_REVIEW"
+                    )
+                else:
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        f"单元测试完成（未生成测试），等待人工审查",
+                        stage="CODE_REVIEW"
+                    )
+            else:
+                # UNIT_TESTING 失败，但代码是成功的
+                await session.commit()
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"单元测试阶段异常，但代码生成成功，等待人工审查",
+                    stage="CODE_REVIEW"
+                )
+        else:
+            await session.rollback()
             op_logger.log_pipeline_status_change(
                 pipeline_id=pipeline_id,
                 old_status='running',
                 new_status='failed',
                 stage='CODING',
-                error=str(e)
+                error=coding_result.get("message", "Unknown error")
             )
-            await push_log(pipeline_id, "error", f"代码生成任务失败: {str(e)}", stage="CODING")
             # 更新 pipeline 状态为 failed
             try:
                 async with async_session_factory() as err_session:
                     await PipelineService.mark_pipeline_failed(
                         pipeline_id=pipeline_id,
-                        error=str(e),
+                        error=coding_result.get("message", "Coding phase failed"),
                         session=err_session
                     )
                     await err_session.commit()
             except Exception:
                 pass
+    except Exception as e:
+        await session.rollback()
+        from app.core.logging import op_logger, error
+        from app.core.sse_log_buffer import push_log
+
+        error(
+            "Pipeline CODING/UNIT_TESTING 阶段失败",
+            pipeline_id=pipeline_id,
+            exc_info=True
+        )
+        op_logger.log_pipeline_status_change(
+            pipeline_id=pipeline_id,
+            old_status='running',
+            new_status='failed',
+            stage='CODING',
+            error=str(e)
+        )
+        await push_log(pipeline_id, "error", "代码生成任务失败 (查看后端日志获取详情)", stage="CODING")
+        # 更新 pipeline 状态为 failed
+        try:
+            async with async_session_factory() as err_session:
+                await PipelineService.mark_pipeline_failed(
+                    pipeline_id=pipeline_id,
+                    error=str(e),
+                    session=err_session
+                )
+                await err_session.commit()
+        except Exception:
+            pass
+    finally:
+        await session.close()
 
 
 @router.post(
@@ -260,26 +331,31 @@ async def create_pipeline(
 ):
     """
     创建新的 Pipeline
-    
+
     使用 BackgroundTasks 异步执行 ArchitectAgent 分析
     立即返回 Pipeline ID，后台运行分析任务
     """
     request_id = getattr(request.state, "request_id", "unknown")
-    
+
     try:
         # 1. 创建 Pipeline 记录
+        # 将 sourceContext 合并到 element_context 中，供后续阶段使用
+        element_context = data.elementContext or {}
+        if data.sourceContext:
+            element_context["sourceContext"] = data.sourceContext.model_dump()
+
         pipeline = await PipelineService.create_pipeline_record(
             requirement=data.requirement,
-            element_context=data.elementContext,
+            element_context=element_context,
             session=session
         )
-        
+
         # 2. 添加后台任务运行 ArchitectAgent
         background_tasks.add_task(
             run_architect_task,
             pipeline_id=pipeline.id,
             requirement=data.requirement,
-            element_context=data.elementContext
+            element_context=element_context
         )
         
         response_data = PipelineCreateResponse(
@@ -294,6 +370,7 @@ async def create_pipeline(
             request_id=request_id
         )
     except Exception as e:
+        error("创建 Pipeline 失败", exc_info=True)
         return error_response(
             error=f"Failed to create pipeline: {str(e)}",
             request_id=request_id
@@ -383,7 +460,7 @@ async def get_pipeline_status(
 
                 if stage.name.value == "CODING" and output_data:
                     # 只保留关键元数据，排除大字段
-                    output_data = cls._extract_coding_summary(output_data)
+                    output_data = _extract_coding_summary(output_data)
 
                 stage_data = PipelineStageInfo(
                     id=stage.id,
@@ -460,6 +537,7 @@ async def get_pipeline_status(
             request_id=request_id
         )
     except Exception as e:
+        error("获取 Pipeline 状态失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to get pipeline status: {str(e)}",
             request_id=request_id
@@ -512,6 +590,7 @@ async def list_pipelines(
             request_id=request_id
         )
     except Exception as e:
+        error("获取 Pipeline 列表失败", exc_info=True)
         return error_response(
             error=f"Failed to list pipelines: {str(e)}",
             request_id=request_id
@@ -568,6 +647,7 @@ async def approve_pipeline(
             request_id=request_id
         )
     except Exception as e:
+        error("审批 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to approve pipeline: {str(e)}",
             request_id=request_id
@@ -620,10 +700,61 @@ async def reject_pipeline(
             request_id=request_id
         )
     except Exception as e:
+        error("驳回 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to reject pipeline: {str(e)}",
             request_id=request_id
         )
+
+
+@router.get(
+    "/pipeline/{pipeline_id}/diff",
+    response_model=ResponseModel,
+    summary="获取 CODING 阶段完整代码变更"
+)
+async def get_pipeline_diff(
+    request: Request,
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
+    session: AsyncSession = Depends(get_session)
+):
+    """获取 CODING 阶段完整代码（含 original_content），供审批页面展示 diff"""
+    request_id = getattr(request.state, "request_id", "unknown")
+    try:
+        from sqlmodel import select
+        from app.models.pipeline import PipelineStage, StageName
+
+        stmt = select(PipelineStage).where(
+            PipelineStage.pipeline_id == pipeline_id,
+            PipelineStage.name == StageName.CODING
+        )
+        result = await session.execute(stmt)
+        coding_stage = result.scalar_one_or_none()
+
+        if not coding_stage or not coding_stage.output_data:
+            return error_response(error="No coding output found", request_id=request_id)
+
+        output = coding_stage.output_data
+        multi_agent_output = output.get("multi_agent_output", {})
+        files = multi_agent_output.get("files", [])
+
+        # 只返回 diff 需要的字段，不传无关数据
+        diff_files = [
+            {
+                "file_path": f.get("file_path", ""),
+                "content": f.get("content", ""),
+                "original_content": f.get("original_content"),
+                "change_type": f.get("change_type", "modify"),
+            }
+            for f in files
+        ]
+
+        return success_response(
+            data={"files": diff_files, "summary": multi_agent_output.get("summary", "")},
+            request_id=request_id
+        )
+    except Exception as e:
+        error("获取 diff 失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(error=str(e), request_id=request_id)
 
 
 @router.get(

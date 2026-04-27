@@ -7,10 +7,14 @@ import asyncio
 import os
 import sys
 
-# Windows 控制台 UTF-8 编码修复
+# Windows 平台特殊处理（必须在所有其他 import 之前）
 if sys.platform == 'win32':
+    # 1. 设置事件循环策略以支持子进程（关键修复）
+    # SelectorEventLoop 不支持子进程，必须使用 ProactorEventLoop
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    # 2. Windows 控制台 UTF-8 编码修复
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    # 重新配置 stdout/stderr
     import io
     if hasattr(sys.stdout, 'buffer'):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -26,6 +30,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.health import router as health_router
 from app.api.v1.pipeline import router as pipeline_router
 from app.api.v1.system import router as system_router
+from app.api.v1.workspace import router as workspace_router
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.response import ResponseModel
@@ -42,14 +47,28 @@ async def _periodic_buffer_cleanup():
         try:
             await asyncio.sleep(600)  # 每 10 分钟清理一次
             _cleanup_expired_buffers()
-        except Exception as e:
-            error("SSE Buffer 清理任务异常", error=str(e))
+        except Exception:
+            error("SSE Buffer 清理任务异常", exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     import asyncio
+
+    # Windows 平台：确保使用 ProactorEventLoop（支持子进程）
+    # 注意：Uvicorn 可能会覆盖我们在文件开头设置的策略，所以在这里再次确认
+    if sys.platform == 'win32':
+        current_loop = asyncio.get_event_loop()
+        if not isinstance(current_loop, asyncio.ProactorEventLoop):
+            # 如果当前不是 ProactorEventLoop，需要重新设置
+            # 注意：这通常发生在 Uvicorn 覆盖了我们的设置时
+            error(
+                "当前事件循环不是 ProactorEventLoop，子进程功能可能无法正常工作",
+                current_loop_type=type(current_loop).__name__
+            )
+            # 尝试设置策略（虽然可能已晚，但记录日志有助于调试）
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     # 启动时执行
     info("OmniFlowAI Backend 启动中...", env=settings.ENV, debug=settings.DEBUG)
@@ -59,8 +78,8 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         info("数据库初始化完成")
-    except Exception as e:
-        error("数据库初始化失败", error=str(e))
+    except Exception:
+        error("数据库初始化失败", exc_info=True)
         raise
 
     # 启动 SSE Buffer 定期清理任务
@@ -167,6 +186,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(pipeline_router, prefix="/api/v1", tags=["pipeline"])
 app.include_router(system_router, prefix="/api/v1", tags=["system"])
+app.include_router(workspace_router, prefix="/api/v1", tags=["workspace"])
 
 
 if __name__ == "__main__":
@@ -175,5 +195,7 @@ if __name__ == "__main__":
         "main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=False  # 强制关闭自动重启，避免日志写入导致无限循环
+        reload=False,  # 强制关闭自动重启，避免日志写入导致无限循环
+        log_level="warning",  # 减少 Uvicorn 自身日志噪音
+        access_log=False,  # 关闭访问日志（由我们的 RequestLogMiddleware 处理）
     )

@@ -1,10 +1,19 @@
 """
 OmniFlowAI 企业级日志系统
 提供结构化日志、请求追踪、性能监控、慢查询捕获等功能
+
+日志级别规范（分级治理）：
+- DEBUG: HTTP 请求出入参、数据库详细 SQL（仅开发环境）
+- INFO:  状态流转（如 [REQUIREMENT -> DESIGN]）、Agent 成功结束、请求完成
+- WARNING: 预期内的异常（如 AI 测试未通过触发 Auto-Fix）
+- ERROR: 需要人类介入（API Key 欠费、数据库断开、三次 Auto-Fix 失败）
+         必须附带 exc_info=True
+
+默认级别: INFO（减少控制台噪音）
 """
 
 import logging
-import logging.handlers
+import logging.config
 import os
 import sys
 import time
@@ -72,72 +81,46 @@ def clear_context() -> None:
 # =============================================================================
 
 def setup_logging():
-    """配置标准库 logging，支持文件轮转和控制台输出"""
-    level = logging.DEBUG if settings.DEBUG else logging.INFO
-
-    # 确保日志目录存在
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, 'app.log')
-
-    # 根 logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
-    root_logger.handlers = []
-
-    # 1. 文件 Handler - JSON 格式（开发和生产都写入）
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file,
-        maxBytes=50 * 1024 * 1024,  # 50MB
-        backupCount=10
-    )
-    file_handler.setLevel(level)
-
-    # 文件使用简单的格式化器，structlog 会处理 JSON
-    file_formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    file_handler.setFormatter(file_formatter)
-    root_logger.addHandler(file_handler)
-
-    # 2. 控制台 Handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-
-    # 控制台使用简单格式
-    console_formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    console_handler.setFormatter(console_formatter)
-    root_logger.addHandler(console_handler)
-
-    # 屏蔽噪声日志
-    _silence_noisy_loggers()
-
-
-def _silence_noisy_loggers():
-    """屏蔽第三方库的噪声日志"""
-    sql_level = logging.DEBUG if settings.DEBUG else logging.WARNING
-
-    # SQLAlchemy
-    logging.getLogger("sqlalchemy.engine").setLevel(sql_level)
-    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy.dialects").setLevel(logging.WARNING)
-
-    # Uvicorn
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn").setLevel(logging.WARNING)
-
-    # HTTP clients
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    # AI SDKs
-    logging.getLogger("anthropic").setLevel(logging.INFO)
-    logging.getLogger("openai").setLevel(logging.INFO)
+    """
+    配置标准库 logging，使用 dictConfig 精准屏蔽噪音
+    核心：第三方库强制使用 INFO/WARNING，防止底层 DEBUG 追踪泄露
+    """
+    # 1. 使用 dictConfig 精准控制各 logger 级别
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "plain": {
+                "format": "%(message)s",
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "plain",
+                "stream": sys.stdout,
+            },
+        },
+        "root": {
+            "level": "INFO",
+            "handlers": ["console"],
+        },
+        "loggers": {
+            # 核心：精准屏蔽这些"话痨"
+            "sqlalchemy.engine": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "sqlalchemy.pool": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "sqlalchemy.dialects": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "litellm": {"level": "ERROR", "handlers": ["console"], "propagate": False},
+            "uvicorn": {"level": "INFO", "handlers": ["console"], "propagate": False},
+            "uvicorn.access": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "uvicorn.error": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "watchfiles": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "httpx": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "httpcore": {"level": "WARNING", "handlers": ["console"], "propagate": False},
+            "anthropic": {"level": "INFO", "handlers": ["console"], "propagate": False},
+            "openai": {"level": "INFO", "handlers": ["console"], "propagate": False},
+        },
+    })
 
 
 # 初始化标准库 logging
@@ -170,68 +153,32 @@ def add_standard_fields(logger, method_name: str, event_dict: EventDict) -> Even
     return event_dict
 
 
-def format_for_rich(logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """为 Rich 控制台格式化日志"""
-    if not settings.DEBUG:
-        return event_dict
-
-    # 提取关键字段
-    timestamp = event_dict.pop('timestamp', '')
-    level = event_dict.get('level', 'info').upper()
-    logger_name = event_dict.get('logger', 'app')
-    event = event_dict.pop('event', '')
-
-    # 构建额外字段字符串
-    extras = []
-    for key, value in event_dict.items():
-        if key not in ['level', 'logger', 'request_id', 'pipeline_id', 'agent', 'timestamp']:
-            if isinstance(value, (dict, list)):
-                extras.append(f"{key}={str(value)[:100]}")
-            else:
-                extras.append(f"{key}={value}")
-
-    extra_str = " ".join(extras) if extras else ""
-
-    # 构建消息
-    if extra_str:
-        event_dict['message'] = f"{event}  {extra_str}"
-    else:
-        event_dict['message'] = event
-
-    return event_dict
-
-
 def setup_structlog():
-    """配置 structlog - 统一使用无颜色格式，避免Windows编码问题"""
+    """配置 structlog - 启用 Rich 彩色渲染"""
     processors = [
-        structlog.contextvars.merge_contextvars,  # 合并 ContextVars
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso"),
-        add_standard_fields,  # 添加标准化字段
-        structlog.stdlib.ExtraAdder(),
+        structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=False),
+        add_standard_fields,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
     ]
 
     if settings.DEBUG:
-        # 开发环境：人类可读格式，但无颜色（避免Windows编码问题）
-        processors.extend([
-            format_for_rich,
+        # 开发环境：启用 Rich 彩色渲染
+        processors.append(
             structlog.dev.ConsoleRenderer(
-                colors=False,  # 禁用颜色，避免Windows编码问题
-                pad_level=False,
-                timestamp_key='timestamp',
+                colors=True,
+                exception_formatter=structlog.dev.rich_traceback
             )
-        ])
+        )
     else:
         # 生产环境：JSON 输出
-        processors.extend([
-            structlog.processors.dict_tracebacks,
-            structlog.processors.JSONRenderer()
-        ])
+        processors.append(structlog.processors.JSONRenderer())
 
     structlog.configure(
         processors=processors,
-        context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
@@ -278,7 +225,7 @@ def critical(msg: str, **kwargs):
 # =============================================================================
 
 class RequestLogMiddleware:
-    """请求日志中间件 - 支持 correlation_id 和慢请求告警"""
+    """请求日志中间件 - 支持 correlation_id 和慢请求告警，屏蔽轮询噪音"""
 
     # 健康检查路径 - 只记录 DEBUG 级别
     HEALTH_PATHS = {'/api/v1/health', '/health', '/favicon.ico'}
@@ -307,17 +254,13 @@ class RequestLogMiddleware:
                 path=path,
             )
 
-        query_string = scope.get("query_string", b"").decode()
-        start_time = time.time()
+        # 优化 1：检测 SSE 接口
+        is_sse = "logs" in path
 
-        if not is_health:
-            logger.info(
-                "request_started",
-                method=method,
-                path=path,
-                query=query_string,
-                client=scope.get("client", ("unknown", 0))[0],
-            )
+        # 优化 2：检测轮询请求
+        is_polling = "status" in path or "stats" in path
+
+        start_time = time.time()
 
         # 包装 send 以捕获响应状态
         status_code = 200
@@ -330,13 +273,12 @@ class RequestLogMiddleware:
 
         try:
             await self.app(scope, receive, wrapped_send)
-        except Exception as e:
+        except Exception:
             status_code = 500
             logger.error(
                 "request_failed",
                 method=method,
                 path=path,
-                error=str(e),
                 exc_info=True,
             )
             raise
@@ -344,7 +286,6 @@ class RequestLogMiddleware:
             duration_ms = (time.time() - start_time) * 1000
 
             if not is_health:
-                # 慢请求分级告警
                 log_data = {
                     "method": method,
                     "path": path,
@@ -352,21 +293,25 @@ class RequestLogMiddleware:
                     "duration_ms": round(duration_ms, 2),
                 }
 
-                if duration_ms >= 2000:
-                    # 极慢请求
-                    log_data.update(slow=True, very_slow=True)
-                    logger.error("request_completed", **log_data)
-                elif duration_ms >= 500:
-                    # 慢请求
-                    log_data.update(slow=True)
-                    logger.warning("request_completed", **log_data)
-                elif duration_ms >= 200:
-                    # 正常但可观察
-                    log_data.update(slow=False)
-                    logger.info("request_completed", **log_data)
+                if is_sse:
+                    # SSE 永远不报 slow_error，除非状态码不是 200
+                    if status_code == 200:
+                        logger.debug("sse_closed", **log_data)
+                    else:
+                        logger.error("sse_failed", **log_data)
+                elif is_polling and status_code == 200:
+                    # 轮询请求平时不打印，除非出错或慢
+                    if duration_ms >= 2000:
+                        logger.error("polling_slow", slow=True, **log_data)
+                    # 正常轮询不记录，减少噪音
                 else:
-                    # 正常请求
-                    logger.info("request_completed", **log_data)
+                    # 正常的业务请求慢查询逻辑
+                    if duration_ms >= 2000:
+                        logger.error("request_completed", slow=True, **log_data)
+                    elif duration_ms >= 500:
+                        logger.warning("request_completed", slow=True, **log_data)
+                    else:
+                        logger.info("request_completed", **log_data)
 
             # 清除 ContextVar
             clear_context()
@@ -463,19 +408,6 @@ class OperationLogger:
         set_pipeline_id(None)
 
     @staticmethod
-    def log_agent_start(pipeline_id: int, agent_name: str, stage: str, **kwargs):
-        """记录 Agent 启动"""
-        set_pipeline_id(pipeline_id)
-        set_agent(agent_name)
-        logger.info(
-            "agent_started",
-            pipeline_id=pipeline_id,
-            agent=agent_name,
-            stage=stage,
-            **kwargs
-        )
-
-    @staticmethod
     def log_agent_complete(
         pipeline_id: int,
         agent_name: str,
@@ -483,23 +415,28 @@ class OperationLogger:
         success: bool,
         duration_ms: float,
         error: Optional[str] = None,
+        input_data: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
-        """记录 Agent 完成"""
+        """记录 Agent 完成（包含入参信息）"""
         set_pipeline_id(pipeline_id)
         set_agent(agent_name)
 
         log_func = logger.info if success else logger.error
-        log_func(
-            "agent_completed",
-            pipeline_id=pipeline_id,
-            agent=agent_name,
-            stage=stage,
-            success=success,
-            duration_ms=round(duration_ms, 2),
-            error=error,
+        log_data = {
+            "pipeline_id": pipeline_id,
+            "agent": agent_name,
+            "stage": stage,
+            "success": success,
+            "duration_ms": round(duration_ms, 2),
+            "error": error,
             **kwargs
-        )
+        }
+
+        if input_data:
+            log_data["input"] = input_data
+
+        log_func("agent_completed", **log_data)
 
         set_agent(None)
         set_pipeline_id(None)
@@ -593,13 +530,13 @@ def log_performance(operation: str, **metadata):
             duration_ms=round(metrics.duration_ms, 2),
             **metadata
         )
-    except Exception as e:
+    except Exception:
         metrics.finish()
         logger.error(
             "performance_metric_failed",
             operation=operation,
             duration_ms=round(metrics.duration_ms, 2),
-            error=str(e),
+            exc_info=True,
             **metadata
         )
         raise
@@ -627,14 +564,14 @@ def log_execution_time(func: Callable) -> Callable:
                 module=func.__module__,
             )
             return result
-        except Exception as e:
+        except Exception:
             duration = (time.time() - start) * 1000
             logger.error(
                 "function_failed",
                 function=func.__name__,
                 duration_ms=round(duration, 2),
                 module=func.__module__,
-                error=str(e),
+                exc_info=True,
             )
             raise
 
@@ -651,14 +588,14 @@ def log_execution_time(func: Callable) -> Callable:
                 module=func.__module__,
             )
             return result
-        except Exception as e:
+        except Exception:
             duration = (time.time() - start) * 1000
             logger.error(
                 "function_failed",
                 function=func.__name__,
                 duration_ms=round(duration, 2),
                 module=func.__module__,
-                error=str(e),
+                exc_info=True,
             )
             raise
 
@@ -800,8 +737,6 @@ class MetricsCollector:
         )
         self.metrics[key] = metrics
 
-        op_logger.log_agent_start(pipeline_id, agent_name, stage_name)
-
         return metrics
 
     def finish_agent(
@@ -867,12 +802,11 @@ def agent_metrics_context(
             output_tokens=metrics.output_tokens,
             retry_count=metrics.retry_count
         )
-    except Exception as e:
+    except Exception:
         metrics_collector.finish_agent(
             pipeline_id=pipeline_id,
             stage_name=stage_name,
             success=False,
-            error=str(e),
             input_tokens=metrics.input_tokens,
             output_tokens=metrics.output_tokens,
             retry_count=metrics.retry_count
@@ -923,3 +857,39 @@ def log_api_request(
         status_code=status_code,
         duration_ms=round(duration_ms, 2)
     )
+
+
+# =============================================================================
+# 统一日志出口：同时打印到后端控制台和推送到前端 SSE
+# =============================================================================
+
+async def emit_log(
+    pipeline_id: int,
+    level: str,
+    msg: str,
+    stage: str = "",
+    exc_info: bool = False,
+    **kwargs
+) -> None:
+    """
+    统一日志出口：同时打印到后端控制台和推送到前端 SSE
+
+    使用示例：
+        await emit_log(pipeline_id, "info", "代码生成完成", stage="CODING", files_count=5)
+    """
+    # 1. 打印后端日志
+    log_func = getattr(logger, level if level in ['info', 'debug', 'warning', 'error'] else 'info')
+
+    # 确保在上下文中携带 pipeline_id
+    with structlog.contextvars.bound_contextvars(pipeline_id=pipeline_id, stage=stage):
+        log_func(msg, exc_info=exc_info, **kwargs)
+
+    # 2. 推送前端 SSE
+    from app.core.sse_log_buffer import push_log
+
+    # 如果有异常，把异常简述发给前端，但不需要把整个长篇堆栈发给前端
+    frontend_msg = msg
+    if exc_info:
+        frontend_msg = f"{msg} (查看后端日志获取详情)"
+
+    await push_log(pipeline_id, level, frontend_msg, stage=stage, **kwargs)

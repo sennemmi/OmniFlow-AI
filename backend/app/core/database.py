@@ -8,10 +8,10 @@ from sqlmodel import SQLModel
 
 from app.core.config import settings
 
-# 创建异步引擎
+# 创建异步引擎 - echo=False 彻底关闭 SQLAlchemy 详细日志
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
+    echo=False,
     future=True
 )
 

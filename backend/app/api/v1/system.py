@@ -109,6 +109,45 @@ async def get_system_stats(
             request_id=request_id
         )
     except Exception as e:
+        from app.core.logging import error
+        error("获取系统统计失败", exc_info=True)
+        return ResponseModel(
+            success=False,
+            data=None,
+            error=str(e),
+            request_id=request_id
+        )
+
+
+@router.get(
+    "/system/config",
+    response_model=ResponseModel,
+    summary="获取系统配置",
+    description="获取前端所需的系统配置信息，如目标项目路径等",
+)
+async def get_system_config(
+    request: Request,
+):
+    """
+    获取系统配置信息
+    """
+    request_id = getattr(request.state, "request_id", None)
+    try:
+        from app.core.config import settings
+
+        return ResponseModel(
+            success=True,
+            data={
+                "target_project_path": settings.TARGET_PROJECT_PATH,
+                "api_base_url": "http://localhost:8000",
+                "version": "1.0.0",
+            },
+            error=None,
+            request_id=request_id
+        )
+    except Exception as e:
+        from app.core.logging import error
+        error("获取系统配置失败", exc_info=True)
         return ResponseModel(
             success=False,
             data=None,
@@ -236,6 +275,8 @@ async def get_analytics(
             request_id=request_id
         )
     except Exception as e:
+        from app.core.logging import error
+        error("获取系统分析数据失败", exc_info=True)
         return ResponseModel(
             success=False,
             data=None,

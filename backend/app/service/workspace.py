@@ -4,7 +4,9 @@
 """
 
 import asyncio
+import os
 import shutil
+import stat
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,12 @@ from app.core.logging import info, error
 
 # 全局线程池，用于执行同步文件操作
 _file_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="workspace_file_")
+
+
+def _remove_readonly(func, path, _):
+    """清除只读属性并重试删除（Windows 兼容）"""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
 class WorkspaceService:
@@ -108,7 +116,7 @@ class WorkspaceService:
         return self.workspace_dir
 
     async def cleanup_async(self) -> None:
-        """异步清理临时工作区（在线程池中执行）"""
+        """异步清理临时工作区（在线程池中执行，Windows 兼容）"""
         if self.workspace_dir and self.workspace_dir.exists():
             try:
                 info(
@@ -119,20 +127,19 @@ class WorkspaceService:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
                     _file_executor,
-                    shutil.rmtree,
-                    self.workspace_dir
+                    lambda: shutil.rmtree(self.workspace_dir, onerror=_remove_readonly)
                 )
                 self.workspace_dir = None
-            except Exception as e:
+            except Exception:
                 error(
                     "清理临时工作区失败",
                     pipeline_id=self.pipeline_id,
                     workspace=str(self.workspace_dir),
-                    error=str(e)
+                    exc_info=True
                 )
 
     def cleanup(self) -> None:
-        """同步清理临时工作区（兼容旧代码）"""
+        """同步清理临时工作区（兼容旧代码，Windows 兼容）"""
         if self.workspace_dir and self.workspace_dir.exists():
             try:
                 info(
@@ -140,16 +147,16 @@ class WorkspaceService:
                     pipeline_id=self.pipeline_id,
                     workspace=str(self.workspace_dir)
                 )
-                shutil.rmtree(self.workspace_dir)
+                shutil.rmtree(self.workspace_dir, onerror=_remove_readonly)
                 self.workspace_dir = None
-            except Exception as e:
+            except Exception:
                 error(
                     "清理临时工作区失败",
                     pipeline_id=self.pipeline_id,
                     workspace=str(self.workspace_dir),
-                    error=str(e)
+                    exc_info=True
                 )
-    
+
     def get_workspace_path(self) -> Optional[Path]:
         """获取当前工作区路径"""
         return self.workspace_dir
