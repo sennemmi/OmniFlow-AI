@@ -21,6 +21,7 @@ import {
   Pause,
 } from 'lucide-react';
 import { apiGet } from '@utils/axios';
+import { CreatePipelineModal } from '@components/Console/CreatePipelineModal';
 import type { PipelineListItem, PipelineListResponse } from '@types';
 
 // ============================================
@@ -41,6 +42,7 @@ export function Pipelines() {
   const [sortField, setSortField] = useState<SortField>('created_at');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
 
   // 获取流水线列表
   const { data: pipelinesData, isLoading, refetch } = useQuery<PipelineListResponse>({
@@ -192,7 +194,7 @@ export function Pipelines() {
               <RefreshCw className={`w-5 h-5 ${isLoading ? 'animate-spin' : ''}`} />
             </button>
             <button
-              onClick={() => navigate('/console/pipelines/new')}
+              onClick={() => setIsCreateModalOpen(true)}
               className="inline-flex items-center gap-2 px-4 py-2.5 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-all shadow-sm hover:shadow-md"
             >
               <Plus className="w-5 h-5" />
@@ -316,7 +318,7 @@ export function Pipelines() {
             </div>
           </div>
         ) : filteredPipelines.length === 0 ? (
-          <EmptyState onCreate={() => navigate('/console/pipelines/new')} />
+          <EmptyState onCreate={() => setIsCreateModalOpen(true)} />
         ) : viewMode === 'list' ? (
           <ListView
             pipelines={filteredPipelines}
@@ -337,6 +339,12 @@ export function Pipelines() {
           />
         )}
       </div>
+
+      {/* 创建流水线弹窗 */}
+      <CreatePipelineModal
+        isOpen={isCreateModalOpen}
+        onClose={() => setIsCreateModalOpen(false)}
+      />
     </div>
   );
 }

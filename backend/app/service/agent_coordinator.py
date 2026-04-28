@@ -18,6 +18,9 @@ from app.agents.architect import architect_agent
 from app.agents.designer import designer_agent
 from app.agents.multi_agent_coordinator import multi_agent_coordinator
 from app.core.logging import info, error
+import logging
+
+logger = logging.getLogger(__name__)
 from app.core.sse_log_buffer import push_log
 from app.models.pipeline import PipelineStage, StageName
 from app.service.project import ProjectService
@@ -44,14 +47,18 @@ class AgentCoordinatorService:
     def _extract_metrics(agent_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         从 Agent 执行结果中提取可观测性指标
-        
+
         Args:
             agent_result: Agent 执行结果
-            
+
         Returns:
             Dict[str, Any]: 指标字典
         """
-        return PipelineStageRepository.extract_metrics(agent_result)
+        metrics = PipelineStageRepository.extract_metrics(agent_result)
+        # ★ DEBUG: 打印提取的指标
+        from app.core.logging import logger
+        logger.info(f"[DEBUG] _extract_metrics from agent_result: {metrics}")
+        return metrics
     
     @staticmethod
     async def _get_project_file_tree(max_depth: int = 4) -> Dict[str, Any]:
@@ -90,6 +97,8 @@ class AgentCoordinatorService:
         
         if stage:
             metrics = AgentCoordinatorService._extract_metrics(agent_result)
+            # ★ DEBUG: 打印即将保存的指标
+            logger.info(f"[DEBUG] _complete_stage_with_metrics for {stage_name}: metrics={metrics}")
             await WorkflowService.complete_stage(
                 stage=stage,
                 output_data=agent_result["output"] if agent_result["success"] else {"error": agent_result["error"]},
@@ -99,6 +108,96 @@ class AgentCoordinatorService:
             )
     
     # ==================== ArchitectAgent 相关 ====================
+    
+    @classmethod
+    async def _enrich_element_context_with_code(
+        cls,
+        pipeline_id: int,
+        element_context: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        【增强】根据 sourceContext 读取真实代码上下文并注入到 element_context
+        
+        Args:
+            pipeline_id: Pipeline ID
+            element_context: 页面元素上下文（包含 sourceContext）
+            
+        Returns:
+            Optional[Dict[str, Any]]: 增强后的 element_context
+        """
+        if not element_context:
+            return element_context
+        
+        source_context = element_context.get("sourceContext")
+        if not source_context:
+            return element_context
+        
+        try:
+            from app.service.code_modifier import CodeModifierService
+            from app.core.config import settings
+            
+            file_path = source_context.get("file") or source_context.get("relativePath")
+            line = source_context.get("line", 0)
+            
+            if not file_path or line <= 0:
+                return element_context
+            
+            await push_log(
+                pipeline_id,
+                "info",
+                f"正在读取圈选元素对应的源码上下文: {file_path}:{line}",
+                stage="REQUIREMENT"
+            )
+            
+            # 创建代码修改服务
+            modifier = CodeModifierService(workspace_path=settings.TARGET_PROJECT_PATH)
+            
+            try:
+                # 读取文件上下文
+                content, surrounding, start_line, end_line = modifier.read_file_context(
+                    file_path, line, context_lines=20
+                )
+                
+                # 构建 code_context
+                code_context = {
+                    "file": file_path,
+                    "line": line,
+                    "column": source_context.get("column", 0),
+                    "surrounding_code": surrounding,
+                    "full_file_content": content,
+                    "context_start_line": start_line,
+                    "context_end_line": end_line,
+                }
+                
+                # 注入到 element_context
+                element_context["code_context"] = code_context
+                
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    f"成功读取源码上下文: {file_path} (行 {start_line}-{end_line})",
+                    stage="REQUIREMENT"
+                )
+                
+            except FileNotFoundError:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"源文件不存在: {file_path}",
+                    stage="REQUIREMENT"
+                )
+            except Exception as e:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"读取源码上下文失败: {str(e)[:100]}",
+                    stage="REQUIREMENT"
+                )
+        
+        except Exception as e:
+            logger.warning(f"增强 element_context 失败: {e}")
+        
+        return element_context
     
     @classmethod
     async def run_architect_analysis(
@@ -111,10 +210,12 @@ class AgentCoordinatorService:
         """
         运行 ArchitectAgent 分析
         
+        【增强】如果存在 sourceContext，会读取真实代码上下文并注入到 element_context
+        
         Args:
             pipeline_id: Pipeline ID
             requirement: 需求描述
-            element_context: 页面元素上下文
+            element_context: 页面元素上下文（可能包含 sourceContext）
             session: 数据库会话
             
         Returns:
@@ -123,6 +224,12 @@ class AgentCoordinatorService:
         await push_log(pipeline_id, "info", "开始需求分析...", stage="REQUIREMENT")
 
         try:
+            # 【增强】根据 sourceContext 读取真实代码上下文
+            if element_context and element_context.get("sourceContext"):
+                element_context = await cls._enrich_element_context_with_code(
+                    pipeline_id, element_context
+                )
+            
             # 获取项目文件树
             file_tree = await cls._get_project_file_tree()
             await push_log(pipeline_id, "info", "正在扫描项目结构...", stage="REQUIREMENT")
@@ -310,7 +417,8 @@ class AgentCoordinatorService:
     async def run_designer_analysis(
         cls,
         pipeline_id: int,
-        session: AsyncSession
+        session: AsyncSession,
+        design_stage_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         运行 DesignerAgent 进行技术设计
@@ -320,6 +428,7 @@ class AgentCoordinatorService:
         Args:
             pipeline_id: Pipeline ID
             session: 数据库会话
+            design_stage_id: DESIGN 阶段 ID（由 Handler 传入，避免重复创建）
 
         Returns:
             Dict: 执行结果
@@ -377,17 +486,35 @@ class AgentCoordinatorService:
             # 获取项目文件树
             file_tree = await cls._get_project_file_tree()
 
-            # 创建 DESIGN 阶段
-            design_stage = await WorkflowService.create_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.DESIGN,
-                input_data={
+            # 【修复】如果提供了 design_stage_id，则更新现有阶段，否则创建新阶段
+            if design_stage_id:
+                # 使用 Handler 已创建的阶段
+                from sqlmodel import select
+                from app.models.pipeline import PipelineStage
+                statement = select(PipelineStage).where(PipelineStage.id == design_stage_id)
+                result = await session.execute(statement)
+                design_stage = result.scalar_one_or_none()
+                if not design_stage:
+                    raise ValueError(f"Design stage {design_stage_id} not found")
+                
+                # 更新输入数据
+                design_stage.input_data = {
                     **architect_output_with_context,
                     "full_files_context_keys": list(full_files_context.keys()) if full_files_context else [],
                     "file_summaries": code_context.get("file_summaries", [])
-                },
-                session=session
-            )
+                }
+            else:
+                # 创建 DESIGN 阶段（兼容旧调用）
+                design_stage = await WorkflowService.create_stage(
+                    pipeline_id=pipeline_id,
+                    stage_name=StageName.DESIGN,
+                    input_data={
+                        **architect_output_with_context,
+                        "full_files_context_keys": list(full_files_context.keys()) if full_files_context else [],
+                        "file_summaries": code_context.get("file_summaries", [])
+                    },
+                    session=session
+                )
 
             # 推送开始日志
             await push_log(pipeline_id, "info", "开始技术设计...", stage="DESIGN")

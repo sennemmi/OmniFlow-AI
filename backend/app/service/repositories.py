@@ -15,6 +15,7 @@ from app.models.pipeline import (
     PipelineStage, StageName, StageStatus
 )
 from app.core.timezone import now
+from app.core.logging import logger
 
 
 class PipelineRepository:
@@ -166,6 +167,10 @@ class PipelineStageRepository:
         )
         session.add(stage)
         await session.commit()
+
+        # ★ DEBUG: 刷新并验证保存的数据
+        await session.refresh(stage)
+        logger.info(f"[DEBUG] After commit - stage {stage.name} metrics: input_tokens={stage.input_tokens}, output_tokens={stage.output_tokens}, duration_ms={stage.duration_ms}")
         return stage
     
     @staticmethod
@@ -178,7 +183,7 @@ class PipelineStageRepository:
     ) -> None:
         """
         完成 Stage
-        
+
         Args:
             stage: Stage 对象
             output_data: 输出数据
@@ -186,10 +191,15 @@ class PipelineStageRepository:
             session: 数据库会话
             metrics: 可观测性指标（可选）
         """
+        # ★ DEBUG: 打印接收到的 metrics
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[DEBUG] PipelineStageRepository.complete called with metrics: {metrics}")
+
         stage.status = StageStatus.SUCCESS if success else StageStatus.FAILED
         stage.output_data = output_data
         stage.completed_at = now()
-        
+
         # 保存可观测性指标
         if metrics:
             stage.input_tokens = metrics.get('input_tokens', 0)
@@ -197,7 +207,10 @@ class PipelineStageRepository:
             stage.duration_ms = metrics.get('duration_ms', 0)
             stage.retry_count = metrics.get('retry_count', 0)
             stage.reasoning = metrics.get('reasoning')
-        
+            logger.info(f"[DEBUG] Saved metrics to stage: input_tokens={stage.input_tokens}, output_tokens={stage.output_tokens}, duration_ms={stage.duration_ms}")
+        else:
+            logger.warning(f"[DEBUG] No metrics provided for stage {stage.name}, all metrics will be 0")
+
         session.add(stage)
         await session.commit()
     

@@ -55,6 +55,13 @@ export interface PipelineStage {
   created_at?: string;
   completed_at?: string;
   duration?: number; // 前端扩展：阶段耗时（秒）
+
+  // 可观测性指标（与后端 PipelineStageRead 对齐）
+  input_tokens?: number;
+  output_tokens?: number;
+  duration_ms?: number;
+  retry_count?: number;
+  reasoning?: string;
 }
 
 // Pipeline 列表项（与后端 PipelineListItem 对齐）

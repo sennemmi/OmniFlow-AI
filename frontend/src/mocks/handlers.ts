@@ -46,15 +46,15 @@ const mockStages: PipelineStage[] = [
 
 export const handlers = [
   // 获取 Pipeline 列表
-  http.get('/api/v1/pipelines', () => {
+  http.get('/api/v1/pipeline', () => {
     return HttpResponse.json({
       success: true,
       data: mockPipelines,
     });
   }),
 
-  // 获取单个 Pipeline
-  http.get('/api/v1/pipelines/:id', ({ params }) => {
+  // 获取单个 Pipeline 状态
+  http.get('/api/v1/pipeline/:id/status', ({ params }) => {
     const pipeline = mockPipelines.find(p => p.id === Number(params.id));
     if (!pipeline) {
       return HttpResponse.json(
@@ -69,7 +69,7 @@ export const handlers = [
   }),
 
   // 创建 Pipeline
-  http.post('/api/v1/pipelines', async ({ request }) => {
+  http.post('/api/v1/pipeline', async ({ request }) => {
     const body = await request.json() as { description: string };
     const newPipeline: Pipeline = {
       id: mockPipelines.length + 1,
@@ -88,7 +88,7 @@ export const handlers = [
   }),
 
   // 审批 Pipeline
-  http.post('/api/v1/pipelines/:id/approve', ({ params }) => {
+  http.post('/api/v1/pipeline/:id/approve', ({ params }) => {
     const pipeline = mockPipelines.find(p => p.id === Number(params.id));
     if (!pipeline) {
       return HttpResponse.json(
@@ -110,7 +110,7 @@ export const handlers = [
   }),
 
   // 驳回 Pipeline
-  http.post('/api/v1/pipelines/:id/reject', async ({ request, params }) => {
+  http.post('/api/v1/pipeline/:id/reject', async ({ request, params }) => {
     const body = await request.json() as { reason: string };
     const pipeline = mockPipelines.find(p => p.id === Number(params.id));
     if (!pipeline) {
@@ -133,7 +133,7 @@ export const handlers = [
   }),
 
   // SSE 日志流
-  http.get('/api/v1/pipelines/:id/logs', () => {
+  http.get('/api/v1/pipeline/:id/logs', () => {
     // SSE 流在测试中返回空即可
     return new HttpResponse(null, { status: 200 });
   }),

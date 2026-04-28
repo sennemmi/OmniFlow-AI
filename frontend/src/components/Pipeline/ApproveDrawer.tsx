@@ -5,10 +5,10 @@ import { usePipelineStore } from '@stores/pipelineStore';
 import { useUIStore } from '@stores/uiStore';
 import { apiPost, apiGet } from '@utils/axios';
 import { getLanguageFromPath, extractTechnicalDesign } from '@utils/formatters';
-import { extractAllCodeChanges, isCodeStage } from '@utils/pipelineHelpers';
+import { extractAllCodeChanges, isCodeStage, isTestStage, extractTestCodeChanges } from '@utils/pipelineHelpers';
 import { DiffViewer } from './DiffViewer';
 import { MetricsPanel } from './MetricsPanel';
-import type { PipelineStage } from '@types';
+import type { Pipeline, PipelineStage } from '@types';
 
 // 审批请求超时时间（毫秒）
 const APPROVE_TIMEOUT = 10000; // 10秒
@@ -18,7 +18,7 @@ const APPROVE_TIMEOUT = 10000; // 10秒
 // ============================================
 
 export function ApproveDrawer() {
-  const { selectedStage, isApproveDrawerOpen, closeApproveDrawer, selectedPipeline } = usePipelineStore();
+  const { selectedStage, isApproveDrawerOpen, closeApproveDrawer, selectedPipeline: storedPipeline } = usePipelineStore();
   const { addToast } = useUIStore();
   const queryClient = useQueryClient();
   const [feedback, setFeedback] = useState('');
@@ -26,12 +26,32 @@ export function ApproveDrawer() {
   const [showConfirm, setShowConfirm] = useState(false);
   const [showDiff, setShowDiff] = useState(true);
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
+  const [selectedTestFileIndex, setSelectedTestFileIndex] = useState(0);
   const [showTimeoutWarning, setShowTimeoutWarning] = useState(false);
   const [showMetrics, setShowMetrics] = useState(true);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // 修复：用实时查询数据替代 store 快照
+  const pipelineId = storedPipeline?.id;
+  const { data: livePipeline } = useQuery<Pipeline>({
+    queryKey: ['pipeline', String(pipelineId)],
+    queryFn: () => apiGet<Pipeline>(`/pipeline/${pipelineId}/status`),
+    enabled: !!pipelineId && isApproveDrawerOpen,
+    refetchInterval: 2000,
+    staleTime: 0,
+  });
+
+  // 优先使用实时数据，fallback 到 store 快照
+  const selectedPipeline = livePipeline ?? storedPipeline;
+
+  // 修复：从实时 pipeline 数据中找到最新的 stage 状态
+  const liveSelectedStage = selectedPipeline?.stages?.find(
+    (s: PipelineStage) => s.name === selectedStage?.name
+  ) ?? selectedStage;
+
   // 判断是否是代码阶段（包括 CODE_REVIEW）
-  const codeStage = isCodeStage(selectedStage);
+  const codeStage = isCodeStage(liveSelectedStage);
+  const testStage = isTestStage(liveSelectedStage);
 
   // 使用 diff 接口获取完整代码数据（解决 API 截断问题）
   const { data: diffData, isLoading: isDiffLoading } = useQuery({
@@ -58,19 +78,43 @@ export function ApproveDrawer() {
 
     // 否则使用原来的逻辑（从 stage 数据中提取）
     return extractAllCodeChanges(
-      selectedStage?.output_data as Record<string, unknown> | undefined,
-      selectedStage?.input_data as Record<string, unknown> | undefined
+      liveSelectedStage?.output_data as Record<string, unknown> | undefined,
+      liveSelectedStage?.input_data as Record<string, unknown> | undefined
     );
-  }, [diffData, selectedStage]);
+  }, [diffData, liveSelectedStage]);
+
+  // 提取测试代码变更
+  const testCodeChanges = useMemo(() => {
+    return extractTestCodeChanges(
+      liveSelectedStage?.output_data as Record<string, unknown> | undefined,
+      liveSelectedStage?.input_data as Record<string, unknown> | undefined
+    );
+  }, [liveSelectedStage]);
 
   const currentChange = allCodeChanges[selectedFileIndex];
+  const currentTestChange = testCodeChanges[selectedTestFileIndex];
+
+  // 提前返回：如果抽屉未打开或没有选中阶段，不渲染任何内容
+  if (!isApproveDrawerOpen || !selectedStage) return null;
 
   // 提取技术设计文档
   const technicalDesignContent = extractTechnicalDesign(selectedStage);
 
-  if (!isApproveDrawerOpen || !selectedStage) return null;
-
   const handleApproveClick = () => {
+    // 增加合法性检查
+    if (!selectedPipeline || selectedPipeline?.status !== 'paused') {
+      addToast({ type: 'warning', message: '当前流水线状态不可审批' });
+      return;
+    }
+    // 允许当前阶段匹配，或者允许在 CODE_REVIEW 时操作 CODING 节点
+    const isMatch = selectedStage?.name === selectedPipeline?.current_stage ||
+                      (selectedStage?.name === 'CODING' && selectedPipeline?.current_stage === 'CODE_REVIEW');
+
+    if (!isMatch) {
+      addToast({ type: 'warning', message: '当前阶段不是待审批阶段' });
+      return;
+    }
+
     if (!showConfirm) {
       setShowConfirm(true);   // 第一次：按钮文字变为"确认批准"
       return;
@@ -92,50 +136,68 @@ export function ApproveDrawer() {
         throw new Error('未选择流水线');
       }
 
-      const response = await apiPost(`/pipeline/${selectedPipeline.id}/approve`, {
+      // 1. 发送请求给后端
+      const response = await apiPost<any>(`/pipeline/${selectedPipeline.id}/approve`, {
         notes: feedback
       });
 
-      // 清除超时定时器
+      // --- 重点：以下部分是点击后的处理逻辑 ---
+
+      // 2. 清除超时定时器
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
         timeoutRef.current = null;
       }
 
-      // 检查是否是异步任务启动
-      if (response.data?.async) {
-        addToast({ type: 'info', message: '代码生成任务已在后台启动，请通过日志监控进度' });
+      // 3. 发送通知（Toast）
+      if (response.async || response.data?.async) {
+        addToast({ type: 'info', message: '任务已在后台启动' });
       } else {
-        addToast({ type: 'success', message: '已批准该阶段，进入下一阶段...' });
+        addToast({ type: 'success', message: '操作成功' });
       }
 
-      // 立即强制刷新 - 统一使用 string 类型的 id
-      await queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
-      await queryClient.invalidateQueries({ queryKey: ['pipelines'] });
-
+      // 5. 触发全局事件
       document.dispatchEvent(new CustomEvent('pipeline:approve', {
         detail: { stageId: selectedStage.id }
       }));
 
-      closeApproveDrawer();
-      setShowConfirm(false);
-      setFeedback('');
-      setSelectedFileIndex(0);
+      // 6.【关键】不要 await 刷新，让它在后台慢慢跑
+      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipelines'] });
+
+      // 7. 延迟关闭抽屉，让用户看到反馈
+      setTimeout(() => {
+        closeApproveDrawer();
+        setShowConfirm(false);
+        setFeedback('');
+        setSelectedFileIndex(0);
+        setSelectedTestFileIndex(0);
+      }, 300);
+
     } catch (error) {
-      // 清除超时定时器
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
       addToast({ type: 'error', message: `审批失败: ${error instanceof Error ? error.message : '请重试'}` });
       setShowConfirm(false);
     } finally {
       setIsSubmitting(false);
-      setShowTimeoutWarning(false);
     }
   };
 
   const handleReject = async () => {
+    // 增加合法性检查
+    if (!selectedPipeline || selectedPipeline?.status !== 'paused') {
+      addToast({ type: 'warning', message: '当前流水线状态不可审批' });
+      return;
+    }
+    // 允许当前阶段匹配，或者允许在 CODE_REVIEW 时操作 CODING 节点
+    const isMatch = selectedStage?.name === selectedPipeline?.current_stage ||
+                      (selectedStage?.name === 'CODING' && selectedPipeline?.current_stage === 'CODE_REVIEW');
+
+    if (!isMatch) {
+      addToast({ type: 'warning', message: '当前阶段不是待审批阶段' });
+      return;
+    }
+
     if (!feedback.trim()) {
       addToast({ type: 'warning', message: '请先输入拒绝理由' });
       return;
@@ -147,24 +209,31 @@ export function ApproveDrawer() {
         throw new Error('未选择流水线');
       }
 
+      // 1. 发送拒绝请求
       await apiPost(`/pipeline/${selectedPipeline.id}/reject`, {
         reason: feedback,
         suggested_changes: undefined
       });
 
-      // 同样立即刷新
-      await queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
-      await queryClient.invalidateQueries({ queryKey: ['pipelines'] });
+      // 2. 后台刷新
+      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
+      // 3. 发送事件和通知
       document.dispatchEvent(new CustomEvent('pipeline:reject', {
         detail: { stageId: selectedStage.id, feedback }
       }));
+      addToast({ type: 'warning', message: '已拒绝，流程回退中' });
 
-      addToast({ type: 'warning', message: '已拒绝该阶段，流程回退中...' });
-      closeApproveDrawer();
-      setShowConfirm(false);
-      setFeedback('');
-      setSelectedFileIndex(0);
+      // 4. 延迟关闭抽屉，让用户看到反馈
+      setTimeout(() => {
+        closeApproveDrawer();
+        setFeedback('');
+        setShowConfirm(false);
+        setSelectedFileIndex(0);
+        setSelectedTestFileIndex(0);
+      }, 300);
+
     } catch (error) {
       addToast({ type: 'error', message: `操作失败: ${error instanceof Error ? error.message : '请重试'}` });
     } finally {
@@ -176,6 +245,7 @@ export function ApproveDrawer() {
     setShowConfirm(false);   // 重置状态
     setFeedback('');
     setSelectedFileIndex(0);
+    setSelectedTestFileIndex(0);
     closeApproveDrawer();
   };
 
@@ -318,6 +388,89 @@ export function ApproveDrawer() {
             </div>
           )}
 
+          {/* 测试代码展示（如果是测试阶段） */}
+          {testStage && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium text-text-primary flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-status-warning" />
+                  测试代码
+                  {testCodeChanges.length > 0 && (
+                    <span className="text-xs text-text-tertiary font-normal">
+                      ({testCodeChanges.length} 个文件)
+                    </span>
+                  )}
+                </h4>
+                {testCodeChanges.length > 0 && (
+                  <button
+                    onClick={() => setShowDiff(!showDiff)}
+                    className="text-xs text-brand-primary hover:underline"
+                  >
+                    {showDiff ? '隐藏' : '显示'}
+                  </button>
+                )}
+              </div>
+
+              {/* 没有生成测试文件的提示 */}
+              {testCodeChanges.length === 0 && (
+                <div className="p-4 bg-bg-secondary rounded-xl border border-border-default">
+                  <div className="flex items-center gap-2 text-text-secondary">
+                    <svg className="w-5 h-5 text-status-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    <span className="text-sm">未生成测试文件</span>
+                  </div>
+                  <p className="text-xs text-text-tertiary mt-2">
+                    TestAgent 未能为此阶段生成单元测试代码。可能是由于代码结构不适合自动化测试，或 LLM 返回格式不正确。
+                  </p>
+                </div>
+              )}
+
+              {/* 测试文件选择 tab — 多于 1 个时显示 */}
+              {testCodeChanges.length > 1 && (
+                <div className="flex gap-1 overflow-x-auto pb-1">
+                  {testCodeChanges.map((change, i) => (
+                    <button
+                      key={change.fileName}
+                      onClick={() => setSelectedTestFileIndex(i)}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono whitespace-nowrap transition-colors
+                        ${i === selectedTestFileIndex
+                          ? 'bg-status-warning text-white'
+                          : 'bg-bg-tertiary text-text-secondary hover:text-text-primary'
+                        }`}
+                    >
+                      <span className="text-status-success font-bold">+</span>
+                      {change.fileName.split('/').pop()}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {testCodeChanges.length > 0 && showDiff && currentTestChange && (
+                <div className="space-y-1">
+                  {/* 文件路径 + 状态标签 */}
+                  <div className="flex items-center gap-2 px-3 py-1.5 bg-bg-secondary rounded-lg">
+                    <code className="text-xs text-text-secondary flex-1 truncate">
+                      {currentTestChange.fileName}
+                    </code>
+                    <span className="text-xs px-2 py-0.5 rounded font-medium bg-status-success/10 text-status-success">
+                      新建测试文件
+                    </span>
+                  </div>
+
+                  <DiffViewer
+                    oldCode={''}
+                    newCode={currentTestChange.newCode}
+                    oldFileName={'/dev/null'}
+                    newFileName={currentTestChange.fileName}
+                    language={getLanguageFromPath(currentTestChange.fileName)}
+                    splitView={false}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
           {/* 技术设计文档 */}
           <div>
             <h4 className="text-sm font-medium text-text-primary mb-3 flex items-center gap-2">
@@ -378,33 +531,60 @@ export function ApproveDrawer() {
             取消
           </button>
 
-          <button
-            onClick={handleReject}
-            disabled={isSubmitting}
-            className="inline-flex items-center gap-2 px-5 py-2.5 border border-status-error text-status-error rounded-lg text-sm font-medium hover:bg-status-error/10 transition-colors disabled:opacity-50"
-          >
-            <XCircle className="w-4 h-4" />
-            拒绝
-          </button>
-
-          {/* 批准按钮（带二次确认动效） */}
-          <button
-            onClick={handleApproveClick}
-            disabled={isSubmitting}
-            className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-all
-              ${showConfirm
-                ? 'bg-status-warning text-white'
-                : 'bg-brand-primary text-white hover:bg-brand-primary-hover'}
-              disabled:opacity-50`}
-          >
-            {isSubmitting ? (
-              <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
-            ) : showConfirm ? (
-              <><AlertCircle className="w-4 h-4" />确认批准？</>
-            ) : (
-              <><CheckCircle2 className="w-4 h-4" />批准</>
-            )}
-          </button>
+          {/* 可审批状态：显示审批按钮 */}
+          {selectedPipeline?.status === 'paused' &&
+          (selectedStage?.name === selectedPipeline?.current_stage ||
+           (selectedStage?.name === 'CODING' && selectedPipeline?.current_stage === 'CODE_REVIEW')) ? (
+            <>
+              <button
+                onClick={handleReject}
+                disabled={isSubmitting}
+                className="inline-flex items-center gap-2 px-5 py-2.5 border border-status-error text-status-error rounded-lg text-sm font-medium hover:bg-status-error/10 transition-colors disabled:opacity-50"
+              >
+                <XCircle className="w-4 h-4" />
+                拒绝
+              </button>
+              <button
+                onClick={handleApproveClick}
+                disabled={isSubmitting}
+                className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                  showConfirm
+                    ? 'bg-status-warning text-white'
+                    : 'bg-brand-primary text-white hover:bg-brand-primary-hover'
+                } disabled:opacity-50`}
+              >
+                {isSubmitting ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
+                ) : showConfirm ? (
+                  <><AlertCircle className="w-4 h-4" />确认批准？</>
+                ) : (
+                  <><CheckCircle2 className="w-4 h-4" />批准</>
+                )}
+              </button>
+            </>
+          ) : (
+            /* 不可操作的状态标签（历史阶段或非当前审批阶段） */
+            <>
+              {/* 状态优先级：running > success > failed/rejected > 其他 */}
+              {liveSelectedStage?.status === 'running' ? (
+                <span className="px-5 py-2.5 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium border border-blue-200">
+                  运行中
+                </span>
+              ) : liveSelectedStage?.status === 'success' ? (
+                <span className="px-5 py-2.5 bg-status-success/10 text-status-success rounded-lg text-sm font-medium border border-status-success/30">
+                  已通过
+                </span>
+              ) : liveSelectedStage?.status === 'failed' || (liveSelectedStage?.output_data as any)?.rejection_feedback ? (
+                <span className="px-5 py-2.5 bg-status-error/10 text-status-error rounded-lg text-sm font-medium border border-status-error/30">
+                  已拒绝
+                </span>
+              ) : (
+                <span className="px-5 py-2.5 bg-bg-tertiary text-text-tertiary rounded-lg text-sm font-medium border border-border-default">
+                  等待中
+                </span>
+              )}
+            </>
+          )}
         </div>
       </div>
     </>

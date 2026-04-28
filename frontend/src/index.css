@@ -464,3 +464,162 @@
   background-color: var(--color-brand-primary);
   border: 2px solid var(--color-bg-primary);
 }
+
+/* ============================================
+   Pipeline 节点执行中动画（重构版）
+   ============================================ */
+
+/* 1. 边框流光动画 - 优雅的呼吸效果 */
+.node-running-glow {
+  position: relative;
+  border-color: var(--color-brand-primary) !important;
+  box-shadow: 
+    0 0 0 1px var(--color-brand-primary),
+    0 0 20px color-mix(in srgb, var(--color-brand-primary) 30%, transparent),
+    0 0 40px color-mix(in srgb, var(--color-brand-primary) 15%, transparent) !important;
+  animation: node-glow-pulse 2s ease-in-out infinite;
+}
+
+@keyframes node-glow-pulse {
+  0%, 100% {
+    box-shadow: 
+      0 0 0 1px var(--color-brand-primary),
+      0 0 20px color-mix(in srgb, var(--color-brand-primary) 30%, transparent),
+      0 0 40px color-mix(in srgb, var(--color-brand-primary) 15%, transparent);
+  }
+  50% {
+    box-shadow: 
+      0 0 0 2px var(--color-brand-primary),
+      0 0 30px color-mix(in srgb, var(--color-brand-primary) 50%, transparent),
+      0 0 60px color-mix(in srgb, var(--color-brand-primary) 25%, transparent);
+  }
+}
+
+/* 2. 边框流动光效 - 沿边框旋转的光点 */
+.node-running-border-flow {
+  position: relative;
+  overflow: hidden;
+}
+
+.node-running-border-flow::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    var(--color-brand-primary) 60deg,
+    transparent 120deg,
+    transparent 240deg,
+    var(--color-brand-primary) 300deg,
+    transparent 360deg
+  );
+  -webkit-mask: 
+    linear-gradient(#fff 0 0) content-box, 
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: border-flow-rotate 2s linear infinite;
+  opacity: 0.8;
+}
+
+@keyframes border-flow-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 3. 状态指示器脉冲 - 右下角小圆点 */
+.node-status-indicator {
+  position: absolute;
+  bottom: -4px;
+  right: -4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: var(--color-brand-primary);
+  border: 2px solid var(--color-bg-primary);
+}
+
+.node-status-indicator.running {
+  animation: status-blink 1.5s ease-in-out infinite;
+}
+
+.node-status-indicator.pending {
+  background-color: var(--color-text-tertiary);
+}
+
+.node-status-indicator.completed {
+  background-color: var(--color-status-success);
+}
+
+.node-status-indicator.failed {
+  background-color: var(--color-status-error);
+}
+
+@keyframes status-blink {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.85);
+  }
+}
+
+/* 4. 图标微动效 - 执行中时的微妙波动 */
+.node-icon-running {
+  animation: icon-subtle-bounce 1.5s ease-in-out infinite;
+}
+
+@keyframes icon-subtle-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+/* 5. 进度条动画 - 底部流动条 */
+.node-progress-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background-color: var(--color-brand-primary-light);
+  border-radius: 0 0 var(--radius-feishu-lg) var(--radius-feishu-lg);
+  overflow: hidden;
+}
+
+.node-progress-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-brand-primary),
+    transparent
+  );
+  animation: progress-flow 1.5s ease-in-out infinite;
+}
+
+@keyframes progress-flow {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}

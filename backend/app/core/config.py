@@ -8,6 +8,44 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 
 
+def get_project_root() -> Path:
+    """
+    获取项目根目录
+
+    从当前文件位置推算项目根目录 (backend/app/core/config.py -> 项目根目录)
+
+    Returns:
+        Path: 项目根目录路径
+    """
+    return Path(__file__).parent.parent.parent.parent
+
+
+def get_workspace_path(subdir: str = "frontend") -> Path:
+    """
+    获取工作目录路径
+
+    Args:
+        subdir: 子目录名，默认为 "frontend"
+
+    Returns:
+        Path: 工作目录路径
+    """
+    return get_project_root() / subdir
+
+
+def process_file_path(file_path: str) -> str:
+    """
+    处理文件路径 - 统一转换为正斜杠格式
+
+    Args:
+        file_path: 原始文件路径
+
+    Returns:
+        str: 处理后的路径
+    """
+    return file_path.replace('\\', '/')
+
+
 class Settings(BaseSettings):
     """应用配置类"""
     

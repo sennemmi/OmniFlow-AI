@@ -90,6 +90,21 @@ class ArchitectAgent(LangGraphAgent[ArchitectOutput]):
 
 请根据以上元素上下文进行精准修复。
 """
+            
+            # 【增强】如果存在 code_context，添加到 prompt
+            code_context = element_context.get("code_context")
+            if code_context:
+                element_context_str += f"""
+【源码上下文】
+文件: {code_context.get('file', 'N/A')}
+行号: {code_context.get('line', 'N/A')}
+周围代码（行 {code_context.get('context_start_line', 'N/A')}-{code_context.get('context_end_line', 'N/A')}）:
+```
+{code_context.get('surrounding_code', 'N/A')}
+```
+
+请根据以上源码上下文进行精准修复，确保修改与现有代码风格一致。
+"""
         
         return f"""【用户需求】
 {requirement}

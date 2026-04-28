@@ -4,17 +4,18 @@ Pipeline API 路由
 """
 
 import asyncio
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, Path, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_session, async_session_factory
 from app.core.response import ResponseModel, success_response, error_response
 from app.core.sse_log_buffer import get_or_create_buffer, remove_buffer
-from app.core.logging import error
+from app.core.logging import error, info
 from app.service.pipeline import PipelineService
 
 router = APIRouter()
@@ -26,6 +27,27 @@ class SourceContext(BaseModel):
     line: int = Field(..., description="行号", ge=1)
     column: int = Field(default=0, description="列号", ge=0)
     relativePath: Optional[str] = Field(default=None, description="相对于项目根目录的路径")
+
+
+class LLMContext(BaseModel):
+    """
+    传给 LLM 的核心上下文结构
+    
+    包含完整的源码定位信息和元素上下文，
+    使 LLM 能够精确理解需要修改的代码位置。
+    """
+    file: str = Field(..., description="源文件路径")
+    line: int = Field(..., description="目标行号")
+    column: int = Field(default=0, description="目标列号")
+    component: Optional[str] = Field(default=None, description="React 组件名")
+    selected_html: str = Field(..., description="选中的 HTML 片段")
+    surrounding_code: str = Field(default="", description="周围代码上下文")
+    user_instruction: str = Field(..., description="用户修改指令")
+    element_type: str = Field(..., description="元素类型（如 div, button）")
+    element_id: Optional[str] = Field(default=None, description="元素 ID")
+    element_class: Optional[str] = Field(default=None, description="元素 class")
+    xpath: str = Field(default="", description="元素 XPath")
+    selector: str = Field(default="", description="CSS 选择器")
 
 
 class PipelineCreateRequest(BaseModel):
@@ -44,6 +66,17 @@ class PipelineCreateRequest(BaseModel):
         default=None,
         description="精确的源码位置上下文（用于绕过 LLM 猜测，直接定位代码）",
         example={"file": "src/components/Button.tsx", "line": 45, "column": 4}
+    )
+    llmContext: Optional[LLMContext] = Field(
+        default=None,
+        description="LLM 核心上下文结构（包含完整的源码定位和元素信息）",
+        example={
+            "file": "src/components/Hero.tsx",
+            "line": 42,
+            "component": "HeroSection",
+            "selected_html": "<h1 class='title'>Hello World</h1>",
+            "user_instruction": "把标题改成蓝色"
+        }
     )
 
 
@@ -64,6 +97,13 @@ class PipelineStageInfo(BaseModel):
     output_data: Optional[dict] = Field(None, description="阶段输出数据")
     created_at: Optional[str] = Field(None, description="创建时间")
     completed_at: Optional[str] = Field(None, description="完成时间")
+
+    # 可观测性指标字段
+    input_tokens: int = Field(default=0, description="输入 Token 数")
+    output_tokens: int = Field(default=0, description="输出 Token 数")
+    duration_ms: int = Field(default=0, description="执行耗时（毫秒）")
+    retry_count: int = Field(default=0, description="重试次数")
+    reasoning: Optional[str] = Field(default=None, description="AI 推理过程")
 
 
 class PipelineDeliveryInfo(BaseModel):
@@ -151,6 +191,24 @@ class PipelineRejectResponse(BaseModel):
     retry_count: int = Field(0, description="当前阶段重试次数")
 
 
+class PipelineTerminateRequest(BaseModel):
+    """Pipeline 终止请求模型"""
+    reason: Optional[str] = Field(
+        default="用户手动终止",
+        description="终止原因",
+        example="不再需要此功能"
+    )
+
+
+class PipelineTerminateResponse(BaseModel):
+    """Pipeline 终止响应数据"""
+    pipeline_id: int = Field(..., description="Pipeline ID")
+    action: str = Field(..., description="操作类型: terminated")
+    status: str = Field(..., description="当前状态: failed")
+    message: str = Field(..., description="终止消息")
+    terminated_at: Optional[str] = Field(None, description="终止时间")
+
+
 async def run_architect_task(pipeline_id: int, requirement: str, element_context: Optional[Dict[str, Any]]) -> None:
     """后台任务：使用独立 session，确保事务完整性"""
     session = async_session_factory()
@@ -195,7 +253,7 @@ async def run_architect_task(pipeline_id: int, requirement: str, element_context
 
 
 async def run_coding_task(pipeline_id: int) -> None:
-    """后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，使用独立 session"""
+    """后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，完成后等待 CODE_REVIEW 审批"""
     session = async_session_factory()
     try:
         from app.core.logging import op_logger
@@ -213,7 +271,7 @@ async def run_coding_task(pipeline_id: int) -> None:
             await session.commit()
             await push_log(pipeline_id, "info", "代码生成完成，开始单元测试阶段...", stage="UNIT_TESTING")
 
-            # 2. 【新增】执行 UNIT_TESTING 阶段
+            # 2. 执行 UNIT_TESTING 阶段
             testing_result = await PipelineService._trigger_testing_phase(
                 pipeline_id=pipeline_id,
                 session=session
@@ -224,34 +282,34 @@ async def run_coding_task(pipeline_id: int) -> None:
                 test_generated = testing_result.get("test_generated", False)
                 test_run_success = testing_result.get("test_run_success", False)
 
+                # 3. 推送状态日志，然后等待 CODE_REVIEW 审批（不做自动推进）
                 if test_generated and test_run_success:
                     await push_log(
                         pipeline_id,
                         "success",
-                        f"单元测试完成（生成测试并全部通过），等待人工审查",
+                        "单元测试通过，等待代码审查",
                         stage="CODE_REVIEW"
                     )
                 elif test_generated:
                     await push_log(
                         pipeline_id,
                         "warning",
-                        f"单元测试完成（生成测试但部分未通过），等待人工审查",
+                        "单元测试部分未通过，等待代码审查",
                         stage="CODE_REVIEW"
                     )
                 else:
                     await push_log(
                         pipeline_id,
                         "info",
-                        f"单元测试完成（未生成测试），等待人工审查",
+                        "代码生成完成，等待代码审查",
                         stage="CODE_REVIEW"
                     )
             else:
-                # UNIT_TESTING 失败，但代码是成功的
                 await session.commit()
                 await push_log(
                     pipeline_id,
                     "warning",
-                    f"单元测试阶段异常，但代码生成成功，等待人工审查",
+                    "单元测试阶段异常，等待代码审查",
                     stage="CODE_REVIEW"
                 )
         else:
@@ -469,7 +527,13 @@ async def get_pipeline_status(
                     input_data=input_data,
                     output_data=output_data,
                     created_at=stage.created_at.isoformat() if stage.created_at else None,
-                    completed_at=stage.completed_at.isoformat() if stage.completed_at else None
+                    completed_at=stage.completed_at.isoformat() if stage.completed_at else None,
+                    # 填充可观测性指标字段
+                    input_tokens=stage.input_tokens or 0,
+                    output_tokens=stage.output_tokens or 0,
+                    duration_ms=stage.duration_ms or 0,
+                    retry_count=stage.retry_count or 0,
+                    reasoning=stage.reasoning
                 )
                 stages_data.append(stage_data.model_dump())
         
@@ -703,6 +767,67 @@ async def reject_pipeline(
         error("驳回 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to reject pipeline: {str(e)}",
+            request_id=request_id
+        )
+
+
+@router.post(
+    "/pipeline/{pipeline_id}/terminate",
+    response_model=ResponseModel,
+    summary="终止 Pipeline",
+    description="""
+    手动终止运行中的 Pipeline。
+    
+    终止后：
+    - Pipeline 状态变为 failed
+    - 当前阶段标记为失败
+    - 记录终止原因
+    - 清理相关资源
+    
+    只能终止状态为 running 的 Pipeline。
+    """,
+    response_description="终止结果"
+)
+async def terminate_pipeline(
+    request: Request,
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
+    data: PipelineTerminateRequest = None,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    终止 Pipeline（用户手动终止）
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        result = await PipelineService.terminate_pipeline(
+            pipeline_id=pipeline_id,
+            reason=data.reason if data else "用户手动终止",
+            session=session
+        )
+
+        if not result["success"]:
+            return error_response(
+                error=result["error"],
+                request_id=request_id
+            )
+
+        response_data = PipelineTerminateResponse(
+            pipeline_id=pipeline_id,
+            action="terminated",
+            status="failed",
+            message=result["data"]["message"],
+            terminated_at=result["data"].get("terminated_at")
+        )
+
+        return success_response(
+            data=response_data.model_dump(),
+            request_id=request_id
+        )
+    except Exception as e:
+        error("终止 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(
+            error=f"Failed to terminate pipeline: {str(e)}",
             request_id=request_id
         )
 

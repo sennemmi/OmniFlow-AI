@@ -19,7 +19,7 @@ from app.agents.coder import coder_agent
 from app.agents.tester import test_agent
 from app.service.test_runner import TestRunnerService
 from app.service.code_executor import CodeExecutorService
-from app.core.logging import emit_log
+from app.core.event_bus import emit_log
 from app.core.sse_log_buffer import push_log
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ class MultiAgentCoordinator:
             pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
-            Dict: 包含 code_output 或 code_error
+            Dict: 包含 code_output 或 code_error，以及指标字段
         """
         logger.info(f"MultiAgentCoordinator: 开始执行 CoderAgent", extra={
             "pipeline_id": pipeline_id,
@@ -95,20 +95,32 @@ class MultiAgentCoordinator:
 
             if code_result["success"]:
                 logger.info(f"MultiAgentCoordinator: CoderAgent 执行成功", extra={
-                    "pipeline_id": pipeline_id
+                    "pipeline_id": pipeline_id,
+                    "input_tokens": code_result.get("input_tokens", 0),
+                    "output_tokens": code_result.get("output_tokens", 0),
+                    "duration_ms": code_result.get("duration_ms", 0)
                 })
                 return {
                     "code_output": code_result["output"],
                     "code_error": None,
+                    "input_tokens": code_result.get("input_tokens", 0),
+                    "output_tokens": code_result.get("output_tokens", 0),
+                    "duration_ms": code_result.get("duration_ms", 0),
                 }
             else:
                 logger.error(f"MultiAgentCoordinator: CoderAgent 执行失败", extra={
                     "pipeline_id": pipeline_id,
-                    "error": code_result["error"]
+                    "error": code_result["error"],
+                    "input_tokens": code_result.get("input_tokens", 0),
+                    "output_tokens": code_result.get("output_tokens", 0),
+                    "duration_ms": code_result.get("duration_ms", 0)
                 })
                 return {
                     "code_output": None,
                     "code_error": code_result["error"],
+                    "input_tokens": code_result.get("input_tokens", 0),
+                    "output_tokens": code_result.get("output_tokens", 0),
+                    "duration_ms": code_result.get("duration_ms", 0),
                 }
         except Exception as e:
             logger.error(f"MultiAgentCoordinator: CoderAgent 执行异常", extra={
@@ -118,6 +130,9 @@ class MultiAgentCoordinator:
             return {
                 "code_output": None,
                 "code_error": f"CoderAgent execution failed: {str(e)}",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "duration_ms": 0,
             }
     
     async def _execute_test_agent(
@@ -137,7 +152,7 @@ class MultiAgentCoordinator:
             pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
-            Dict: 包含 test_output 或 test_error
+            Dict: 包含 test_output 或 test_error，以及指标字段
         """
         # 如果代码生成失败，跳过测试生成
         if not code_output:
@@ -147,6 +162,9 @@ class MultiAgentCoordinator:
             return {
                 "test_output": None,
                 "test_error": None,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "duration_ms": 0,
             }
 
         logger.info(f"MultiAgentCoordinator: 开始执行 TestAgent", extra={
@@ -158,20 +176,32 @@ class MultiAgentCoordinator:
 
             if test_result["success"]:
                 logger.info(f"MultiAgentCoordinator: TestAgent 执行成功", extra={
-                    "pipeline_id": pipeline_id
+                    "pipeline_id": pipeline_id,
+                    "input_tokens": test_result.get("input_tokens", 0),
+                    "output_tokens": test_result.get("output_tokens", 0),
+                    "duration_ms": test_result.get("duration_ms", 0)
                 })
                 return {
                     "test_output": test_result["output"],
                     "test_error": None,
+                    "input_tokens": test_result.get("input_tokens", 0),
+                    "output_tokens": test_result.get("output_tokens", 0),
+                    "duration_ms": test_result.get("duration_ms", 0),
                 }
             else:
                 logger.warning(f"MultiAgentCoordinator: TestAgent 执行失败", extra={
                     "pipeline_id": pipeline_id,
-                    "error": test_result["error"]
+                    "error": test_result["error"],
+                    "input_tokens": test_result.get("input_tokens", 0),
+                    "output_tokens": test_result.get("output_tokens", 0),
+                    "duration_ms": test_result.get("duration_ms", 0)
                 })
                 return {
                     "test_output": None,
                     "test_error": test_result["error"],
+                    "input_tokens": test_result.get("input_tokens", 0),
+                    "output_tokens": test_result.get("output_tokens", 0),
+                    "duration_ms": test_result.get("duration_ms", 0),
                 }
         except Exception:
             logger.error(
@@ -182,6 +212,9 @@ class MultiAgentCoordinator:
             return {
                 "test_output": None,
                 "test_error": "TestAgent execution failed (查看后端日志获取详情)",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "duration_ms": 0,
             }
     
     def _merge_results(
@@ -506,6 +539,7 @@ class MultiAgentCoordinator:
         1. 先执行 CoderAgent 生成代码
         2. 再执行 TestAgent 生成测试（依赖 CoderAgent 输出）
         3. 合并结果
+        4. 汇总指标（input_tokens, output_tokens, duration_ms）
 
         只要有代码输出，就认为执行成功（部分成功）
         测试生成失败不会导致整体失败
@@ -516,7 +550,7 @@ class MultiAgentCoordinator:
             pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
-            Dict: 包含合并后的结果或错误信息
+            Dict: 包含合并后的结果或错误信息，以及指标字段
         """
         await emit_log(
             pipeline_id, "info",
@@ -545,6 +579,14 @@ class MultiAgentCoordinator:
             test_result.get("test_error")
         )
 
+        # ★ 汇总指标
+        input_tokens = (code_result.get("input_tokens", 0) or 0) + \
+                       (test_result.get("input_tokens", 0) or 0)
+        output_tokens = (code_result.get("output_tokens", 0) or 0) + \
+                        (test_result.get("output_tokens", 0) or 0)
+        duration_ms = (code_result.get("duration_ms", 0) or 0) + \
+                      (test_result.get("duration_ms", 0) or 0)
+
         final_output = merge_result.get("final_output")
         # 只有当完全没有生成文件，或者存在 code_error 时才判定为失败
         is_failed = code_result.get("code_error") is not None or not final_output or not final_output.get("files")
@@ -558,21 +600,30 @@ class MultiAgentCoordinator:
             return {
                 "success": False,
                 "error": merge_result.get("error") or "No output generated",
-                "output": final_output
+                "output": final_output,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "duration_ms": duration_ms
             }
 
         await emit_log(
             pipeline_id, "info",
             f"✅ 多 Agent 执行成功，生成 {len(final_output.get('files', []))} 个文件",
             stage="CODING",
-            files_count=len(final_output.get("files", []))
+            files_count=len(final_output.get("files", [])),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_ms=duration_ms
         )
 
         # 成功时也返回 error，以便调用者看到测试生成的警告
         return {
             "success": True,
             "error": merge_result.get("error"),
-            "output": final_output
+            "output": final_output,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "duration_ms": duration_ms
         }
 
     async def execute_with_auto_fix(
@@ -601,11 +652,18 @@ class MultiAgentCoordinator:
             workspace_path: 临时工作区路径
 
         Returns:
-            Dict: 执行结果
+            Dict: 执行结果，包含累计的指标字段
         """
+        import time
+
         current_error_context = None
         attempt = 0
         last_code_output = None  # 新增：保存最后一次生成的代码
+
+        # ★ 累计指标
+        total_input_tokens = 0
+        total_output_tokens = 0
+        start_time = time.time()
 
         while attempt <= self.MAX_FIX_RETRIES:
             if attempt > 0:
@@ -624,6 +682,10 @@ class MultiAgentCoordinator:
                 error_context=current_error_context
             )
 
+            # ★ 累计本次调用的指标
+            total_input_tokens += code_result.get("input_tokens", 0) or 0
+            total_output_tokens += code_result.get("output_tokens", 0) or 0
+
             # 新增：只要生成了代码，就保存下来
             if code_result.get("success") and code_result.get("output"):
                 last_code_output = code_result["output"]
@@ -632,13 +694,18 @@ class MultiAgentCoordinator:
                 logger.error(f"MultiAgentCoordinator: CoderAgent 执行失败", extra={
                     "pipeline_id": pipeline_id,
                     "attempt": attempt,
-                    "error": code_result["error"]
+                    "error": code_result["error"],
+                    "total_input_tokens": total_input_tokens,
+                    "total_output_tokens": total_output_tokens
                 })
                 return {
                     "success": False,
                     "error": f"Code generation failed: {code_result['error']}",
                     "output": None,
-                    "attempt": attempt
+                    "attempt": attempt,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "duration_ms": int((time.time() - start_time) * 1000)
                 }
 
             # 2. 写入文件到工作区（先做 import 修正）
@@ -703,6 +770,10 @@ class MultiAgentCoordinator:
                     pipeline_id
                 )
 
+                # ★ 累计 TestAgent 的指标
+                total_input_tokens += test_result.get("input_tokens", 0) or 0
+                total_output_tokens += test_result.get("output_tokens", 0) or 0
+
                 # 合并代码和测试
                 merge_result = self._merge_results(
                     code_result["output"],
@@ -716,7 +787,10 @@ class MultiAgentCoordinator:
                     "success": True,
                     "output": merge_result["final_output"],
                     "test_logs": test_results["logs"],
-                    "attempt": attempt
+                    "attempt": attempt,
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "duration_ms": int((time.time() - start_time) * 1000)
                 }
 
             # 4. 如果失败，构建详细的错误上下文并重试
@@ -767,7 +841,9 @@ class MultiAgentCoordinator:
         # 达到最大重试次数
         logger.error(f"MultiAgentCoordinator: 自动修复达到最大次数", extra={
             "pipeline_id": pipeline_id,
-            "max_retries": self.MAX_FIX_RETRIES
+            "max_retries": self.MAX_FIX_RETRIES,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens
         })
 
         return {
@@ -775,7 +851,10 @@ class MultiAgentCoordinator:
             "error": f"自动修复达到最大次数({self.MAX_FIX_RETRIES})，仍有测试未通过。",
             "last_error_logs": current_error_context,
             "attempt": attempt,
-            "output": last_code_output  # 新增：把最后一次生成的代码传出去
+            "output": last_code_output,  # 新增：把最后一次生成的代码传出去
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "duration_ms": int((time.time() - start_time) * 1000)
         }
 
 

@@ -35,15 +35,50 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
 
 const statusConfig: Record<
   PipelineStatus,
-  { icon: React.ComponentType<{ className?: string }>; className: string; label: string }
+  { icon: React.ComponentType<{ className?: string }>; className: string; label: string; indicatorClass: string }
 > = {
-  pending: { icon: Clock, className: 'text-text-tertiary bg-bg-tertiary', label: '待执行' },
-  running: { icon: Loader2, className: 'text-brand-primary bg-brand-primary-light animate-spin', label: '执行中' },
-  completed: { icon: CheckCircle2, className: 'text-status-success bg-status-success/10', label: '已完成' },
-  failed: { icon: AlertCircle, className: 'text-status-error bg-status-error/10', label: '失败' },
-  approved: { icon: CheckCircle2, className: 'text-status-success bg-status-success/10', label: '已批准' },
-  rejected: { icon: AlertCircle, className: 'text-status-error bg-status-error/10', label: '已拒绝' },
-  paused: { icon: Hand, className: 'text-status-warning bg-status-warning/10', label: '待审批' },
+  pending: { 
+    icon: Clock, 
+    className: 'text-text-tertiary bg-bg-tertiary', 
+    label: '待执行',
+    indicatorClass: 'pending'
+  },
+  running: { 
+    icon: Loader2, 
+    className: 'text-brand-primary bg-brand-primary-light', 
+    label: '执行中',
+    indicatorClass: 'running'
+  },
+  completed: { 
+    icon: CheckCircle2, 
+    className: 'text-status-success bg-status-success/10', 
+    label: '已完成',
+    indicatorClass: 'completed'
+  },
+  failed: { 
+    icon: AlertCircle, 
+    className: 'text-status-error bg-status-error/10', 
+    label: '失败',
+    indicatorClass: 'failed'
+  },
+  approved: { 
+    icon: CheckCircle2, 
+    className: 'text-status-success bg-status-success/10', 
+    label: '已批准',
+    indicatorClass: 'completed'
+  },
+  rejected: { 
+    icon: AlertCircle, 
+    className: 'text-status-error bg-status-error/10', 
+    label: '已拒绝',
+    indicatorClass: 'failed'
+  },
+  paused: { 
+    icon: Hand, 
+    className: 'text-status-warning bg-status-warning/10', 
+    label: '待审批',
+    indicatorClass: 'pending'
+  },
 };
 
 function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) {
@@ -52,6 +87,7 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
   const IconComponent = iconMap[icon] || iconMap.default;
   const statusConfig_item = statusConfig[status] || statusConfig.pending;
   const StatusIcon = statusConfig_item.icon;
+  const isRunning = status === 'running';
 
   // 根据状态确定节点样式
   const getNodeStyles = () => {
@@ -59,9 +95,9 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
       // 等待审批：橙色高亮边框
       return 'border-status-warning ring-2 ring-status-warning/30';
     }
-    if (status === 'running') {
-      // 执行中：蓝色呼吸灯效果
-      return 'border-brand-primary ring-2 ring-brand-primary/30';
+    if (isRunning) {
+      // 执行中：发光效果
+      return 'node-running-glow';
     }
     if (status === 'pending') {
       // 未执行：降低透明度
@@ -74,7 +110,7 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
     <div
       className={`relative min-w-[160px] max-w-[200px] p-3 rounded-xl border bg-bg-primary shadow-feishu-card transition-all duration-250 cursor-pointer ${getNodeStyles()} ${
         selected ? 'ring-2 ring-brand-primary/20 shadow-feishu' : ''
-      } ${status === 'running' ? 'animate-pulse' : ''}`}
+      }`}
       onClick={onClick}
     >
       {/* 输入连接点 */}
@@ -89,7 +125,7 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
         {/* 图标 */}
         <div className={`w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0 ${
           isPendingApproval ? 'bg-status-warning/10' : 'bg-brand-primary-light'
-        }`}>
+        } ${isRunning ? 'node-icon-running' : ''}`}>
           <IconComponent className={`w-4 h-4 ${isPendingApproval ? 'text-status-warning' : 'text-brand-primary'}`} />
         </div>
 
@@ -107,7 +143,7 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
         <span
           className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-xs font-medium ${statusConfig_item.className}`}
         >
-          <StatusIcon className="w-3 h-3" />
+          <StatusIcon className={`w-3 h-3 ${isRunning ? 'animate-spin' : ''}`} />
           {statusConfig_item.label}
         </span>
 
@@ -119,6 +155,12 @@ function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) 
           </span>
         )}
       </div>
+
+      {/* 状态指示器 - 右下角小圆点 */}
+      <div className={`node-status-indicator ${statusConfig_item.indicatorClass}`} />
+
+      {/* 执行中进度条 */}
+      {isRunning && <div className="node-progress-bar" />}
 
       {/* 输出连接点 */}
       <Handle

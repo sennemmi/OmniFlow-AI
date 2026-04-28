@@ -9,7 +9,6 @@ import {
   Palette,
   Save,
   CheckCircle2,
-  AlertCircle,
   Mail,
   Lock,
   Eye,

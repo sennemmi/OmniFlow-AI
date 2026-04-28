@@ -112,11 +112,11 @@ function TypewriterText({ text, speed = 30 }: { text: string; speed?: number }) 
 export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRunning = true }: ThoughtLogProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isTyping, setIsTyping] = useState(false);
-  const [hasPaused, setHasPaused] = useState(false);
   const [isRunning, setIsRunning] = useState(initialIsRunning);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const scrollRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const hasPausedRef = useRef(false);
 
   // SSE 连接
   useEffect(() => {
@@ -188,12 +188,12 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
 
   // 当状态变为 paused 时，添加暂停提示
   useEffect(() => {
-    if (status === 'paused' && !hasPaused) {
-      setHasPaused(true);
+    if (status === 'paused' && !hasPausedRef.current) {
+      hasPausedRef.current = true;
       setLogs((currentLogs) => [
         ...currentLogs,
         {
-          id: 'paused-' + Date.now(),
+          id: 'paused-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9),
           timestamp: new Date(),
           type: 'paused',
           message: '【系统提示】分析已完成',
@@ -201,7 +201,7 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         },
       ]);
     }
-  }, [status, hasPaused]);
+  }, [status]);
 
   // 自动滚动到底部
   useEffect(() => {
@@ -240,9 +240,10 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
   };
 
   return (
-    <div className="h-full flex flex-col bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
-      {/* 终端头部 - 浅色主题 */}
-      <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200">
+    // 关键修改点：将 h-full 改为固定高度，并确保 flex-col 布局
+    <div className="h-[600px] flex flex-col bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+      {/* 终端头部 - 浅色主题，添加 flex-shrink-0 防止被压缩 */}
+      <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200 flex-shrink-0">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center">
             <Terminal className="w-4 h-4 text-blue-600" />
@@ -259,10 +260,11 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         </div>
       </div>
 
-      {/* 日志内容区 - 浅色背景 */}
+      {/* 日志内容区 - 核心滚动区域 */}
+      {/* flex-1 会占据剩余所有空间，overflow-y-auto 负责滚动，min-h-0 确保正确触发滚动 */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto p-3 font-mono text-sm space-y-2 scrollbar-hide bg-slate-50/50"
+        className="flex-1 overflow-y-auto p-3 font-mono text-sm space-y-2 scrollbar-hide bg-slate-50/50 min-h-0"
       >
         {logs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-slate-400">
@@ -322,8 +324,8 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         )}
       </div>
 
-      {/* 底部状态栏 - 浅色 */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-white border-t border-slate-200 text-xs">
+      {/* 底部状态栏 - 浅色，添加 flex-shrink-0 防止被压缩 */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-white border-t border-slate-200 text-xs flex-shrink-0">
         <div className="flex items-center gap-4">
           <span className="text-slate-500">
             日志: <span className="text-slate-900 font-medium">{logs.length}</span>

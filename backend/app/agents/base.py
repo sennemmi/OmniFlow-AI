@@ -7,6 +7,7 @@ Agent 基类
 - 支持 ModelScope (魔搭) 和 OpenAI 运行时切换
 - 保持 Pydantic 解析逻辑不变
 - 自动捕获 Token 和耗时指标
+- 使用策略模式注入 LLM Provider
 """
 
 import json
@@ -15,26 +16,22 @@ import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, TypeVar, Generic, TypedDict
 
-import litellm
 from pydantic import BaseModel, ValidationError
 from langgraph.graph import StateGraph, END
 
 from app.core.config import settings
 from app.core.logging import agent_metrics_context, MetricsCollector, error
 from app.core.sse_log_buffer import push_log
+from app.agents.llm_providers import (
+    LLMProvider, LLMCallError, get_llm_provider
+)
+import logging
 
-
-# 禁用 litellm 的详细日志
-litellm.set_verbose = False
+logger = logging.getLogger(__name__)
 
 
 class AgentError(Exception):
     """Agent 错误"""
-    pass
-
-
-class LLMCallError(AgentError):
-    """LLM 调用错误"""
     pass
 
 
@@ -46,45 +43,44 @@ class JSONParseError(AgentError):
 T = TypeVar('T', bound=BaseModel)
 
 
-class BaseAgentState(TypedDict):
-    """LangGraph 状态基类"""
-    output: Optional[Dict[str, Any]]
-    error: Optional[str]
-    retry_count: int
+# 使用 Dict 而不是 TypedDict，以支持任意业务字段
+BaseAgentState = Dict[str, Any]
 
 
 class LangGraphAgent(ABC, Generic[T]):
     """
     基于 LangGraph 的 Agent 基类
-    
+
     统一 LLM 调用逻辑，支持：
-    - ModelScope (魔搭) 和 OpenAI 运行时切换
+    - ModelScope (魔搭) 和 OpenAI 运行时切换（通过 Provider 策略）
     - 自动 Token 和耗时统计
     - JSON 输出解析和校验
     - 重试机制
     - LangGraph 状态机
-    
+
     子类只需实现：
     - system_prompt: 系统 Prompt
     - build_user_prompt(): 构建用户 Prompt
     - parse_output(): 解析 LLM 输出
     - validate_output(): 校验输出为 Pydantic 模型
-    
+
     八荣八耻：
     - 严禁在 agents/ 之外的地方编写模型调用逻辑
     """
-    
+
     MAX_RETRIES: int = 3
-    
-    def __init__(self, agent_name: str):
+
+    def __init__(self, agent_name: str, llm_provider: Optional[LLMProvider] = None):
         """
         初始化 Agent
-        
+
         Args:
             agent_name: Agent 名称（用于日志和指标）
+            llm_provider: LLM Provider 实例，None 则使用默认 Provider
         """
         self.agent_name = agent_name
         self.metrics_collector = MetricsCollector()
+        self._llm_provider = llm_provider or get_llm_provider()
         self.graph = self._build_graph()
     
     @property
@@ -176,28 +172,32 @@ class LangGraphAgent(ABC, Generic[T]):
             state: 当前状态
             
         Returns:
-            BaseAgentState: 更新后的状态
+            BaseAgentState: 更新后的状态（包含 Token 信息）
         """
         try:
             # 构建用户提示
             user_prompt = self.build_user_prompt(state)
             
-            # 调用 LLM
+            # 调用 LLM（现在返回字典包含 Token 信息）
             response = await self._call_llm(self.system_prompt, user_prompt)
             
             # 尝试解析输出
-            parsed_output = self.parse_output(response)
+            parsed_output = self.parse_output(response["content"])
             
             return {
                 **state,
                 "output": parsed_output,
-                "error": None
+                "error": None,
+                "input_tokens": response.get("input_tokens", 0),
+                "output_tokens": response.get("output_tokens", 0)
             }
         except Exception as e:
             return {
                 **state,
                 "output": None,
-                "error": str(e)
+                "error": str(e),
+                "input_tokens": 0,
+                "output_tokens": 0
             }
     
     def _validate_node(self, state: BaseAgentState) -> BaseAgentState:
@@ -271,12 +271,11 @@ class LangGraphAgent(ABC, Generic[T]):
         user_prompt: str,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         统一 LLM 调用方法（异步）
 
-        根据配置自动选择 ModelScope 或 OpenAI
-        使用 litellm.acompletion 避免阻塞事件循环
+        使用注入的 LLM Provider 进行调用
 
         Args:
             system_prompt: 系统提示
@@ -285,7 +284,7 @@ class LangGraphAgent(ABC, Generic[T]):
             max_tokens: 最大 Token 数
 
         Returns:
-            str: LLM 响应内容
+            Dict: {content, input_tokens, output_tokens}
 
         Raises:
             LLMCallError: 调用失败
@@ -293,48 +292,17 @@ class LangGraphAgent(ABC, Generic[T]):
         try:
             # 检查 API Key
             if not settings.llm_api_key:
-                provider = "ModelScope" if settings.USE_MODELSCOPE else "OpenAI"
-                raise LLMCallError(f"{provider} API Key 未配置")
+                raise LLMCallError(
+                    f"{self._llm_provider.provider_name} API Key 未配置"
+                )
 
-            if settings.USE_MODELSCOPE:
-                # ModelScope 使用 OpenAI 兼容接口（异步）
-                from openai import AsyncOpenAI
-                
-                client = AsyncOpenAI(
-                    base_url=settings.llm_api_base,
-                    api_key=settings.llm_api_key
-                )
-                
-                response = await client.chat.completions.create(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            else:
-                # OpenAI 使用 LiteLLM 异步接口
-                response = await litellm.acompletion(
-                    model=settings.llm_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                
-                if response and response.choices:
-                    return response.choices[0].message.content
-            
-            raise LLMCallError("LLM 返回空响应")
+            # 使用注入的 Provider 调用 LLM
+            return await self._llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
 
         except Exception as e:
             raise LLMCallError(f"LLM 调用失败: {e}")
@@ -410,6 +378,8 @@ class LangGraphAgent(ABC, Generic[T]):
                 "output": None,
                 "error": None,
                 "retry_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
                 **initial_state  # 合并业务状态
             }
             
@@ -420,6 +390,10 @@ class LangGraphAgent(ABC, Generic[T]):
                 # 计算耗时
                 end_time = time.perf_counter()
                 duration_ms = int((end_time - start_time) * 1000)
+                
+                # 从结果中提取 Token 信息（由 _process_node 添加）
+                total_input_tokens = result.get("input_tokens", 0)
+                total_output_tokens = result.get("output_tokens", 0)
                 
                 # 记录指标
                 metrics.input_tokens = total_input_tokens
@@ -460,7 +434,10 @@ class LangGraphAgent(ABC, Generic[T]):
                     f"[{self.agent_name}] 执行完成，耗时 {duration_ms}ms",
                     stage=stage_name
                 )
-                
+
+                # ★ DEBUG: 打印返回的指标
+                logger.info(f"[DEBUG] Agent={self.agent_name} returning metrics: input_tokens={total_input_tokens}, output_tokens={total_output_tokens}, duration_ms={duration_ms}")
+
                 return {
                     "success": True,
                     "output": result["output"],
@@ -542,17 +519,3 @@ class MockAgent(BaseAgent[BaseModel]):
     
     async def _call_llm(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
         return json.dumps(self._mock_response)
-
-
-def get_llm_provider_info() -> Dict[str, str]:
-    """
-    获取当前 LLM 供应商信息
-    
-    Returns:
-        Dict: 供应商信息
-    """
-    return {
-        "provider": "ModelScope" if settings.USE_MODELSCOPE else "OpenAI",
-        "model": settings.llm_model,
-        "api_base": settings.llm_api_base
-    }

@@ -164,6 +164,10 @@ export function buildFlowElements(
       nodeClassName = 'animate-pulse';
     }
 
+    // 修复：只要有 output_data 就可以点击查看（包括 CODING 自动编码阶段）
+    const hasOutputData = !!backendStage?.output_data;
+    const isPending = isCurrentStage && pipelineStatus === 'paused';
+
     nodes.push({
       id: stageName,
       type: 'pipelineNode',
@@ -174,9 +178,9 @@ export function buildFlowElements(
         status: status,
         description: backendStage?.description || config.description,
         stageId: stageName,
-        isClickable: isCurrentStage && pipelineStatus === 'paused',
+        isClickable: isPending || hasOutputData, // 修复：待审批或有数据都可点击
         backendStage: backendStage,
-        isPendingApproval: isCurrentStage && pipelineStatus === 'paused',
+        isPendingApproval: isPending,
       },
       sourcePosition: stageName === 'DESIGN' ? Position.Right : Position.Right,
       targetPosition: stageName === 'DELIVERY' ? Position.Left : Position.Left,
@@ -264,14 +268,14 @@ export function usePipelineFlow(pipeline: Pipeline | null): UsePipelineFlowRetur
       ?? pipeline.stages?.[0];
   }, [pipeline]);
 
-  // 计算进度
-  const totalStages = 3;
+  // 计算进度 - 使用实际阶段数
+  const totalStages = useMemo(() => pipeline?.stages?.length || 1, [pipeline]);
   const completedStages = useMemo(() => {
     return pipeline?.stages?.filter(s => s.status === 'success').length || 0;
   }, [pipeline]);
   const progress = useMemo(() => {
     return Math.round((completedStages / totalStages) * 100);
-  }, [completedStages]);
+  }, [completedStages, totalStages]);
 
   // 是否显示审批按钮
   const showApproveButton = useMemo(() => {

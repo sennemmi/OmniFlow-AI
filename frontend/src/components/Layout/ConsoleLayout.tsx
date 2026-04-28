@@ -12,7 +12,7 @@ export function ConsoleLayout() {
       <Sidebar />
 
       {/* 主内容区 */}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto min-h-0">
         <div className="min-h-full p-6">
           <Outlet />
         </div>

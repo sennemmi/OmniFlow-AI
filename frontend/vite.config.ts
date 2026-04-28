@@ -4,6 +4,18 @@ import tailwindcss from '@tailwindcss/vite'
 import componentDebugger from 'vite-plugin-component-debugger'
 import path from 'path'
 
+// OmniFlowAI 悬浮对话框注入插件
+const omniFlowOverlayPlugin = () => ({
+  name: 'omniflow-overlay',
+  transformIndexHtml(html) {
+    // 在 body 末尾注入 injector.js 脚本
+    return html.replace(
+      '</body>',
+      '  <script src="/injector.js" data-api-url="http://localhost:8000"></script>\n</body>'
+    )
+  },
+})
+
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
   const isDev = mode === 'development'
@@ -17,6 +29,8 @@ export default defineConfig(({ mode }) => {
       }) : null,
       react(),
       tailwindcss(),
+      // OmniFlowAI 悬浮对话框注入
+      omniFlowOverlayPlugin(),
     ].filter(Boolean),
     resolve: {
       alias: {

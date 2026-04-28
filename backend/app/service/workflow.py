@@ -19,6 +19,7 @@ from app.service.repositories import (
     PipelineStageRepository,
     StageTransitionService
 )
+from app.core.timezone import now
 
 
 class WorkflowService:
@@ -204,6 +205,11 @@ class WorkflowService:
                 - retry_count: 重试次数
                 - reasoning: AI 推理过程
         """
+        # ★ DEBUG: 打印接收到的 metrics
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[DEBUG] WorkflowService.complete_stage called for {stage.name} with metrics: {metrics}")
+
         await PipelineStageRepository.complete(
             stage, output_data, success, session, metrics
         )
@@ -312,5 +318,60 @@ class WorkflowService:
         info(
             "Pipeline 状态更新为 FAILED",
             pipeline_id=pipeline.id,
+            current_stage=pipeline.current_stage.value if pipeline.current_stage else None
+        )
+    
+    @classmethod
+    async def terminate_pipeline(
+        cls,
+        pipeline: Pipeline,
+        reason: str,
+        session: AsyncSession
+    ) -> None:
+        """
+        终止 Pipeline（用户手动终止）
+        
+        Args:
+            pipeline: Pipeline 对象
+            reason: 终止原因
+            session: 数据库会话
+        """
+        from app.models.pipeline import StageStatus
+        from app.core.sse_log_buffer import push_log, remove_buffer
+        
+        # 1. 标记当前阶段为失败
+        if pipeline.current_stage:
+            current_stage = await PipelineStageRepository.get_by_pipeline_and_name(
+                pipeline.id, pipeline.current_stage, session
+            )
+            if current_stage:
+                current_stage.status = StageStatus.FAILED
+                current_stage.output_data = {
+                    **(current_stage.output_data or {}),
+                    "terminated": True,
+                    "terminate_reason": reason,
+                    "terminated_at": now().isoformat()
+                }
+                session.add(current_stage)
+        
+        # 2. 标记 Pipeline 为失败
+        pipeline.status = PipelineStatus.FAILED
+        await session.commit()
+        
+        # 3. 推送终止日志
+        await push_log(
+            pipeline.id,
+            "error",
+            f"Pipeline 已被终止: {reason}",
+            stage=pipeline.current_stage.value if pipeline.current_stage else "UNKNOWN"
+        )
+        
+        # 4. 清理 SSE 缓冲区
+        remove_buffer(pipeline.id)
+        
+        info(
+            "Pipeline 已被用户终止",
+            pipeline_id=pipeline.id,
+            reason=reason,
             current_stage=pipeline.current_stage.value if pipeline.current_stage else None
         )

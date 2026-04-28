@@ -857,39 +857,3 @@ def log_api_request(
         status_code=status_code,
         duration_ms=round(duration_ms, 2)
     )
-
-
-# =============================================================================
-# 统一日志出口：同时打印到后端控制台和推送到前端 SSE
-# =============================================================================
-
-async def emit_log(
-    pipeline_id: int,
-    level: str,
-    msg: str,
-    stage: str = "",
-    exc_info: bool = False,
-    **kwargs
-) -> None:
-    """
-    统一日志出口：同时打印到后端控制台和推送到前端 SSE
-
-    使用示例：
-        await emit_log(pipeline_id, "info", "代码生成完成", stage="CODING", files_count=5)
-    """
-    # 1. 打印后端日志
-    log_func = getattr(logger, level if level in ['info', 'debug', 'warning', 'error'] else 'info')
-
-    # 确保在上下文中携带 pipeline_id
-    with structlog.contextvars.bound_contextvars(pipeline_id=pipeline_id, stage=stage):
-        log_func(msg, exc_info=exc_info, **kwargs)
-
-    # 2. 推送前端 SSE
-    from app.core.sse_log_buffer import push_log
-
-    # 如果有异常，把异常简述发给前端，但不需要把整个长篇堆栈发给前端
-    frontend_msg = msg
-    if exc_info:
-        frontend_msg = f"{msg} (查看后端日志获取详情)"
-
-    await push_log(pipeline_id, level, frontend_msg, stage=stage, **kwargs)
