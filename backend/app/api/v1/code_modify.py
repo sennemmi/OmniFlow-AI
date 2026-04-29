@@ -22,7 +22,7 @@ from fastapi import APIRouter, Request, Depends
 from pydantic import BaseModel, Field
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.core.config import settings, get_workspace_path, process_file_path
+from app.core.config import settings
 from app.core.database import get_session
 from app.core.response import ResponseModel, success_response, error_response
 from app.core.logging import error, info

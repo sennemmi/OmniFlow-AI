@@ -25,7 +25,7 @@ from app.core.sse_log_buffer import push_log
 from app.models.pipeline import PipelineStage, StageName
 from app.service.project import ProjectService
 from app.service.workflow import WorkflowService
-from app.service.repositories import PipelineStageRepository
+from app.repositories import PipelineStageRepository
 
 
 class AgentCoordinatorService:
@@ -329,8 +329,8 @@ class AgentCoordinatorService:
                 backend_dir = Path(__file__).parent.parent
                 project_path = str(backend_dir.parent / project_path)
 
-            # 获取或创建索引服务
-            indexer = get_indexer(project_path)
+            # 获取或创建索引服务（线程安全）
+            indexer = await get_indexer(project_path)
 
             # 提取需求关键词进行检索
             feature_description = architect_output.get("feature_description", "")

@@ -1,0 +1,38 @@
+# OmniFlowAI Sandbox 精简依赖
+# 用于测试环境，不包含重型依赖（如 torch）
+
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Database
+sqlmodel==0.0.22
+alembic==1.14.0
+aiosqlite==0.20.0
+
+# AI/LLM (基础)
+langgraph==0.2.45
+langchain==0.3.7
+langchain-openai==0.2.6
+litellm==1.52.0
+openai==1.54.0
+
+# Utilities
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+httpx==0.27.2
+psutil>=5.9.0
+
+# Logging & Monitoring
+structlog==24.4.0
+python-json-logger==2.0.7
+rich==13.9.4
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# 注意：chromadb 和 sentence-transformers 需要 torch，在沙箱中按需安装
+# 如果需要 RAG 功能，可以在运行时单独安装
+ruff>=0.8.0

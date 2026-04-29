@@ -245,7 +245,9 @@ class LLMProviderFactory:
             LLMProvider: Provider 实例
         """
         if provider_type is None:
-            provider_type = "modelscope" if settings.USE_MODELSCOPE else "openai"
+            # 安全访问配置，避免属性错误
+            use_modelscope = getattr(settings, 'USE_MODELSCOPE', True)
+            provider_type = "modelscope" if use_modelscope else "openai"
 
         provider_type = provider_type.lower()
 

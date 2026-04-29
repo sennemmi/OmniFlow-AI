@@ -18,21 +18,22 @@ class ImportSanitizer:
     """
 
     # 错误模式 -> 正确模式 的映射
+    # 使用 [\w.]+ 来匹配多级路径，如 api.v1.users
     IMPORT_FIXES = [
         # from core.xxx -> from app.core.xxx
-        (r'from core\.(\w+) import', r'from app.core.\1 import'),
+        (r'from core\.([\w.]+) import', r'from app.core.\1 import'),
         # from models.xxx -> from app.models.xxx
-        (r'from models\.(\w+) import', r'from app.models.\1 import'),
+        (r'from models\.([\w.]+) import', r'from app.models.\1 import'),
         # from service.xxx -> from app.service.xxx
-        (r'from service\.(\w+) import', r'from app.service.\1 import'),
-        # from api.xxx -> from app.api.xxx
-        (r'from api\.(\w+) import', r'from app.api.\1 import'),
+        (r'from service\.([\w.]+) import', r'from app.service.\1 import'),
+        # from api.xxx -> from app.api.xxx (支持多级路径如 api.v1.users)
+        (r'from api\.([\w.]+) import', r'from app.api.\1 import'),
         # from db.xxx -> from app.db.xxx
-        (r'from db\.(\w+) import', r'from app.db.\1 import'),
+        (r'from db\.([\w.]+) import', r'from app.db.\1 import'),
         # from utils.xxx -> from app.utils.xxx
-        (r'from utils\.(\w+) import', r'from app.utils.\1 import'),
+        (r'from utils\.([\w.]+) import', r'from app.utils.\1 import'),
         # from agents.xxx -> from app.agents.xxx
-        (r'from agents\.(\w+) import', r'from app.agents.\1 import'),
+        (r'from agents\.([\w.]+) import', r'from app.agents.\1 import'),
         # import core.xxx -> import app.core.xxx
         (r'^import core\.', 'import app.core.'),
         # import models.xxx -> import app.models.xxx

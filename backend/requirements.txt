@@ -36,3 +36,6 @@ httpx==0.27.2
 # Code Indexing & RAG
 chromadb>=0.4.0
 sentence-transformers>=2.2.0
+
+# Code Quality & Auto-healing
+ruff>=0.8.0

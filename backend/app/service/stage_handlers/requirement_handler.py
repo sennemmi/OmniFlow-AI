@@ -33,7 +33,7 @@ class RequirementHandler(StageHandler):
             raise ValueError("Requirement is required for REQUIREMENT stage")
         
         # 阶段记录在 Pipeline 创建时已经创建，这里获取 stage_id
-        from app.service.repositories import PipelineStageRepository
+        from app.repositories import PipelineStageRepository
         stage = await PipelineStageRepository.get_by_pipeline_and_name(
             context.pipeline_id, self.stage_name, context.session
         )

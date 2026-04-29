@@ -5,6 +5,7 @@
 原则：
 1. 在修改前自动备份原文件（防止 AI 改坏代码）
 2. 简单的冲突检测：如果目标文件不存在，主动报错
+3. 代码写入后自动执行 Ruff 修复（Linter-based Auto-healing）
 
 重构说明：
 - 所有路径操作基于 settings.TARGET_PROJECT_PATH
@@ -12,15 +13,19 @@
 """
 
 import hashlib
+import logging
 import shutil
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from datetime import datetime
 
 from app.core.config import settings
 from app.core.timezone import now_str
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,28 +53,95 @@ class CodeExecutorError(Exception):
     pass
 
 
+def auto_heal_code(project_root: str) -> Dict[str, Any]:
+    """
+    调用 Ruff 进行静默修复 - Linter-based Auto-healing
+
+    修复内容：
+    - 未使用的 import
+    - 代码格式化
+    - 简单的语法问题
+
+    Args:
+        project_root: 项目根目录路径
+
+    Returns:
+        Dict: 修复结果统计
+    """
+    result = {
+        "success": True,
+        "check_fixed": 0,
+        "format_fixed": 0,
+        "errors": []
+    }
+
+    try:
+        # 修复未使用的 import、简单语法问题等
+        check_result = subprocess.run(
+            ["ruff", "check", "--fix", project_root],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        result["check_fixed"] = len([line for line in check_result.stdout.split("\n") if line.strip()])
+        if check_result.returncode != 0 and check_result.stderr:
+            result["errors"].append(f"ruff check error: {check_result.stderr[:200]}")
+
+        # 代码格式化
+        format_result = subprocess.run(
+            ["ruff", "format", project_root],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        result["format_fixed"] = len([line for line in format_result.stdout.split("\n") if line.strip()])
+        if format_result.returncode != 0 and format_result.stderr:
+            result["errors"].append(f"ruff format error: {format_result.stderr[:200]}")
+
+        logger.info(f"Ruff auto-heal completed: {result}")
+
+    except FileNotFoundError:
+        # Ruff 未安装，静默处理
+        logger.debug("Ruff not found, skipping auto-heal")
+        result["success"] = False
+        result["errors"].append("ruff not installed")
+    except subprocess.TimeoutExpired:
+        logger.warning("Ruff auto-heal timeout")
+        result["success"] = False
+        result["errors"].append("timeout")
+    except Exception as e:
+        # 静默处理，不影响主流程
+        logger.warning(f"Ruff auto-heal failed: {e}")
+        result["success"] = False
+        result["errors"].append(str(e))
+
+    return result
+
+
 class CodeExecutorService:
     """
     代码执行服务
-    
+
     负责：
     1. 安全地将代码写入文件系统
     2. 自动备份原文件
     3. 冲突检测和验证
     4. 支持批量文件操作
-    
+    5. 代码写入后自动执行 Ruff 修复
+
     安全原则：
     - 修改前必须备份
     - 文件不存在时报错（不自动创建目录）
     - 提供回滚能力
-    
+    - 代码写入后自动格式化
+
     重要：所有操作基于 settings.TARGET_PROJECT_PATH
     实现平台代码与 AI 操作目标代码的解耦
     """
-    
+
     BACKUP_DIR_NAME = ".devflow_backups"
     MAX_BACKUP_AGE_DAYS = 7
-    
+
     def __init__(self, project_root: Optional[str] = None):
         """
         初始化代码执行服务
@@ -245,21 +317,23 @@ class CodeExecutorService:
     def apply_changes(
         self,
         changes: Dict[str, str],
-        create_if_missing: bool = False
+        create_if_missing: bool = False,
+        auto_heal: bool = True
     ) -> ExecutionResult:
         """
         批量应用文件变更
-        
+
         Args:
             changes: {文件路径: 新内容} 字典
             create_if_missing: 文件不存在时是否创建
-            
+            auto_heal: 是否自动执行 Ruff 修复（默认开启）
+
         Returns:
             ExecutionResult: 执行结果
         """
         file_changes = []
         errors = []
-        
+
         for relative_path, new_content in changes.items():
             change = self.apply_file_change(
                 relative_path,
@@ -267,10 +341,10 @@ class CodeExecutorService:
                 create_if_missing=create_if_missing
             )
             file_changes.append(change)
-            
+
             if not change.success:
                 errors.append(f"{relative_path}: {change.error}")
-        
+
         # 统计
         summary = {
             "total": len(file_changes),
@@ -279,9 +353,21 @@ class CodeExecutorService:
             "created": sum(1 for c in file_changes if c.original_content is None and c.success),
             "modified": sum(1 for c in file_changes if c.original_content is not None and c.success)
         }
-        
+
         success = summary["failed"] == 0
-        
+
+        # 【Ruff Auto-healing】代码写入后自动修复
+        if success and auto_heal and changes:
+            heal_result = auto_heal_code(str(self.project_root))
+            if heal_result["success"]:
+                total_fixed = heal_result.get("check_fixed", 0) + heal_result.get("format_fixed", 0)
+                if total_fixed > 0:
+                    logger.info(f"Ruff auto-healed {total_fixed} issues")
+                    summary["ruff_fixed"] = total_fixed
+            else:
+                # 静默处理，不影响主流程
+                logger.debug(f"Ruff auto-heal skipped: {heal_result.get('errors', [])}")
+
         return ExecutionResult(
             success=success,
             changes=file_changes,

@@ -7,14 +7,16 @@
 - 支持自动修复循环
 """
 
+from pathlib import Path
 from typing import Any, Dict
 
+from app.core.config import settings
 from app.core.sse_log_buffer import push_log
 from app.models.pipeline import StageName, PipelineStatus, StageStatus
 from app.service.agent_coordinator import AgentCoordinatorService
+from app.service.sandbox_manager import sandbox_manager
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
-from app.service.workspace import async_workspace_context
 
 
 class CodingHandler(StageHandler):
@@ -75,29 +77,35 @@ class CodingHandler(StageHandler):
         from app.agents.multi_agent_coordinator import multi_agent_coordinator
         
         multi_agent_result = None
-        
+        sandbox_info = None
+        sandbox_started = False
+
         try:
-            async with async_workspace_context(pipeline_id) as ws:
-                workspace_dir = ws.get_workspace_path()
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"创建临时工作区: {workspace_dir.name}",
-                    stage="CODING"
-                )
-                
-                # 调用带自动修复的协调器
-                multi_agent_result = await multi_agent_coordinator.execute_with_auto_fix(
-                    design_output=design_output,
-                    target_files=target_files,
-                    pipeline_id=pipeline_id,
-                    workspace_path=str(workspace_dir)
-                )
-                
-                # 如果成功，记录测试日志
-                if multi_agent_result["success"] and "test_logs" in multi_agent_result:
-                    await push_log(pipeline_id, "info", "测试日志已保存", stage="CODING")
-                
+            # 启动沙箱
+            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+            sandbox_info = await sandbox_manager.start(pipeline_id, project_path)
+            sandbox_started = True
+            await push_log(
+                pipeline_id,
+                "info",
+                f"沙箱已启动，预览端口: {sandbox_info.port}",
+                stage="CODING"
+            )
+
+            # 调用带自动修复的协调器
+            multi_agent_result = await multi_agent_coordinator.execute_with_auto_fix(
+                design_output=design_output,
+                target_files=target_files,
+                pipeline_id=pipeline_id,
+                workspace_path="/workspace",  # 容器内路径，固定
+                sandbox_port=sandbox_info.port,  # 透传给 coordinator，存入 output_data
+                error_context=context.error_context  # 传入错误上下文（如允许修改测试的授权）
+            )
+
+            # 如果成功，记录测试日志
+            if multi_agent_result["success"] and "test_logs" in multi_agent_result:
+                await push_log(pipeline_id, "info", "测试日志已保存", stage="CODING")
+
         except Exception as e:
             await push_log(pipeline_id, "error", f"代码生成执行失败: {str(e)}", stage="CODING")
             multi_agent_result = {
@@ -105,20 +113,46 @@ class CodingHandler(StageHandler):
                 "error": str(e),
                 "output": None
             }
+        finally:
+            # 确保沙箱被停止，避免资源泄漏
+            if sandbox_started:
+                try:
+                    await sandbox_manager.stop(pipeline_id)
+                    await push_log(pipeline_id, "info", "沙箱已停止", stage="CODING")
+                except Exception as stop_error:
+                    await push_log(pipeline_id, "warning", f"停止沙箱时出错: {str(stop_error)}", stage="CODING")
         
         # 构建结果
         if not multi_agent_result or not multi_agent_result["success"]:
             error_msg = multi_agent_result.get("error", "Unknown error") if multi_agent_result else "Unknown error"
-            
+
+            # 检查是否是挂起等待用户决策的状态
+            if multi_agent_result and multi_agent_result.get("pending_user_decision"):
+                return StageResult(
+                    success=False,
+                    status=PipelineStatus.PAUSED,   # PAUSED 不是 FAILED
+                    message="等待用户决策：旧测试不兼容",
+                    output_data={
+                        "pending_user_decision": True,
+                        "decision_options": multi_agent_result.get("decision_options", []),
+                        "user_message": multi_agent_result.get("user_message", ""),
+                        "regression_failed_tests": multi_agent_result.get("regression_failed_tests", []),
+                        "last_code_output": multi_agent_result.get("last_code_output"),
+                        "target_files": target_files,
+                    },
+                    metrics=self._extract_metrics(multi_agent_result),
+                )
+
             output_data = {
                 "error": error_msg,
                 "last_error_logs": multi_agent_result.get("last_error_logs") if multi_agent_result else None
             }
-            
-            if multi_agent_result and multi_agent_result.get("output"):
-                output_data["multi_agent_output"] = multi_agent_result["output"]
+
+            # 注意：失败时不保存 multi_agent_output，避免脏数据残留
+            # 只保存目标文件信息用于调试
+            if target_files:
                 output_data["target_files"] = target_files
-            
+
             return StageResult.failure_result(
                 message=f"Code generation failed: {error_msg}",
                 output_data=output_data,
@@ -152,7 +186,8 @@ class CodingHandler(StageHandler):
                 "tests_included": combined_output.get("tests_included", False),
                 "target_files": target_files,
                 "auto_fix_attempts": attempt_count,
-                "test_logs": multi_agent_result.get("test_logs")
+                "test_logs": multi_agent_result.get("test_logs"),
+                "sandbox_port": sandbox_info.port if sandbox_info else None
             },
             status=PipelineStatus.RUNNING,  # 继续执行到 UNIT_TESTING
             metrics=self._extract_metrics(multi_agent_result)
@@ -215,10 +250,10 @@ class CodingHandler(StageHandler):
             )
             if pipeline:
                 await WorkflowService.set_pipeline_failed(pipeline, context.session)
-            
+
             from app.core.sse_log_buffer import remove_buffer
             remove_buffer(context.pipeline_id)
-        
+
         await context.session.commit()
     
     async def handle_error(
@@ -233,6 +268,7 @@ class CodingHandler(StageHandler):
             f"代码生成阶段异常: {str(error)}",
             stage="CODING"
         )
+        # 注意：沙箱在 execute 方法的 finally 块中已停止
         return StageResult.failure_result(
             message=f"Code generation failed: {str(error)}",
             output_data={"error": str(error), "error_type": type(error).__name__}

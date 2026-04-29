@@ -20,6 +20,7 @@ import os
 import ast
 import json
 import hashlib
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
@@ -302,6 +303,18 @@ class CodeIndexerService:
             self._index_to_vector_db()
 
         return self.chunks
+
+    def build_index(self, force_refresh: bool = False) -> List[CodeChunk]:
+        """
+        构建代码索引（公开接口）
+
+        Args:
+            force_refresh: 强制刷新索引
+
+        Returns:
+            List[CodeChunk]: 代码块列表
+        """
+        return self.extract_code_units(force_refresh=force_refresh)
 
     def _is_method(self, node: ast.FunctionDef, tree: ast.Module) -> bool:
         """检查函数是否是类方法"""
@@ -835,11 +848,13 @@ class CodeIndexerService:
 
 # 全局索引服务实例缓存
 _indexer_cache: Dict[str, CodeIndexerService] = {}
+_indexer_locks: Dict[str, asyncio.Lock] = {}  # 每个索引器一个锁，防止并发更新
+_global_lock = asyncio.Lock()  # 用于保护缓存操作的全局锁
 
 
-def get_indexer(project_path: str, include_tests: bool = False) -> CodeIndexerService:
+async def get_indexer(project_path: str, include_tests: bool = False) -> CodeIndexerService:
     """
-    获取或创建索引服务实例（带缓存）
+    获取或创建索引服务实例（带缓存，线程安全）
 
     Args:
         project_path: 项目路径
@@ -849,14 +864,33 @@ def get_indexer(project_path: str, include_tests: bool = False) -> CodeIndexerSe
         CodeIndexerService: 索引服务实例
     """
     cache_key = f"{project_path}:{include_tests}"
-    if cache_key not in _indexer_cache:
-        _indexer_cache[cache_key] = CodeIndexerService(project_path, include_tests=include_tests)
-    return _indexer_cache[cache_key]
+    
+    async with _global_lock:
+        if cache_key not in _indexer_cache:
+            _indexer_cache[cache_key] = CodeIndexerService(project_path, include_tests=include_tests)
+            _indexer_locks[cache_key] = asyncio.Lock()
+        return _indexer_cache[cache_key]
+
+
+def get_indexer_lock(project_path: str, include_tests: bool = False) -> asyncio.Lock:
+    """
+    获取索引器的更新锁
+
+    Args:
+        project_path: 项目路径
+        include_tests: 是否包含测试目录
+
+    Returns:
+        asyncio.Lock: 锁对象
+    """
+    cache_key = f"{project_path}:{include_tests}"
+    return _indexer_locks.get(cache_key, asyncio.Lock())
 
 
 def clear_indexer_cache():
     """清除所有索引器缓存"""
-    global _indexer_cache
+    global _indexer_cache, _indexer_locks
     for indexer in _indexer_cache.values():
         indexer.clear_cache()
     _indexer_cache.clear()
+    _indexer_locks.clear()

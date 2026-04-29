@@ -311,7 +311,7 @@ class LangGraphAgent(ABC, Generic[T]):
         """
         解析 LLM 返回的 JSON（工具方法）
         
-        剥离 Markdown 代码块，提取纯 JSON
+        剥离 Markdown 代码块和前后文本，提取纯 JSON
         
         Args:
             response: LLM 响应字符串
@@ -323,12 +323,15 @@ class LangGraphAgent(ABC, Generic[T]):
             JSONParseError: 解析失败
         """
         try:
-            # 去除 Markdown 代码块标记
-            json_str = re.sub(r'^```json\s*', '', response.strip())
-            json_str = re.sub(r'^```\s*', '', json_str)
-            json_str = re.sub(r'```\s*$', '', json_str)
-            json_str = json_str.strip()
+            # 首先尝试提取 ```json ... ``` 或 ``` ... ``` 代码块中的内容
+            code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+            match = re.search(code_block_pattern, response, re.DOTALL)
+            if match:
+                json_str = match.group(1).strip()
+                return json.loads(json_str)
             
+            # 如果没有代码块，尝试直接解析整个响应（去除前后空白）
+            json_str = response.strip()
             return json.loads(json_str)
         except json.JSONDecodeError as e:
             raise JSONParseError(f"JSON 解析失败: {e}\n响应内容: {response[:500]}")

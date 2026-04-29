@@ -24,7 +24,7 @@ class DesignHandler(StageHandler):
     
     async def prepare(self, context: StageContext) -> StageContext:
         """准备阶段：获取 REQUIREMENT 阶段输出"""
-        from app.service.repositories import PipelineStageRepository
+        from app.repositories import PipelineStageRepository
         
         # 获取 REQUIREMENT 阶段输出作为输入
         requirement_stage = await PipelineStageRepository.get_by_pipeline_and_name(

@@ -11,6 +11,12 @@ Repository 层
 - 所有查询通过 Repository 方法完成
 """
 
+from app.repositories.pipeline_repository import PipelineRepository
 from app.repositories.pipeline_stage_repository import PipelineStageRepository
+from app.repositories.stage_transition_service import StageTransitionService
 
-__all__ = ["PipelineStageRepository"]
+__all__ = [
+    "PipelineRepository",
+    "PipelineStageRepository",
+    "StageTransitionService",
+]

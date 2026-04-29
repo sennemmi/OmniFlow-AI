@@ -45,6 +45,39 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
 【核心铁律】
 以单元测试为荣！
 
+【分层测试策略 - 快速失败原则】
+测试按照"发现问题速度"和"修复成本"分层执行：
+
+Layer 1 - 语法检查（毫秒级）：
+- 使用 ast.parse 检查新生成代码的语法
+- 失败立即返回，不进入后续层
+
+Layer 2 - 防御性测试（秒级，核心保护机制）：
+- 位于 backend/tests/unit/defense/ 目录
+- 是系统的"免疫系统"，包含 4 层防线：
+  * 代码修改与沙箱防线：文件回滚、路径安全、导入清理
+  * 测试运行器与决策防线：语法拦截、回归保护
+  * 多 Agent 协作与状态机防线：Pydantic 校验、重试限制、JSON 剥离
+  * 工作流与状态持久化防线：状态流转、反馈传递
+- 【关键】防御性测试失败 = 代码破坏了核心保护机制
+- 【关键】防御性测试失败必须人工介入，不能 Auto-Fix
+
+Layer 3 - 新测试（秒级，功能验证）：
+- 位于 backend/tests/ai_generated/ 目录（你生成的测试）
+- 验证新生成功能是否符合预期
+- 失败可进入 Auto-Fix 循环自动修复
+
+Layer 4 - 健康检查（服务启动验证）：
+- 验证代码是否能正常启动服务
+
+【重要】你生成的新测试必须：
+- 放置于 backend/tests/ai_generated/ 目录
+- 通过 Layer 1 语法检查（ast.parse 秒级完成）
+- 通过 Layer 2 防御性测试（不能破坏核心保护机制）
+- 不能与 backend/tests/unit/defense/ 中的防御性测试冲突
+- 不能修改 backend/tests/unit/ 和 backend/tests/integration/ 下的旧测试（受保护层）
+- 如果测试失败，系统会告诉你具体的失败测试名称和错误日志
+
 【任务要求】
 1. 仔细阅读 DesignerAgent 的技术方案（API 端点、函数变更、逻辑流）
 2. 仔细阅读 CoderAgent 生成的代码
@@ -75,7 +108,7 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
 {
     "test_files": [
         {
-            "file_path": "tests/test_example.py",
+            "file_path": "backend/tests/ai_generated/test_example.py",
             "content": "完整的测试文件内容...",
             "target_module": "app.api.v1.example",
             "test_cases_count": 5
@@ -105,7 +138,8 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
 - 测试文件内容必须是完整的，不是 diff 格式
 - 测试代码必须可以直接运行
 - 优先使用 pytest 的最佳实践
-- 必须使用完整的文件路径（包含 backend/ 前缀，如 backend/tests/test_xxx.py）
+- 必须使用完整的文件路径（包含 backend/ 前缀，如 backend/tests/ai_generated/test_xxx.py）
+- 严禁修改 backend/tests/unit/defense/ 下的防御性测试
 """
     
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
@@ -118,20 +152,46 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
         design_output = state.get("design_output", {})
         code_output = state.get("code_output", {})
         target_files = state.get("target_files", {})
-        
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
+
+        # ── 骨架模式 ──────────────────────────────────────────────────────
+        if state.get("skeleton_mode"):
+            return f"""【任务】基于技术设计方案生成测试骨架（不需要实现断言，用 TODO 占位）。
+
+【技术设计方案】
+{design_str}
+
+请输出 JSON，test_files[].content 中每个测试函数体写 `assert True  # TODO: fill after code`。
+输出格式与正常模式完全相同。"""
+
+        # ── 填充模式 ──────────────────────────────────────────────────────
+        if state.get("fill_mode"):
+            skeleton_output = state.get("skeleton_output", {})
+            skeleton_str = json.dumps(skeleton_output, indent=2, ensure_ascii=False)
+            code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
+            files_content = "\n\n".join(
+                f"【文件: {p}】\n```python\n{c}\n```"
+                for p, c in target_files.items()
+            )
+            return f"""【任务】将以下测试骨架的 TODO 替换为真实断言。
+
+【测试骨架（待填充）】
+{skeleton_str}
+
+【CoderAgent 生成的代码】
+{code_str}
+
+【目标文件当前内容】
+{files_content}
+
+请输出完整的测试文件（JSON 格式），不要保留任何 TODO 占位。"""
+
+        # ── 原有完整模式（兜底）─────────────────────────────────────────
         code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
-        
-        # 构建文件内容部分
-        files_content = []
-        for file_path, content in target_files.items():
-            files_content.append(f"""【文件: {file_path}】
-```python
-{content}
-```""")
-        
-        files_str = "\n\n".join(files_content)
-        
+        files_content = "\n\n".join(
+            f"【文件: {p}】\n```python\n{c}\n```"
+            for p, c in target_files.items()
+        )
         return f"""【技术设计方案】
 {design_str}
 
@@ -139,7 +199,7 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
 {code_str}
 
 【目标文件当前内容】
-{files_str}
+{files_content}
 
 请根据技术设计方案和生成的代码，编写完整的单元测试。
 注意：
@@ -157,6 +217,62 @@ class TesterAgent(LangGraphAgent[TesterOutput]):
         """校验输出为 TesterOutput 模型"""
         return TesterOutput(**output)
     
+    async def generate_skeleton(
+        self,
+        design_output: Dict[str, Any],
+        pipeline_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        第一阶段：仅基于 design_output 生成测试骨架。
+        不依赖 CoderAgent 输出，可与 CoderAgent 并发执行。
+        骨架包含：测试文件结构、测试函数签名、TODO 占位断言。
+        """
+        from app.core.sse_log_buffer import push_log
+        if pipeline_id:
+            await push_log(pipeline_id, "info", "TestAgent 开始生成测试骨架...", stage="CODING")
+
+        initial_state = {
+            "design_output": design_output,
+            "code_output": {},      # 空，此时代码还没生成
+            "target_files": {},
+            "skeleton_mode": True,  # 告知 build_user_prompt 进入骨架模式
+        }
+        result = await self.execute(
+            pipeline_id=pipeline_id or 0,
+            stage_name="CODING",
+            initial_state=initial_state
+        )
+        return result
+
+    async def fill_assertions(
+        self,
+        skeleton_output: Dict[str, Any],
+        code_output: Dict[str, Any],
+        target_files: Dict[str, str],
+        pipeline_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        第二阶段：拿到 CoderAgent 的代码后，填充骨架里的 TODO 断言。
+        串行执行（必须等 CoderAgent 完成）。
+        """
+        from app.core.sse_log_buffer import push_log
+        if pipeline_id:
+            await push_log(pipeline_id, "info", "TestAgent 填充测试断言...", stage="CODING")
+
+        initial_state = {
+            "design_output": {},
+            "code_output": code_output,
+            "target_files": target_files,
+            "skeleton_output": skeleton_output,  # 传入骨架
+            "fill_mode": True,
+        }
+        result = await self.execute(
+            pipeline_id=pipeline_id or 0,
+            stage_name="CODING",
+            initial_state=initial_state
+        )
+        return result
+
     async def generate_tests(
         self,
         design_output: Dict[str, Any],

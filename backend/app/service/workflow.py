@@ -14,7 +14,7 @@ from app.models.pipeline import (
     Pipeline, PipelineStatus,
     PipelineStage, StageName, StageStatus
 )
-from app.service.repositories import (
+from app.repositories import (
     PipelineRepository,
     PipelineStageRepository,
     StageTransitionService
@@ -169,8 +169,13 @@ class WorkflowService:
         Returns:
             PipelineStage: 创建的阶段
         """
+        from app.models.pipeline import StageStatus
         stage = await PipelineStageRepository.create(
-            pipeline_id, stage_name, input_data, session
+            pipeline_id=pipeline_id,
+            stage_name=stage_name,
+            status=StageStatus.RUNNING,
+            session=session,
+            input_data=input_data
         )
         
         info(

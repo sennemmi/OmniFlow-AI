@@ -192,38 +192,41 @@ class PipelineService:
         stage_name: StageName,
         session: AsyncSession,
         input_data: Optional[Dict[str, Any]] = None,
-        rejection_feedback: Optional[Dict[str, Any]] = None
+        rejection_feedback: Optional[Dict[str, Any]] = None,
+        error_context: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         通用阶段触发方法
-        
+
         Args:
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
             session: 数据库会话
             input_data: 输入数据（可选）
             rejection_feedback: 驳回反馈（可选）
-            
+            error_context: 错误上下文（可选，用于传递允许修改测试的授权等）
+
         Returns:
             Dict: 执行结果
         """
         handler = self._registry.get(stage_name)
-        
+
         if not handler:
             return {
                 "success": False,
                 "error": f"No handler registered for stage: {stage_name.value}"
             }
-        
+
         context = StageContext(
             pipeline_id=pipeline_id,
             session=session,
             input_data=input_data or {},
-            rejection_feedback=rejection_feedback
+            rejection_feedback=rejection_feedback,
+            error_context=error_context
         )
-        
+
         result = await handler.run(context)
-        
+
         return {
             "success": result.success,
             "status": result.status.value,
@@ -235,13 +238,19 @@ class PipelineService:
         }
     
     @classmethod
-    async def _trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+    async def _trigger_coding_phase(
+        cls,
+        pipeline_id: int,
+        session: AsyncSession,
+        error_context: Optional[str] = None
+    ) -> Dict[str, Any]:
         """触发 CODING 阶段（供后台任务调用）"""
         service = cls()
         return await service._trigger_stage(
             pipeline_id=pipeline_id,
             stage_name=StageName.CODING,
-            session=session
+            session=session,
+            error_context=error_context
         )
     
     @classmethod
@@ -558,9 +567,14 @@ class PipelineService:
     # ==================== 后台任务方法 ====================
 
     @classmethod
-    async def trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+    async def trigger_coding_phase(
+        cls,
+        pipeline_id: int,
+        session: AsyncSession,
+        error_context: Optional[str] = None
+    ) -> Dict[str, Any]:
         """公开方法：触发 CODING 阶段（供后台任务调用）"""
-        return await cls._trigger_coding_phase(pipeline_id, session)
+        return await cls._trigger_coding_phase(pipeline_id, session, error_context)
 
     @classmethod
     async def mark_pipeline_failed(cls, pipeline_id: int, error: str, session: AsyncSession) -> None:

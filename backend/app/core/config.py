@@ -1,146 +1,138 @@
 """
-应用配置
+OmniFlowAI 核心配置模块
+
+遵循 '以状态管理为荣' 原则，所有可配置项集中管理。
 """
-
-from typing import List
 from pathlib import Path
-
 from pydantic_settings import BaseSettings
+from typing import Optional, List
 
 
-def get_project_root() -> Path:
-    """
-    获取项目根目录
-
-    从当前文件位置推算项目根目录 (backend/app/core/config.py -> 项目根目录)
-
-    Returns:
-        Path: 项目根目录路径
-    """
-    return Path(__file__).parent.parent.parent.parent
-
-
-def get_workspace_path(subdir: str = "frontend") -> Path:
-    """
-    获取工作目录路径
-
-    Args:
-        subdir: 子目录名，默认为 "frontend"
-
-    Returns:
-        Path: 工作目录路径
-    """
-    return get_project_root() / subdir
-
-
-def process_file_path(file_path: str) -> str:
-    """
-    处理文件路径 - 统一转换为正斜杠格式
-
-    Args:
-        file_path: 原始文件路径
-
-    Returns:
-        str: 处理后的路径
-    """
-    return file_path.replace('\\', '/')
-
-
-class Settings(BaseSettings):
+class Config(BaseSettings):
     """应用配置类"""
-    
-    # 应用信息
+
+    # 应用基础配置
     APP_NAME: str = "OmniFlowAI"
-    VERSION: str = "0.1.0"
+    APP_VERSION: str = "0.1.0"
+    DEBUG: bool = False
     ENV: str = "development"
-    DEBUG: bool = False  # 默认 INFO 级别，减少日志噪音
-    
+
     # 服务器配置
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    
+
     # CORS 配置
     CORS_ORIGINS: List[str] = ["*"]
-    
-    # 数据库配置 - 开发环境使用 SQLite
-    DATABASE_URL: str = f"sqlite+aiosqlite:///{Path(__file__).parent.parent.parent}/omniflowai.db"
-    
+
+    # 数据库配置
+    DATABASE_URL: str = "sqlite:///./omniflow.db"
+
+    # API 版本
+    API_V1_PREFIX: str = "/api/v1"
+
+    # 沙箱测试功能开关（默认启用）
+    SANDBOX_TEST_ENABLED: bool = True
+
     # ============================================
-    # 模型供应商配置
+    # AI 模型配置
     # ============================================
-    
+
     # 模型选择开关
-    # true: 使用 ModelScope (魔搭)
-    # false: 使用 OpenAI
     USE_MODELSCOPE: bool = True
-    
+
     # ModelScope (魔搭) 配置
-    MODELSCOPE_API_KEY: str = ""
+    MODELSCOPE_API_KEY: Optional[str] = None
     MODELSCOPE_API_BASE: str = "https://api-inference.modelscope.cn/v1"
-    
+    DEFAULT_MODEL: str = "Qwen/Qwen2.5-72B-Instruct"
+
     # OpenAI 配置
-    OPENAI_API_KEY: str = ""
+    OPENAI_API_KEY: Optional[str] = None
     OPENAI_API_BASE: str = "https://api.openai.com/v1"
-    
-    # 默认模型 (ModelScope 模型名需要加 openai/ 前缀)
-    DEFAULT_MODEL: str = "openai/Qwen/Qwen2.5-72B-Instruct"
-    
-    # 兼容旧版环境变量名
-    DEFAULT_LLM_MODEL: str = ""
-    
+
     # ============================================
-    # AI 目标项目配置（平台与目标项目解耦）
+    # 计算属性
     # ============================================
-    
-    # AI 操作的目标项目路径（workspace 目录下）
-    # 例如: workspace/feishutemp
-    TARGET_PROJECT_PATH: str = ""
-    
-    # GitHub 配置（用于远程推送）
-    GITHUB_TOKEN: str = ""
-    GITHUB_OWNER: str = ""
-    GITHUB_REPO: str = ""
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-    
+
     @property
-    def llm_api_key(self) -> str:
-        """
-        获取当前使用的 LLM API Key
-        
-        Returns:
-            str: API Key
-        """
+    def llm_api_key(self) -> Optional[str]:
+        """根据 USE_MODELSCOPE 返回对应的 API Key"""
         if self.USE_MODELSCOPE:
             return self.MODELSCOPE_API_KEY
         return self.OPENAI_API_KEY
-    
+
     @property
     def llm_api_base(self) -> str:
-        """
-        获取当前使用的 LLM API Base URL
-        
-        Returns:
-            str: API Base URL
-        """
+        """根据 USE_MODELSCOPE 返回对应的 API Base"""
         if self.USE_MODELSCOPE:
             return self.MODELSCOPE_API_BASE
         return self.OPENAI_API_BASE
-    
+
     @property
     def llm_model(self) -> str:
-        """
-        获取当前使用的 LLM 模型名
-        
-        Returns:
-            str: 模型名
-        """
-        # 优先使用 DEFAULT_LLM_MODEL（兼容旧版环境变量）
-        if self.DEFAULT_LLM_MODEL:
-            return self.DEFAULT_LLM_MODEL
+        """返回使用的模型名称"""
         return self.DEFAULT_MODEL
 
+    # ============================================
+    # AI 目标项目配置
+    # ============================================
 
-settings = Settings()
+    # AI 操作的目标项目路径（必须使用绝对路径）
+    TARGET_PROJECT_PATH: str = ""
+
+    # ============================================
+    # GitHub 集成配置
+    # ============================================
+
+    GITHUB_TOKEN: Optional[str] = None
+    GITHUB_OWNER: Optional[str] = None
+    GITHUB_REPO: Optional[str] = None
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+        extra = "ignore"  # 忽略未定义的字段
+
+
+# 全局配置实例
+settings = Config()
+
+
+# ============================================
+# 路径处理工具函数
+# ============================================
+
+def get_workspace_path(subdir: str = "") -> Path:
+    """
+    获取工作区路径
+
+    Args:
+        subdir: 子目录名（如 "frontend", "backend"）
+
+    Returns:
+        Path: 工作区绝对路径
+    """
+    base_path = Path(settings.TARGET_PROJECT_PATH)
+    if subdir:
+        return base_path / subdir
+    return base_path
+
+
+def process_file_path(file_path: str) -> Path:
+    """
+    处理文件路径，转换为绝对路径
+
+    Args:
+        file_path: 原始文件路径（可能是相对路径）
+
+    Returns:
+        Path: 处理后的绝对路径
+    """
+    path = Path(file_path)
+
+    # 如果已经是绝对路径，直接返回
+    if path.is_absolute():
+        return path
+
+    # 如果是相对路径，基于 TARGET_PROJECT_PATH 解析
+    base_path = Path(settings.TARGET_PROJECT_PATH)
+    return base_path / path

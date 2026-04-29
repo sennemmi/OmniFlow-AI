@@ -23,11 +23,26 @@ class BaseAgentOutput(BaseModel):
 
 
 class FileChange(BaseModel):
-    """文件变更模型"""
+    """
+    文件变更模型 - Line-Number Based Patching Protocol
+
+    采用 Claude Code 风格的行号坐标系统，避免 JSON 字段内大量换行和转义符导致的解析失败。
+    """
     file_path: str = Field(description="文件相对路径")
-    content: str = Field(description="完整的文件内容")
-    change_type: str = Field(default="modify", description="变更类型: add/modify/delete")
-    description: str = Field(default="", description="变更说明")
+    change_type: str = Field(description="变更类型: add | modify | delete")
+
+    # 局部修改的核心字段（行号坐标系统）
+    start_line: Optional[int] = Field(None, description="起始行号(1-based, 包含)")
+    end_line: Optional[int] = Field(None, description="结束行号(1-based, 包含)")
+    replace_block: Optional[str] = Field(None, description="新代码块，将替换 start_line 到 end_line 的所有行")
+
+    # 仅用于新建文件 (change_type="add")
+    content: Optional[str] = Field(None, description="完整文件内容（仅 add 时使用）")
+
+    # 可选：用于验证的原始代码片段（帮助检测行号漂移）
+    expected_original: Optional[str] = Field(None, description="预期被替换的原始代码片段（用于验证）")
+
+    description: str = Field("", description="改动说明")
 
 
 class TestFile(BaseModel):

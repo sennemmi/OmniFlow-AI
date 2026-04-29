@@ -1,95 +1,134 @@
-import asyncio
-import sys
+"""
+Pytest 配置文件
+
+提供测试共享的 fixtures 和配置
+"""
+
 import os
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlmodel import SQLModel
+import asyncio
+from typing import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
 
-# 确保 backend 目录在路径中
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# 确保测试环境有基本的配置
+os.environ.setdefault("USE_MODELSCOPE", "true")
+os.environ.setdefault("DEFAULT_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+os.environ.setdefault("TARGET_PROJECT_PATH", "/tmp/test_project")
 
-# ─── 数据库 Fixture：SQLite 内存数据库 ───────────────────────────────────────
 
-@pytest_asyncio.fixture
-async def db_session():
+@pytest.fixture(scope="session", autouse=True)
+def setup_test_env():
     """
-    使用 SQLite 内存数据库创建真实的数据库 session
-    每个测试运行在独立环境，自动建表和销毁
+    确保测试环境配置正确加载
+
+    在导入任何使用配置的模块之前设置环境变量
     """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-
-    # 创建所有表
-    async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
-
-    # 创建 session
-    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with async_session() as session:
-        yield session
-
-    # 清理
-    await engine.dispose()
+    # 强制重新加载配置模块，确保环境变量生效
+    import importlib
+    from app.core import config
+    importlib.reload(config)
+    yield
 
 
-@pytest.fixture
-def override_get_session(db_session):
-    """用于 FastAPI 依赖注入的 Override"""
-    async def _get_db():
-        yield db_session
-    return _get_db
-
-
-# ─── 全局 Fixture：Mock 掉所有外部依赖 ───────────────────────────────────────
-
-@pytest.fixture
-def mock_llm_response():
-    """mock Claude API 响应，避免真实调用"""
-    return {
-        "success": True,
-        "output": {
-            "files": [
-                {"file_path": "app/service/example.py", "content": "def hello(): return 'world'", "change_type": "add"}
-            ],
-            "summary": "mock output",
-            "dependencies_added": []
-        }
-    }
+@pytest.fixture(scope="session")
+def event_loop():
+    """创建会话级别的事件循环"""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
 
 @pytest.fixture
-def mock_db_session_mock():
-    """mock 数据库 session，避免真实 DB 连接（用于不需要真实 DB 的测试）"""
-    session = AsyncMock()
-    session.execute = AsyncMock()
-    session.flush = AsyncMock()
-    session.commit = AsyncMock()
-    session.rollback = AsyncMock()
-    session.add = MagicMock()
-    return session
+def mock_db_session():
+    """提供模拟的数据库会话"""
+    return MagicMock()
 
 
 @pytest.fixture
-def mock_git_service():
-    """mock Git 操作"""
-    git = MagicMock()
-    git.create_branch = MagicMock()
-    git.add_files = MagicMock()
-    git.has_changes = MagicMock(return_value=True)
-    git.commit_changes = MagicMock()
-    git.get_last_commit_hash = MagicMock(return_value="abc123")
-    git.push_branch = MagicMock(return_value=MagicMock(success=True))
-    return git
+def mock_pipeline():
+    """提供模拟的 Pipeline 对象"""
+    from app.models.pipeline import Pipeline, PipelineStatus, StageName
+
+    pipeline = MagicMock(spec=Pipeline)
+    pipeline.id = 1
+    pipeline.status = PipelineStatus.RUNNING
+    pipeline.current_stage = StageName.CODING
+    pipeline.description = "Test pipeline"
+    return pipeline
 
 
-# ─── VCR Fixture：用于录制/回放 LLM 响应 ───────────────────────────────────────
+@pytest.fixture
+def mock_pipeline_stage():
+    """提供模拟的 PipelineStage 对象"""
+    from app.models.pipeline import PipelineStage, StageStatus, StageName
 
-@pytest.fixture(scope="module")
-def vcr_config():
-    """VCR 配置"""
-    return {
-        "filter_headers": [("authorization", "DUMMY")],
-        "filter_query_parameters": [("api_key", "DUMMY")],
-    }
+    stage = MagicMock(spec=PipelineStage)
+    stage.id = 1
+    stage.pipeline_id = 1
+    stage.name = StageName.CODING
+    stage.status = StageStatus.PENDING
+    stage.input_data = {}
+    stage.output_data = {}
+    return stage
+
+
+@pytest.fixture
+def sample_python_code():
+    """提供示例 Python 代码用于测试"""
+    return '''
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+class Calculator:
+    """Simple calculator class."""
+
+    def multiply(self, x: float, y: float) -> float:
+        return x * y
+
+    def divide(self, x: float, y: float) -> float:
+        if y == 0:
+            raise ValueError("Cannot divide by zero")
+        return x / y
+'''
+
+
+@pytest.fixture
+def sample_react_code():
+    """提供示例 React/TypeScript 代码用于测试"""
+    return '''
+import React, { useState } from 'react';
+
+interface CounterProps {
+  initialValue?: number;
+}
+
+export const Counter: React.FC<CounterProps> = ({ initialValue = 0 }) => {
+  const [count, setCount] = useState(initialValue);
+
+  const increment = () => setCount(c => c + 1);
+  const decrement = () => setCount(c => c - 1);
+
+  return (
+    <div className="counter">
+      <button onClick={decrement}>-</button>
+      <span>{count}</span>
+      <button onClick={increment}>+</button>
+    </div>
+  );
+};
+'''
+
+
+@pytest.fixture
+def temp_project_dir(tmp_path):
+    """提供临时项目目录"""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    # 创建标准目录结构
+    (project_dir / "backend" / "app").mkdir(parents=True)
+    (project_dir / "backend" / "tests" / "unit").mkdir(parents=True)
+    (project_dir / "backend" / "tests" / "ai_generated").mkdir(parents=True)
+
+    return project_dir

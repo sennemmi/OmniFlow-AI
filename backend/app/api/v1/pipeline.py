@@ -948,3 +948,82 @@ async def stream_pipeline_logs(
             "Connection": "keep-alive",
         }
     )
+
+
+class TestDecisionRequest(BaseModel):
+    """用户对测试冲突做决策的请求模型"""
+    choice: str = Field(..., description="update_tests 或 rollback")
+
+
+@router.post(
+    "/pipeline/{pipeline_id}/test-decision",
+    response_model=ResponseModel,
+    summary="用户对测试冲突做决策",
+)
+async def handle_test_decision(
+    pipeline_id: int,
+    body: TestDecisionRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    当新代码导致旧测试失败时，用户选择更新测试或回滚代码
+    """
+    request_id = getattr(request.state, "request_id", None)
+    choice = body.choice
+
+    if choice not in ("update_tests", "rollback"):
+        return error_response("choice 必须为 update_tests 或 rollback", request_id)
+
+    if choice == "rollback":
+        # 直接回滚：调 git provider revert，标记 pipeline FAILED
+        from app.service.git_provider_gitpython import GitProviderGitPython
+        from app.service.pipeline_refactored import PipelineService as RefactoredPipelineService
+        from app.core.config import settings
+        from pathlib import Path
+
+        git = GitProviderGitPython(Path(settings.TARGET_PROJECT_PATH))
+        await asyncio.to_thread(git.revert_last_commit)   # 视 git_provider 实现而定
+        await RefactoredPipelineService.mark_pipeline_failed(
+            pipeline_id, "用户选择回滚", session
+        )
+        await push_log(pipeline_id, "info", "✅ 代码已回滚", stage="CODING")
+        return success_response(
+            {"rolled_back": True}, request_id=request_id
+        )
+
+    # choice == "update_tests"：
+    # 后台重新触发 CODING，但在 error_context 中注明"允许更新旧测试"
+    # 需要先获取 regression_failed_tests
+    from sqlmodel import select
+    from app.models.pipeline import PipelineStage, StageName
+
+    stmt = select(PipelineStage).where(
+        PipelineStage.pipeline_id == pipeline_id,
+        PipelineStage.name == StageName.CODING
+    )
+    result = await session.execute(stmt)
+    coding_stage = result.scalar_one_or_none()
+
+    regression_failed_tests = []
+    if coding_stage and coding_stage.output_data:
+        regression_failed_tests = coding_stage.output_data.get("regression_failed_tests", [])
+
+    # 构造 error_context，告知 CoderAgent 允许修改测试
+    error_context = (
+        "【用户已授权】允许修改 backend/tests/unit/ 下与本次变更冲突的测试文件。\n"
+        f"以下测试已失败，需要适配新代码：\n"
+        + "\n".join(f"  - {t}" for t in regression_failed_tests)
+    )
+
+    async def run_update_tests_task(pid: int, ctx: str):
+        from app.core.database import async_session_factory
+        async with async_session_factory() as s:
+            from app.service.pipeline_refactored import PipelineService as RefactoredPipelineService
+            await RefactoredPipelineService.trigger_coding_phase(pid, s, error_context=ctx)
+
+    background_tasks.add_task(run_update_tests_task, pipeline_id, error_context)
+    await push_log(pipeline_id, "info",
+                   "🔄 重新生成代码（允许更新旧测试）", stage="CODING")
+    return success_response({"restarted": True}, request_id=request_id)

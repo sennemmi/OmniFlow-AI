@@ -22,7 +22,8 @@ class StageContext:
     stage_id: Optional[int] = None
     previous_output: Optional[Dict[str, Any]] = None
     rejection_feedback: Optional[Dict[str, Any]] = None
-    
+    error_context: Optional[str] = None  # 用于传递错误上下文（如允许修改测试的授权）
+
     def get(self, key: str, default: Any = None) -> Any:
         """从 input_data 获取值"""
         return self.input_data.get(key, default)

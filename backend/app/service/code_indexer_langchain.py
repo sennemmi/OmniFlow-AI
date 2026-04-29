@@ -93,10 +93,12 @@ class LangChainCodeIndexer:
     def _create_embeddings(self):
         """创建嵌入模型"""
         # 使用 OpenAI 嵌入（可通过 litellm 路由）
+        # 安全访问配置
+        use_modelscope = getattr(settings, 'USE_MODELSCOPE', True)
         return OpenAIEmbeddings(
             model="text-embedding-3-small",
             openai_api_key=settings.llm_api_key,
-            openai_api_base=settings.llm_api_base if not settings.USE_MODELSCOPE else None
+            openai_api_base=settings.llm_api_base if not use_modelscope else None
         )
     
     def _get_loader_kwargs(self) -> Dict[str, Any]:
@@ -443,13 +445,13 @@ class LangChainCodeIndexer:
 _indexer_cache: Dict[str, LangChainCodeIndexer] = {}
 
 
-def get_langchain_indexer(
+async def get_langchain_indexer(
     project_path: str,
     include_tests: bool = False,
     use_langchain: bool = True
 ) -> Any:
     """
-    获取索引服务实例
+    获取索引服务实例（线程安全）
     
     Args:
         project_path: 项目路径
@@ -462,15 +464,18 @@ def get_langchain_indexer(
     if not use_langchain or not LANGCHAIN_AVAILABLE:
         # 回退到旧版
         from app.service.code_indexer import get_indexer
-        return get_indexer(project_path, include_tests)
+        return await get_indexer(project_path, include_tests)
     
-    cache_key = f"langchain:{project_path}:{include_tests}"
-    if cache_key not in _indexer_cache:
-        _indexer_cache[cache_key] = LangChainCodeIndexer(
-            project_path,
-            include_tests=include_tests
-        )
-    return _indexer_cache[cache_key]
+    # 使用锁保护缓存操作
+    from app.service.code_indexer import _global_lock
+    async with _global_lock:
+        cache_key = f"langchain:{project_path}:{include_tests}"
+        if cache_key not in _indexer_cache:
+            _indexer_cache[cache_key] = LangChainCodeIndexer(
+                project_path,
+                include_tests=include_tests
+            )
+        return _indexer_cache[cache_key]
 
 
 def clear_langchain_indexer_cache():
