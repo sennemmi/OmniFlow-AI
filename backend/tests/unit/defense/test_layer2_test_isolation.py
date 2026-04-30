@@ -91,9 +91,12 @@ class TestTemporaryFileCleanup:
 
             # 多次修改，产生多个备份
             for i in range(5):
+                # 【Read Token 机制】每次写入前重新读取获取 token
+                read_result = executor.read_file("test.py")
                 change = executor.apply_file_change(
                     relative_path="test.py",
-                    new_content=f"# Version {i}\n"
+                    new_content=f"# Version {i}\n",
+                    read_token=read_result.read_token
                 )
                 assert change.backup_path is not None
 

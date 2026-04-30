@@ -7,7 +7,7 @@ import path from 'path'
 // OmniFlowAI 悬浮对话框注入插件
 const omniFlowOverlayPlugin = () => ({
   name: 'omniflow-overlay',
-  transformIndexHtml(html) {
+  transformIndexHtml(html: string) {
     // 在 body 末尾注入 injector.js 脚本
     return html.replace(
       '</body>',
@@ -41,6 +41,7 @@ export default defineConfig(({ mode }) => {
         '@stores': path.resolve(__dirname, './src/stores'),
         '@utils': path.resolve(__dirname, './src/utils'),
         '@types': path.resolve(__dirname, './src/types'),
+        '@injector': path.resolve(__dirname, './src/injector'),
       },
     },
     server: {
@@ -56,6 +57,21 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: 'dist',
       sourcemap: true,
+      rollupOptions: {
+        input: {
+          main: path.resolve(__dirname, 'index.html'),
+          injector: path.resolve(__dirname, 'src/injector/index.ts'),
+        },
+        output: {
+          entryFileNames: (chunkInfo) => {
+            if (chunkInfo.name === 'injector') {
+              return 'omni-injector.iife.js'
+            }
+            return 'assets/[name]-[hash].js'
+          },
+          format: 'iife',
+        },
+      },
     },
     // 开发模式下定义全局变量
     define: isDev ? {

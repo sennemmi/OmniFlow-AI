@@ -31,7 +31,7 @@ rich==13.9.4
 
 # Testing
 pytest==8.3.3
-pytest-asyncio==0.24.0
+pytest-asyncio==0.23.8
 
 # 注意：chromadb 和 sentence-transformers 需要 torch，在沙箱中按需安装
 # 如果需要 RAG 功能，可以在运行时单独安装

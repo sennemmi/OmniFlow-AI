@@ -145,13 +145,12 @@ Layer 4 - 健康检查（服务启动验证）：
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
         """
         构建用户 Prompt
-        
+
         Args:
-            state: 包含 design_output, code_output, target_files 的状态
+            state: 包含 design_output, code_output 的状态
         """
         design_output = state.get("design_output", {})
         code_output = state.get("code_output", {})
-        target_files = state.get("target_files", {})
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
 
         # ── 骨架模式 ──────────────────────────────────────────────────────
@@ -169,10 +168,6 @@ Layer 4 - 健康检查（服务启动验证）：
             skeleton_output = state.get("skeleton_output", {})
             skeleton_str = json.dumps(skeleton_output, indent=2, ensure_ascii=False)
             code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
-            files_content = "\n\n".join(
-                f"【文件: {p}】\n```python\n{c}\n```"
-                for p, c in target_files.items()
-            )
             return f"""【任务】将以下测试骨架的 TODO 替换为真实断言。
 
 【测试骨架（待填充）】
@@ -181,25 +176,25 @@ Layer 4 - 健康检查（服务启动验证）：
 【CoderAgent 生成的代码】
 {code_str}
 
-【目标文件当前内容】
-{files_content}
+【重要 - 使用工具读取目标文件】
+在填充断言前，请使用以下工具读取目标文件的最新内容：
+1. glob("app/**/*.py") - 发现相关文件
+2. read_file("app/xxx.py", 1, 50) - 读取文件内容
 
 请输出完整的测试文件（JSON 格式），不要保留任何 TODO 占位。"""
 
         # ── 原有完整模式（兜底）─────────────────────────────────────────
         code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
-        files_content = "\n\n".join(
-            f"【文件: {p}】\n```python\n{c}\n```"
-            for p, c in target_files.items()
-        )
         return f"""【技术设计方案】
 {design_str}
 
 【CoderAgent 生成的代码】
 {code_str}
 
-【目标文件当前内容】
-{files_content}
+【重要 - 使用工具读取目标文件】
+在编写测试前，请使用以下工具读取目标文件的最新内容：
+1. glob("app/**/*.py") - 发现相关文件
+2. read_file("app/xxx.py", 1, 50) - 读取文件内容
 
 请根据技术设计方案和生成的代码，编写完整的单元测试。
 注意：
@@ -248,12 +243,13 @@ Layer 4 - 健康检查（服务启动验证）：
         self,
         skeleton_output: Dict[str, Any],
         code_output: Dict[str, Any],
-        target_files: Dict[str, str],
         pipeline_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         第二阶段：拿到 CoderAgent 的代码后，填充骨架里的 TODO 断言。
         串行执行（必须等 CoderAgent 完成）。
+
+        【改造】不再传入 target_files，使用工具按需读取文件
         """
         from app.core.sse_log_buffer import push_log
         if pipeline_id:
@@ -262,7 +258,6 @@ Layer 4 - 健康检查（服务启动验证）：
         initial_state = {
             "design_output": {},
             "code_output": code_output,
-            "target_files": target_files,
             "skeleton_output": skeleton_output,  # 传入骨架
             "fill_mode": True,
         }
@@ -277,23 +272,23 @@ Layer 4 - 健康检查（服务启动验证）：
         self,
         design_output: Dict[str, Any],
         code_output: Dict[str, Any],
-        target_files: Dict[str, str],
         pipeline_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         根据设计方案和生成的代码生成测试
 
+        【改造】TestAgent 现在使用工具按需读取文件，不再依赖预加载的 target_files
+
         Args:
             design_output: DesignerAgent 的输出内容
             code_output: CoderAgent 的输出内容
-            target_files: 目标文件路径到内容的映射
             pipeline_id: Pipeline ID，用于日志记录
 
         Returns:
             Dict: 包含生成结果或错误信息
         """
         from app.core.sse_log_buffer import push_log
-        
+
         code_files_count = len(code_output.get("files", [])) if isinstance(code_output, dict) else 0
         logger.info(f"TesterAgent 开始生成测试", extra={
             "pipeline_id": pipeline_id,
@@ -302,19 +297,18 @@ Layer 4 - 健康检查（服务启动验证）：
 
         if pipeline_id:
             await push_log(pipeline_id, "info", f"TesterAgent 开始生成测试代码...", stage="TESTING")
-        
+
         initial_state = {
             "design_output": design_output,
-            "code_output": code_output,
-            "target_files": target_files
+            "code_output": code_output
         }
-        
+
         result = await self.execute(
             pipeline_id=pipeline_id or 0,
             stage_name="TESTING",
             initial_state=initial_state
         )
-        
+
         if result.get("success"):
             test_files = result.get("output", {}).get("test_files", [])
             logger.info(f"TesterAgent 测试生成完成", extra={
@@ -330,7 +324,7 @@ Layer 4 - 健康检查（服务启动验证）：
             })
             if pipeline_id:
                 await push_log(pipeline_id, "error", f"测试生成失败: {result.get('error', '')}", stage="TESTING")
-        
+
         return result
 
 

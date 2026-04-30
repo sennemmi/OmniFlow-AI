@@ -36,10 +36,13 @@ from app.service.code_executor import CodeExecutorService
 from app.service.code_indexer import CodeIndexerService
 from app.agents.reviewer import ReviewAgent, ReviewDecision
 from app.agents.coder import CoderAgent
+from app.agents.repairer import RepairerAgent
+from app.agents.verify_agent import VerifyAgent, verify_fixes
 from app.agents.tester import TesterAgent
 from app.agents.architect import ArchitectAgent
 from app.agents.designer import DesignerAgent
 from app.agents.schemas import CoderOutput, TesterOutput, ArchitectOutput, DesignerOutput
+from app.core.resilience import RetryExecutor, ResilienceManager, RetryConfig, CircuitBreakerOpenError
 
 
 @dataclass
@@ -67,43 +70,11 @@ class DockerSandboxTester:
         self.backend_dir = Path(__file__).parent.parent
         self.project_root = self.backend_dir.parent
         self.code_indexer: Optional[CodeIndexerService] = None
-
-    def _flexible_search_replace(self, original_text: str, search_block: str, replace_block: str) -> Optional[str]:
-        """多级模糊匹配替换算法 (Aider 简化版)"""
-        if not search_block:
-            return original_text
-
-        # 【第1层】精确匹配
-        if search_block in original_text:
-            return original_text.replace(search_block, replace_block)
-
-        # 【第2层】换行符归一化 (解决 \r\n vs \n)
-        orig_norm = original_text.replace('\r\n', '\n')
-        search_norm = search_block.replace('\r\n', '\n')
-        replace_norm = replace_block.replace('\r\n', '\n')
-        if search_norm in orig_norm:
-            return orig_norm.replace(search_norm, replace_norm)
-
-        # 【第3层】行级别的宽松匹配 (忽略每行首尾多余空格，忽略完全空白的行)
-        def clean_lines(text: str) -> list:
-            return [line.strip() for line in text.splitlines() if line.strip()]
-
-        orig_lines_clean = clean_lines(orig_norm)
-        search_lines_clean = clean_lines(search_norm)
-
-        # 在清洗后的原文件中滑动窗口找匹配
-        search_len = len(search_lines_clean)
-        if search_len > 0:
-            for i in range(len(orig_lines_clean) - search_len + 1):
-                window = orig_lines_clean[i : i + search_len]
-                if window == search_lines_clean:
-                    # 在这里，我们确认逻辑上是匹配的
-                    # 为了安全替换，我们退回到使用正则进行忽略空白的替换
-                    pattern = r'\s*'.join(re.escape(line) for line in search_lines_clean)
-                    # 将正则匹配到的原代码块，替换为 AI 提供的新代码块
-                    return re.sub(pattern, replace_norm, orig_norm, count=1, flags=re.DOTALL)
-
-        return None  # 彻底找不到
+        # 【智能重试】初始化重试执行器
+        self._sandbox_retry_executor = ResilienceManager.get_executor(
+            name="e2e_sandbox",
+            **RetryConfig.TEST_RUN
+        )
 
     async def init_code_rag(self):
         """初始化 CodeRAG (代码语义索引)"""
@@ -221,228 +192,11 @@ class DockerSandboxTester:
         except Exception:
             return False
 
-    def extract_imports_from_content(self, content: str) -> Set[str]:
-        """
-        使用 AST 分析代码内容，提取所有 import 语句
-        
-        Returns:
-            Set[str]: 导入的模块名集合
-        """
-        imports = set()
-        try:
-            tree = ast.parse(content)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        imports.add(alias.name.split('.')[0])
-                elif isinstance(node, ast.ImportFrom):
-                    if node.module:
-                        imports.add(node.module.split('.')[0])
-        except SyntaxError:
-            pass
-        return imports
-
-    def find_file_by_module(self, module_name: str) -> Optional[str]:
-        """
-        根据模块名查找对应的文件路径
-        
-        例如: 'app.core.database' -> 'backend/app/core/database.py'
-        """
-        # 将模块名转换为文件路径
-        parts = module_name.split('.')
-        
-        # 尝试不同的路径组合
-        possible_paths = [
-            self.backend_dir / Path(*parts) / "__init__.py",
-            self.backend_dir / Path(*parts).with_suffix('.py'),
-        ]
-        
-        for path in possible_paths:
-            if path.exists():
-                rel_path = path.relative_to(self.backend_dir)
-                return f"backend/{rel_path}"
-        
-        return None
-
-    def analyze_dependencies(self, file_content: str, file_path: str) -> List[str]:
-        """
-        分析文件的依赖关系，返回需要一起发送的相关文件列表
-        
-        Args:
-            file_content: 文件内容
-            file_path: 文件路径
-            
-        Returns:
-            List[str]: 相关文件路径列表
-        """
-        imports = self.extract_imports_from_content(file_content)
-        related_files = []
-        
-        # 项目特定的 import 映射
-        project_imports = {
-            'app': ['backend/app/main.py', 'backend/app/__init__.py'],
-            'main': ['backend/app/main.py'],
-            'database': ['backend/app/core/database.py'],
-            'config': ['backend/app/core/config.py'],
-            'models': ['backend/app/models/__init__.py'],
-            'service': ['backend/app/service/__init__.py'],
-            'api': ['backend/app/api/__init__.py', 'backend/app/api/v1/__init__.py'],
-        }
-        
-        for imp in imports:
-            if imp in project_imports:
-                related_files.extend(project_imports[imp])
-        
-        # 去重并过滤掉自己
-        related_files = list(set([f for f in related_files if f != file_path]))
-        
-        return related_files
-
-    async def get_target_files_with_rag(self, design_output: Dict[str, Any], requirement: str) -> Dict[str, str]:
-        """
-        使用 CodeRAG (语义检索) 智能获取目标文件
-        
-        结合:
-        1. DesignerAgent 输出的 affected_files
-        2. CodeRAG 语义搜索相关代码
-        3. AST 分析文件依赖
-        
-        Args:
-            design_output: DesignerAgent 的输出
-            requirement: 原始需求描述
-            
-        Returns:
-            Dict[str, str]: 文件路径 -> 文件内容的映射
-        """
-        target_files = {}
-        code_executor = CodeExecutorService(str(self.backend_dir))
-        
-        # 1. 从 DesignerAgent 输出获取文件
-        affected_files = design_output.get("affected_files", [])
-        function_changes = design_output.get("function_changes", [])
-        
-        all_files_to_read = set()
-        
-        # 添加 affected_files
-        for file_path in affected_files:
-            all_files_to_read.add(file_path)
-        
-        # 添加 function_changes 中的文件
-        for change in function_changes:
-            file_path = change.get("file", "")
-            if file_path:
-                all_files_to_read.add(file_path)
-        
-        # 2. 使用 CodeRAG 搜索相关代码
-        if not all_files_to_read:
-            # 如果没有指定文件，使用 CodeRAG 根据需求搜索
-            print(f"   🔍 CodeRAG 根据需求搜索相关代码...")
-            rag_files = await self.search_related_code(requirement, top_k=10)
-            for file_path, content in rag_files.items():
-                # 转换为 backend/ 前缀的路径
-                if not file_path.startswith("backend/"):
-                    file_path = f"backend/{file_path}"
-                all_files_to_read.add(file_path)
-                target_files[file_path] = content  # 直接使用 CodeRAG 读取的内容
-        
-        # 3. 使用 AST 分析依赖关系
-        print(f"   🔍 AST 分析文件依赖...")
-        for file_path in list(all_files_to_read):
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-            content = code_executor.get_file_content(clean_path)
-            
-            if content and file_path not in target_files:
-                target_files[file_path] = content
-                
-                # 分析依赖
-                dependencies = self.analyze_dependencies(content, file_path)
-                for dep in dependencies:
-                    if dep not in target_files:
-                        all_files_to_read.add(dep)
-        
-        # 4. 读取所有收集到的文件
-        print(f"   📂 读取 {len(all_files_to_read)} 个文件（含依赖）...")
-        for file_path in sorted(all_files_to_read):
-            if file_path in target_files:
-                continue
-                
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-            content = code_executor.get_file_content(clean_path)
-            if content:
-                target_files[file_path] = content
-                print(f"      ✓ 读取: {file_path}")
-            else:
-                # 文件不存在，标记为新文件
-                target_files[file_path] = "# 新文件"
-                print(f"      ✓ 新文件: {file_path}")
-
-        print(f"   📊 共加载 {len(target_files)} 个目标文件")
-        return target_files
-
-    def get_target_files_from_design(self, design_output: Dict[str, Any], default_files: List[str] = None) -> Dict[str, str]:
-        """
-        根据 DesignerAgent 的输出获取目标文件内容（兼容旧版本）
-        复用真实流程中的 CodeExecutorService
-        使用 AST 分析自动发现依赖文件
-        
-        Args:
-            design_output: DesignerAgent 的输出
-            default_files: 如果 design_output 中没有 affected_files，使用默认文件列表
-        """
-        target_files = {}
-        code_executor = CodeExecutorService(str(self.backend_dir))
-
-        # 1. 从 affected_files 获取文件
-        affected_files = design_output.get("affected_files", [])
-        
-        # 如果没有 affected_files 且提供了默认值，使用默认值
-        if not affected_files and default_files:
-            affected_files = default_files
-            print(f"   📂 使用默认文件列表: {default_files}")
-        
-        # 2. 收集所有需要读取的文件（包括依赖）
-        all_files_to_read = set()
-        
-        for file_path in affected_files:
-            all_files_to_read.add(file_path)
-            
-            # 读取文件内容并分析依赖
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-            content = code_executor.get_file_content(clean_path)
-            
-            if content:
-                # 使用 AST 分析依赖
-                dependencies = self.analyze_dependencies(content, file_path)
-                for dep in dependencies:
-                    all_files_to_read.add(dep)
-        
-        # 3. 从 function_changes 获取文件
-        function_changes = design_output.get("function_changes", [])
-        if function_changes:
-            print(f"   📂 从 function_changes 读取文件...")
-            for change in function_changes:
-                file_path = change.get("file", "")
-                if file_path:
-                    all_files_to_read.add(file_path)
-        
-        # 4. 读取所有文件
-        print(f"   📂 读取 {len(all_files_to_read)} 个文件（含依赖）...")
-        for file_path in sorted(all_files_to_read):
-            if file_path in target_files:
-                continue
-                
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-            content = code_executor.get_file_content(clean_path)
-            if content:
-                target_files[file_path] = content
-                print(f"      ✓ 读取: {file_path}")
-            else:
-                # 文件不存在，标记为新文件
-                target_files[file_path] = "# 新文件"
-                print(f"      ✓ 新文件: {file_path}")
-
-        print(f"   📊 共加载 {len(target_files)} 个目标文件")
-        return target_files
+    # 注意：以下方法已迁移到后端，测试脚本直接复用
+    # - extract_imports_from_content -> CodeExecutorService.extract_imports_from_content
+    # - find_file_by_module -> CodeExecutorService.find_file_by_module
+    # - analyze_dependencies -> CodeExecutorService.analyze_dependencies
+    # 【新架构】CoderAgent 通过工具主动获取文件，不再需要预加载 target_files
 
     def _build_file_tree(self, max_depth: int = 4) -> Dict[str, Any]:
         """
@@ -518,40 +272,17 @@ class DockerSandboxTester:
     def get_related_test_files(self, affected_files: List[str]) -> Dict[str, str]:
         """
         获取相关的测试文件作为参考
-        复用真实流程中的逻辑
+        复用后端 CodeExecutorService.get_related_test_files
         """
-        test_files = {}
         code_executor = CodeExecutorService(str(self.backend_dir))
-
         print(f"   📂 查找相关测试文件...")
-        for file_path in affected_files:
-            # 提取模块名
-            path_parts = file_path.split('/')
-            if len(path_parts) < 2:
-                continue
-
-            file_name = path_parts[-1]  # calculator.py
-            module_name = file_name.replace('.py', '')  # calculator
-
-            # 构建可能的测试文件路径
-            possible_test_paths = [
-                f"tests/unit/test_{module_name}.py",
-                f"tests/unit/test_{module_name}_api.py",
-                f"tests/test_{module_name}.py",
-            ]
-
-            for test_path in possible_test_paths:
-                content = code_executor.get_file_content(test_path)
-                if content:
-                    full_path = f"backend/{test_path}"
-                    test_files[full_path] = content
-                    print(f"      ✓ 找到测试文件: {full_path}")
-                    break
-
+        test_files = code_executor.get_related_test_files(affected_files)
+        for full_path in test_files:
+            print(f"      ✓ 找到测试文件: {full_path}")
         print(f"   📊 共找到 {len(test_files)} 个测试文件")
         return test_files
 
-    def prepare_workspace(self, code_files: List[Dict], test_files: List[Dict], target_files: Dict[str, str] = None) -> str:
+    def prepare_workspace(self, code_files: List[Dict], test_files: List[Dict]) -> str:
         """
         准备工作目录，包含生成的代码和项目的测试文件
 
@@ -598,74 +329,189 @@ class DockerSandboxTester:
             print(f"      ✓ .env")
 
         # ========== 第 2 步：写入生成的代码文件（覆盖旧版本）==========
-        print(f"   📝 写入生成的代码文件（覆盖旧版本）...")
+        print(f"   📝 写入生成的代码文件（使用 Read Token 机制）...")
+
+        # 【核心】使用 CodeExecutorService 进行安全的文件写入
+        code_executor = CodeExecutorService(str(backend_workspace))
+
+        # 导入 MultiAgentCoordinator 用于搜索替换
+        from app.agents.multi_agent_coordinator import MultiAgentCoordinator
+        coordinator = MultiAgentCoordinator()
+
+        # 按文件分组收集所有修改
+        from collections import defaultdict
+        file_changes_map = defaultdict(list)
+
+        # 【保护核心文件】这些文件不应该被 AI 生成或修改
+        PROTECTED_FILES = [
+        ]
+
         for f in code_files:
-            file_path = backend_workspace / f['file_path'].replace("backend/", "")
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            content = f.get('content')
-            change_type = f.get('change_type', 'modify')
             file_path_key = f.get('file_path', '')
-            
-            # 统一路径格式：将 AI 返回的正斜杠转为系统路径格式进行查找
-            file_path_normalized = file_path_key.replace('/', os.sep)
-            original = target_files.get(file_path_key, '') or target_files.get(file_path_normalized, '')
-            
-            if content is None:
-                if change_type == 'add':
-                    # 新建文件必须有 content
-                    raise ValueError(f"文件 {file_path_key} 是新建文件(change_type=add)，必须提供 content 字段")
-                elif change_type in ['modify', 'update'] and target_files:
-                    # 如果没有 content，尝试使用行号定位替换（数组切片，永不报错）
-                    start_line = f.get('start_line')
-                    end_line = f.get('end_line')
+            # 统一路径分隔符为正斜杠
+            file_path_key = file_path_key.replace("\\", "/")
+
+            # 检查是否是受保护文件
+            if any(file_path_key.endswith(p) or file_path_key == p for p in PROTECTED_FILES):
+                print(f"      ⚠️  跳过受保护文件: {file_path_key}")
+                continue
+
+            file_changes_map[file_path_key].append(f)
+
+        # 处理每个文件的修改
+        for file_path_key, changes in file_changes_map.items():
+            # 移除 backend/ 前缀，转换为相对路径
+            relative_path = file_path_key.replace("backend/", "").replace("backend\\", "")
+
+            # 【Read Token 机制】先读取文件获取 read_token
+            read_result = code_executor.read_file(relative_path)
+
+            if len(changes) == 1:
+                # 单个修改
+                f = changes[0]
+                content = f.get('content')
+                change_type = f.get('change_type', 'modify')
+
+                if content is not None:
+                    # 直接有 content，使用 read_token 写入
+                    pass
+                elif change_type == 'add':
+                    # 新建文件，使用 NEW_FILE token
+                    content = f.get('replace_block', '') or f.get('content', '')
+                elif change_type in ['modify', 'update']:
+                    # 使用搜索替换应用修改（直接复用 coordinator 的方法）
+                    # 【新架构】从工作目录读取原始内容，不再依赖 target_files
+                    original = read_result.content
+
+                    if not original:
+                        raise ValueError(f"找不到文件 {file_path_key} 的原始内容，请确保文件已存在于工作目录")
+
+                    search_block = f.get('search_block')
                     replace_block = f.get('replace_block', '')
 
-                    if start_line and end_line:
-                        lines = original.splitlines()
-                        # 行号是 1-based 的，转成 0-based 切片
-                        # 切片操作：保留前半部分 + 插入新块 + 保留后半部分
-                        new_lines = lines[:start_line - 1] + replace_block.splitlines() + lines[end_line:]
-                        content = "\n".join(new_lines)
-                        print(f"      ✓ {file_path_key} (行号定位替换 {start_line}-{end_line})")
-                    elif original:
-                        # 兜底：如果没有行号但有原文件内容，保留原文件
-                        content = original
-                        print(f"      ✓ {file_path_key} (保留原文件内容)")
-                    else:
-                        raise ValueError(f"文件 {file_path_key} 缺少 start_line 或 end_line，且无法找到原文件内容")
-                else:
-                    raise ValueError(f"文件 {file_path_key} 无 content 且无法处理(change_type={change_type})")
-            
-            file_path.write_text(content, encoding='utf-8')
-            print(f"      ✓ {f['file_path']}")
+                    if not search_block:
+                        raise ValueError(f"文件 {file_path_key} 缺少 search_block")
 
-        # ========== 第 3 步：写入生成的测试文件（覆盖旧版本）==========
-        print(f"   📝 写入生成的测试文件（覆盖旧版本）...")
+                    content = coordinator._apply_search_replace(
+                        original, search_block, replace_block, None, None
+                    )
+
+                    if content is None:
+                        raise ValueError(f"搜索块匹配失败: {file_path_key}")
+                else:
+                    raise ValueError(f"文件 {file_path_key} 无法处理(change_type={change_type})")
+            else:
+                # 多个修改，需要合并应用（直接复用 coordinator 的方法）
+                print(f"      [INFO] 文件 {file_path_key} 有 {len(changes)} 个修改，合并应用...")
+                # 【新架构】从工作目录读取原始内容
+                original = read_result.content
+
+                if not original:
+                    raise ValueError(f"找不到文件 {file_path_key} 的原始内容，请确保文件已存在于工作目录")
+
+                content = original
+                valid_changes = [c for c in changes if c.get('search_block')]
+
+                for i, change in enumerate(valid_changes):
+                    search_block = change.get('search_block', '')
+                    replace_block = change.get('replace_block', '')
+
+                    new_content = coordinator._apply_search_replace(
+                        content, search_block, replace_block, None, None
+                    )
+
+                    if new_content is not None:
+                        content = new_content
+                        print(f"        [PASS] 修改 {i+1}/{len(valid_changes)}: 搜索替换成功")
+                    else:
+                        raise ValueError(f"修改 {i+1} 搜索块匹配失败")
+
+            # 【核心】使用 CodeExecutorService 安全写入（带 read_token 校验）
+            is_new_file = (changes[0].get('change_type') == 'add') if changes else False
+            read_token = read_result.read_token if read_result.read_token else "NEW_FILE"
+
+            result = code_executor.apply_file_change(
+                relative_path=relative_path,
+                new_content=content,
+                read_token=read_token,
+                create_if_missing=is_new_file
+            )
+
+            if not result.success:
+                raise PermissionError(f"写入文件失败 [{file_path_key}]: {result.error}")
+
+            print(f"      ✓ {file_path_key} (read_token 校验通过)")
+
+        # ========== 第 3 步：写入生成的测试文件（使用 Read Token）==========
+        print(f"   📝 写入生成的测试文件（使用 Read Token 机制）...")
         for f in test_files:
-            file_path = backend_workspace / f['file_path'].replace("backend/", "")
-            file_path.parent.mkdir(parents=True, exist_ok=True)
+            relative_path = f['file_path'].replace("backend/", "").replace("backend\\", "")
             content = f.get('content', '')
-            file_path.write_text(content, encoding='utf-8')
-            print(f"      ✓ {f['file_path']}")
+
+            # 读取获取 read_token（测试文件可能已存在）
+            read_result = code_executor.read_file(relative_path)
+            read_token = read_result.read_token if read_result.read_token else "NEW_FILE"
+
+            result = code_executor.apply_file_change(
+                relative_path=relative_path,
+                new_content=content,
+                read_token=read_token,
+                create_if_missing=True
+            )
+
+            if not result.success:
+                raise PermissionError(f"写入测试文件失败 [{f['file_path']}]: {result.error}")
+
+            print(f"      ✓ {f['file_path']} (read_token 校验通过)")
+
+        # 【修复模块缓存问题】清除 Python 模块缓存，确保新文件能被正确导入
+        print(f"   🧹 清除 Python 模块缓存...")
+        import shutil
+        pycache_count = 0
+        for root, dirs, files in os.walk(backend_workspace):
+            for dir_name in dirs:
+                if dir_name == "__pycache__":
+                    pycache_path = Path(root) / dir_name
+                    try:
+                        shutil.rmtree(pycache_path)
+                        pycache_count += 1
+                    except Exception:
+                        pass
+        if pycache_count > 0:
+            print(f"      ✓ 清除 {pycache_count} 个 __pycache__ 目录")
+
+        # 删除所有 .pyc 文件
+        pyc_count = 0
+        for root, dirs, files in os.walk(backend_workspace):
+            for file in files:
+                if file.endswith(".pyc"):
+                    pyc_path = Path(root) / file
+                    try:
+                        pyc_path.unlink()
+                        pyc_count += 1
+                    except Exception:
+                        pass
+        if pyc_count > 0:
+            print(f"      ✓ 清除 {pyc_count} 个 .pyc 文件")
 
         return workspace
 
     async def _generate_code_and_tests(
         self,
         design_data: Dict[str, Any],
-        target_files: Dict[str, str],
         test_files_ref: Dict[str, str],
         feature_description: str,
         attempt: int
     ) -> tuple:
         """
-        生成代码和测试
+        生成代码和测试（新架构：CoderAgent 通过工具主动获取文件）
 
         Returns:
             (code_files, test_files, success)
         """
         print(f"\n📝 Step 3: CoderAgent 生成代码...")
         print(f"   正在调用 LLM，请稍候...")
+        print(f"   💡 新架构：CoderAgent 将通过工具主动获取需要的文件")
 
         coder = CoderAgent()
 
@@ -677,31 +523,16 @@ class DockerSandboxTester:
                 "files": {path: content[:3000] for path, content in test_files_ref.items()}
             }
 
-        # 从所有 target_files 中提取可用的函数和类名
-        import re
-        available_apis = []
-        for file_path, content in target_files.items():
-            func_matches = re.findall(r'^(?:async\s+)?def\s+(\w+)\s*\(', content, re.MULTILINE)
-            class_matches = re.findall(r'^class\s+(\w+)', content, re.MULTILINE)
-
-            if func_matches or class_matches:
-                available_apis.append(f"\n{file_path}:")
-                for func in func_matches:
-                    available_apis.append(f"  - {func}()")
-                for cls in class_matches:
-                    available_apis.append(f"  - class {cls}")
-
         # 添加通用约束
         enhanced_design["coding_constraints"] = {
             "description": "【编码约束】请严格遵守以下规则",
             "rules": [
-                "1. 只能使用 target_files 中已定义的函数、类和模块",
-                "2. 所有 import 必须基于 target_files 中实际存在的模块路径",
+                "1. 使用 glob/grep/read_file 工具主动获取需要的文件",
+                "2. 所有 import 必须基于项目中实际存在的模块路径",
                 "3. 禁止假设存在未提供的工具函数或类",
                 "4. 保持与现有代码风格一致（命名规范、错误处理等）",
-                "5. 如果 target_files 中不存在需要的功能，请实现它而不是假设它存在"
-            ],
-            "available_apis": available_apis if available_apis else ["请查看 target_files 中的可用 API"]
+                "5. 如果需要的功能不存在，请实现它而不是假设它存在"
+            ]
         }
 
         # 如果是重试，添加错误上下文
@@ -713,7 +544,7 @@ class DockerSandboxTester:
 
         coder_initial_state = {
             "design_output": enhanced_design,
-            "target_files": target_files
+            "project_path": str(self.backend_dir)  # 传递项目路径，供工具使用
         }
 
         coder_result = await coder.execute(
@@ -730,7 +561,25 @@ class DockerSandboxTester:
 
         output = coder_result.get('output', {})
         if isinstance(output, CoderOutput):
-            code_files = [{"file_path": f.file_path, "content": f.content} for f in output.files]
+            # 【修复】保留所有字段，不只是 file_path 和 content
+            code_files = []
+            for f in output.files:
+                file_dict = {
+                    "file_path": f.file_path,
+                    "change_type": getattr(f, 'change_type', 'modify'),
+                    "content": getattr(f, 'content', None),
+                }
+                # 添加搜索替换相关字段（如果存在）
+                if hasattr(f, 'search_block') and f.search_block:
+                    file_dict["search_block"] = f.search_block
+                if hasattr(f, 'replace_block') and f.replace_block:
+                    file_dict["replace_block"] = f.replace_block
+                if hasattr(f, 'fallback_start_line') and f.fallback_start_line:
+                    file_dict["fallback_start_line"] = f.fallback_start_line
+                if hasattr(f, 'fallback_end_line') and f.fallback_end_line:
+                    file_dict["fallback_end_line"] = f.fallback_end_line
+                # 添加旧格式字段（向后兼容）
+                code_files.append(file_dict)
         else:
             code_files = output.get('files', [])
 
@@ -742,17 +591,17 @@ class DockerSandboxTester:
         for f in code_files:
             file_path = f.get('file_path', 'unknown')
             change_type = f.get('change_type', 'modify')
-            start_line = f.get('start_line')
-            end_line = f.get('end_line')
-            if change_type == 'modify' and start_line and end_line:
-                # 显示行号定位模式
+            search_block = f.get('search_block')
+
+            if change_type == 'modify' and search_block:
+                # 显示搜索替换模式
                 replace_preview = f.get('replace_block', '')[:50].replace('\n', ' ')
-                print(f"     - {file_path} [{change_type}] 行{start_line}-{end_line}")
+                print(f"     - {file_path} [{change_type}] 搜索替换")
                 print(f"       replace: {replace_preview}{'...' if len(f.get('replace_block', '')) > 50 else ''}")
             elif change_type == 'add':
                 print(f"     - {file_path} [add] (新文件)")
             else:
-                print(f"     - {file_path} [{change_type}]")
+                print(f"     - {file_path} [{change_type}] (content={f.get('content') is not None})")
 
         self.total_input_tokens += coder_result.get('input_tokens', 0)
         self.total_output_tokens += coder_result.get('output_tokens', 0)
@@ -802,64 +651,193 @@ class DockerSandboxTester:
 
         return code_files, test_files, True
 
-    def _prepare_error_context(self, layered_result: LayeredTestResult, code_files: List[Dict]) -> Dict[str, Any]:
-        """准备错误上下文供修复使用"""
-        error_details = layered_result.error_details or {}
-        # 【修复 Bug 2】增加日志截取长度，确保包含完整的错误信息
-        logs = error_details.get("logs", "")
-        # 优先截取包含 ERROR 或 FAILED 的部分
-        if "ERROR" in logs or "FAILED" in logs:
-            # 找到第一个 ERROR 或 FAILED 的位置
-            error_pos = logs.find("ERROR") if "ERROR" in logs else len(logs)
-            failed_pos = logs.find("FAILED") if "FAILED" in logs else len(logs)
-            start_pos = min(error_pos, failed_pos)
-            # 从错误位置开始截取 3000 字符
-            relevant_logs = logs[start_pos:start_pos + 3000]
-        else:
-            relevant_logs = logs[-3000:]  # 默认截取最后 3000 字符
+    async def _verify_with_agent(
+        self,
+        workspace_path: str,
+        code_files: List[Dict],
+        pipeline_id: int = 99999
+    ) -> Dict[str, Any]:
+        """
+        【阶段二：独立验证步骤 - 利益隔离核心】
 
-        return {
-            "layer": error_details.get("layer"),
-            "message": error_details.get("message"),
-            "logs": relevant_logs,
-            "failed_tests": error_details.get("failed_tests", []),
-            "generated_files": [f["file_path"] for f in code_files]
-        }
+        使用独立的 VerifyAgent 进行验证，与 RepairerAgent 完全分离。
+        【复用后端代码】直接使用 verify_fixes 便捷函数
+
+        【利益隔离原则】
+        - VerifyAgent 只负责"检"，没有任何文件写入或代码修改权限
+        - 只能如实报告，无法补救
+        - 只报告事实（PASS/FAIL），绝不提供修复建议
+
+        Args:
+            workspace_path: 工作目录路径
+            code_files: 生成的代码文件列表
+            pipeline_id: Pipeline ID
+
+        Returns:
+            Dict[str, Any]: 验证结果
+        """
+        print(f"   🔍 独立验证步骤（VerifyAgent）- 只检测，不修复...")
+
+        # 【复用后端代码】使用 TestRunnerService 运行测试
+        from app.service.test_runner import TestRunnerService
+
+        # 运行测试
+        test_result = await TestRunnerService.run_tests(
+            project_path=workspace_path,
+            test_path="tests/",
+            timeout=120
+        )
+
+        # 【复用后端代码】使用 verify_fixes 便捷函数进行验证
+        verify_result = await verify_fixes(
+            test_runner=TestRunnerService,
+            test_path="tests/",
+            generated_files=[f.get("file_path", "") for f in code_files],
+            project_path=workspace_path
+        )
+
+        # 添加测试运行结果到验证结果
+        verify_result["test_result"] = test_result
+
+        verdict = verify_result.get("verdict")
+        message = verify_result.get("message", "")
+
+        if verdict == "PASS":
+            print(f"   ✅ {message}")
+        elif verdict == "FAIL":
+            error_count = verify_result.get("error_count", 0)
+            print(f"   ❌ {message}")
+            print(f"      发现 {error_count} 个错误")
+            errors = verify_result.get("errors", [])
+            for err in errors[:3]:  # 只显示前3个
+                print(f"         - {err}")
+        else:
+            print(f"   ⚠️  验证过程出错: {message}")
+
+        return verify_result
 
     async def _apply_fixes(
         self,
-        target_files: Dict[str, str],
         code_files: List[Dict],
-        error_context: Dict[str, Any]
-    ) -> Dict[str, str]:
+        verify_result: Dict[str, Any],
+        workspace_path: str
+    ) -> bool:
         """
-        应用修复：不污染原始上下文，只把错误记录以特殊文件的形式传给 AI
+        【利益隔离】RepairerAgent 修复阶段
+
+        RepairerAgent 被剥夺了自检能力，永远看不到测试结果。
+        它只能通过结构化工单了解错误，然后提交修复。
+
+        【利益隔离原则】
+        - RepairerAgent 只负责"修"
+        - 永远看不到原始测试日志，只能看到结构化工单
+        - 没有任何测试工具的访问权限
+
+        Returns:
+            bool: 修复是否成功
         """
-        print(f"   🔧 收集错误上下文，保持目标文件原样...")
+        print(f"   🔧 调用 RepairerAgent 进行精确修复（利益隔离）...")
 
-        # ！！！！ 核心修改：绝对不要修改 target_files ！！！！
-        # 让 target_files 保持原样，这样 AI 看到的还是未被破坏的代码
-        updated_files = dict(target_files)
+        # 【利益隔离】构建结构化工单
+        structured_errors = verify_result.get("structured_errors", {})
+        failed_tests = verify_result.get("errors", [])
+        evidence = verify_result.get("evidence", {})
+        snippet = evidence.get("failed_output", "")[:1500] if evidence else ""
 
-        # 仅增加一个错误报告给 AI 看
-        error_info = f"""# 上次尝试的错误信息
+        # 从 structured_errors 中获取错误列表
+        errors_list = structured_errors.get("errors", []) if structured_errors else []
 
-## 失败层级
-{error_context.get('layer', 'unknown')}
+        # 修复 file_path：如果指向测试文件，则改为第一个生成的代码文件
+        generated_file_paths = [f["file_path"] for f in code_files]
+        if generated_file_paths:
+            for err in errors_list:
+                file_path = err.get("file_path", "")
+                if not file_path or "test_" in file_path or "/tests/" in file_path:
+                    err["file_path"] = generated_file_paths[0]
 
-## 错误描述
-{error_context.get('message', '无')}
+        # 如果没有错误列表，创建一个默认的错误项
+        if not errors_list and generated_file_paths:
+            errors_list = [
+                {
+                    "file_path": generated_file_paths[0],
+                    "line": 1,
+                    "severity": "critical",
+                    "summary": "代码需要修复",
+                    "detail": "测试失败，需要修复代码",
+                    "fix_hint": "根据测试输出修复代码"
+                }
+            ]
 
-## 失败的测试
-{chr(10).join(error_context.get('failed_tests', [])[:5])}
+        fix_order = {
+            "type": "fix_order",
+            "category": "code_bug",
+            "source": "VerificationAgent",
+            "errors": errors_list,
+            "failed_tests": failed_tests[:5],
+            "error_snippet": snippet,
+            "generated_files": generated_file_paths,
+            "fix_hint": "根据以上测试输出修复代码，务必使所有测试通过。"
+        }
 
-## 注意
-你上次生成的代码测试未通过。
-请参考上方原有的目标文件代码（我们已为你恢复到修改前的状态），重新思考并生成正确的修复代码。
-"""
-        updated_files["ERROR_CONTEXT.md"] = error_info
+        print(f"   📋 修复工单已生成: {len(fix_order['errors'])} 个错误项")
 
-        return updated_files
+        # 【利益隔离核心】调用 RepairerAgent 进行修复
+        repairer = RepairerAgent()
+        repair_result = await repairer.execute_with_reread(
+            pipeline_id=99999,
+            stage_name="REPAIR",
+            fix_order=fix_order,
+            project_path=workspace_path,
+            initial_state={
+                "verification_report": {
+                    "verdict": verify_result.get("verdict"),
+                    "error_count": len(failed_tests),
+                    "message": verify_result.get("message", "")
+                }
+            }
+        )
+
+        if not repair_result.get("success"):
+            print(f"   ❌ RepairerAgent 修复失败: {repair_result.get('error', '未知错误')}")
+            return False
+
+        # 修复成功，应用修复到工作目录
+        repair_output = repair_result.get("output", {})
+        if repair_output and "files" in repair_output:
+            print(f"   ✅ RepairerAgent 修复完成，应用 {len(repair_output['files'])} 个文件修复")
+
+            # 使用 CodeExecutorService 应用修复
+            from app.service.code_executor import CodeExecutorService
+            code_executor = CodeExecutorService(workspace_path)
+
+            for file_change in repair_output["files"]:
+                file_path = file_change.get("file_path", "")
+                relative_path = file_path.replace("backend/", "").replace("backend\\", "")
+
+                # 读取文件获取 read_token
+                read_result = code_executor.read_file(relative_path)
+
+                # 应用修改
+                search_block = file_change.get("search_block", "")
+                replace_block = file_change.get("replace_block", "")
+
+                if search_block and read_result.content:
+                    new_content = read_result.content.replace(search_block, replace_block, 1)
+
+                    result = code_executor.apply_file_change(
+                        relative_path=relative_path,
+                        new_content=new_content,
+                        read_token=read_result.read_token
+                    )
+
+                    if result.success:
+                        print(f"      ✓ 应用修复: {file_path}")
+                    else:
+                        print(f"      ❌ 应用修复失败: {file_path} - {result.error}")
+
+            return True
+
+        return False
 
     def _display_test_results(self, layered_result: LayeredTestResult):
         """显示测试结果"""
@@ -887,24 +865,32 @@ class DockerSandboxTester:
         pipeline_id: int = 99999
     ) -> LayeredTestResult:
         """
-        在 Docker Sandbox 中运行分层测试
+        在 Docker Sandbox 中运行分层测试（带智能重试）
+
+        【智能重试】对于环境错误（如 Docker 容器启动失败）会进行静默重试。
 
         流程：
-        1. 启动 Docker 容器
+        1. 启动 Docker 容器（带重试）
         2. 在容器中运行 pytest
         3. 解析结果并返回 LayeredTestResult
         """
         print(f"\n   🐳 启动 Docker Sandbox...")
 
-        # 启动沙箱
-        try:
-            sandbox_info = await sandbox_manager.start(
+        # 【智能重试】启动沙箱（带重试）
+        async def _do_start_sandbox():
+            return await sandbox_manager.start(
                 pipeline_id=pipeline_id,
                 project_path=workspace_path
             )
+
+        try:
+            sandbox_info = await self._sandbox_retry_executor.execute(_do_start_sandbox)
             print(f"   ✅ Sandbox 已启动")
             print(f"      容器: {sandbox_info.container_id[:12]}")
             print(f"      端口: {sandbox_info.port}")
+        except CircuitBreakerOpenError:
+            print(f"   ❌ 启动 Sandbox 失败: 服务暂时不可用，系统正在冷却")
+            raise RuntimeError("Docker Sandbox 服务暂时不可用，请稍后再试...")
         except Exception as e:
             print(f"   ❌ 启动 Sandbox 失败: {e}")
             raise
@@ -1091,7 +1077,10 @@ class DockerSandboxTester:
         print("\n" + "=" * 70)
         print("🧪 测试场景: 使用真实 LLM + Docker Sandbox 完整验证")
         print("=" * 70)
-        print("需求: 修改已存在的 health check API，添加数据库连接状态检查")
+        print("需求: 实现复杂的系统状态监控 API（多文件修改）")
+        print("  - 添加 /api/v1/health/detailed 端点")
+        print("  - 检查 database、disk、memory 组件状态")
+        print("  - 实现健康状态聚合逻辑")
         print("⚠️  此测试将真正调用 LLM API 并启动 Docker 容器！")
         print()
 
@@ -1108,7 +1097,30 @@ class DockerSandboxTester:
             # 动态构建项目文件树（只包含文件结构，不包含代码内容）
             file_tree = self._build_file_tree()
 
-            requirement = "修改 backend/app/api/v1/health.py 文件，在现有的 health check API 中添加数据库连接状态检查。需要检查数据库是否可连接，并在响应中返回 db_status 字段。"
+            requirement = """在 backend/app/api/v1/health.py 中实现一个完整的系统状态监控 API：
+
+1. 添加一个新的端点 GET /api/v1/health/detailed，返回详细的系统状态信息
+2. 需要检查以下组件状态：
+   - database: 检查数据库连接是否正常
+   - disk: 检查磁盘使用率（模拟即可）
+   - memory: 检查内存使用率（模拟即可）
+3. 返回 JSON 格式：
+   {
+     "status": "healthy|degraded|unhealthy",
+     "timestamp": "ISO格式时间戳",
+     "components": {
+       "database": {"status": "up|down", "response_time_ms": 123},
+       "disk": {"status": "up|down", "usage_percent": 45},
+       "memory": {"status": "up|down", "usage_percent": 67}
+     }
+   }
+4. 如果任一组件状态为 down，整体状态应为 degraded
+5. 如果多个组件 down，整体状态应为 unhealthy
+
+这是一个复杂的任务，需要：
+- 修改 health.py 添加新端点
+- 可能需要创建新的服务模块来处理状态检查逻辑
+- 需要处理错误情况和边界条件"""
 
             architect_initial_state = {
                 "requirement": requirement,
@@ -1197,14 +1209,13 @@ class DockerSandboxTester:
             self.total_input_tokens += designer_result.get('input_tokens', 0)
             self.total_output_tokens += designer_result.get('output_tokens', 0)
 
-            # 获取目标文件内容（使用 CodeRAG 智能检索）
-            print("\n📂 获取目标文件内容...")
-            # 使用 CodeRAG 根据需求智能搜索相关文件
-            target_files = await self.get_target_files_with_rag(design_data, requirement)
-
-            # 获取相关测试文件作为参考
-            affected_files = list(target_files.keys())
+            # 【新架构】CoderAgent 将通过工具主动获取需要的文件
+            # 不再需要预加载所有目标文件，大幅降低 Token 消耗
+            print("\n📂 获取测试文件参考...")
+            # 从 affected_files 中提取文件路径用于查找相关测试
+            affected_files = design_data.get('affected_files', [])
             test_files_ref = self.get_related_test_files(affected_files)
+            print(f"   💡 新架构：CoderAgent 将通过 glob/grep/read_file 工具主动获取文件")
 
             # ========== Step 3-7: 代码生成、测试生成、分层测试、ReviewAgent 决策（带 Auto-Fix 循环）==========
             max_retries = 3
@@ -1218,9 +1229,9 @@ class DockerSandboxTester:
                 print(f"🔄 Auto-Fix 循环: 第 {attempt + 1}/{max_retries} 次尝试")
                 print(f"{'='*70}")
 
-                # 生成代码
+                # 生成代码（新架构：CoderAgent 通过工具主动获取文件）
                 code_files, test_files, success = await self._generate_code_and_tests(
-                    design_data, target_files, test_files_ref, feature_description, attempt
+                    design_data, test_files_ref, feature_description, attempt
                 )
 
                 if not success:
@@ -1230,7 +1241,7 @@ class DockerSandboxTester:
 
                 # 准备工作目录
                 print(f"\n🛡️  准备工作目录...")
-                workspace_path = self.prepare_workspace(code_files, test_files, target_files)
+                workspace_path = self.prepare_workspace(code_files, test_files)
 
                 # 运行分层测试
                 print(f"\n🐳 在 Docker Sandbox 中运行分层测试...")
@@ -1249,21 +1260,55 @@ class DockerSandboxTester:
                     break
 
                 if decision.action == "auto_fix":
-                    print(f"\n🔧 进入 Auto-Fix 模式，分析错误并修复...")
-                    # 准备错误上下文供下次代码生成使用
-                    error_context = self._prepare_error_context(layered_result, code_files)
-                    target_files = await self._apply_fixes(target_files, code_files, error_context)
+                    print(f"\n🔧 进入 Auto-Fix 模式（利益隔离）...")
+                    print(f"   Step 1: 独立验证（VerifyAgent）...")
+
+                    # 【利益隔离】Step 1: 独立验证步骤
+                    # VerifyAgent 只负责"检"，没有任何文件写入或代码修改权限
+                    verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999)
+
+                    if verify_result.get("verdict") == "PASS":
+                        print(f"   ✅ 验证通过，无需修复")
+                        break
+
+                    print(f"   Step 2: 调用 RepairerAgent 进行修复...")
+
+                    # 【利益隔离】Step 2: RepairerAgent 修复阶段
+                    # RepairerAgent 只负责"修"，永远看不到测试结果
+                    fix_success = await self._apply_fixes(code_files, verify_result, workspace_path)
+
+                    if fix_success:
+                        print(f"   🔄 修复已应用，将进行下一次验证...")
+                    else:
+                        print(f"   ⚠️  修复未成功，继续下一次尝试...")
                     attempt += 1
+
                 elif decision.action == "request_user":
                     # 【修复 Bug 3】在 E2E 测试场景中，如果是 regression 失败，继续尝试修复
                     # 因为可能是生成的代码与旧测试不兼容，需要调整
                     if layered_result.failure_cause == "regression_broken" and attempt < max_retries - 1:
-                        print(f"\n🔧 regression 测试失败，尝试调整代码以兼容旧测试...")
-                        error_context = self._prepare_error_context(layered_result, code_files)
-                        # 添加特殊标记，告诉 CoderAgent 需要兼容旧测试
-                        error_context["regression_failure"] = True
-                        error_context["note"] = "新代码导致原有测试失败，请检查是否破坏了向后兼容性"
-                        target_files = await self._apply_fixes(target_files, code_files, error_context)
+                        print(f"\n🔧 regression 测试失败，调用 RepairerAgent 调整代码以兼容旧测试...")
+                        print(f"   Step 1: 独立验证（VerifyAgent）...")
+
+                        # 【利益隔离】独立验证
+                        verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999)
+
+                        if verify_result.get("verdict") == "PASS":
+                            print(f"   ✅ 验证通过，无需修复")
+                            break
+
+                        print(f"   Step 2: 调用 RepairerAgent 进行修复（regression 兼容模式）...")
+
+                        # 添加 regression 标记到验证结果
+                        verify_result["regression_failure"] = True
+                        verify_result["note"] = "新代码导致原有测试失败，请检查是否破坏了向后兼容性"
+
+                        fix_success = await self._apply_fixes(code_files, verify_result, workspace_path)
+
+                        if fix_success:
+                            print(f"   🔄 修复已应用，将进行下一次验证...")
+                        else:
+                            print(f"   ⚠️  修复未成功，继续下一次尝试...")
                         attempt += 1
                     else:
                         print(f"\n⛔ 需要人工介入，停止 Auto-Fix")

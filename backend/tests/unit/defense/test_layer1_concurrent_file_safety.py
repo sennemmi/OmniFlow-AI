@@ -54,9 +54,12 @@ class TestConcurrentFileOperations:
                 try:
                     # 添加小延迟增加并发冲突概率
                     time.sleep(0.01)
+                    # 【Read Token 机制】每次写入前重新读取获取 token
+                    read_result = executor.read_file("shared.py")
                     change = executor.apply_file_change(
                         relative_path="shared.py",
-                        new_content=content
+                        new_content=content,
+                        read_token=read_result.read_token
                     )
                     return index, change.success
                 except Exception as e:
@@ -101,9 +104,12 @@ class TestConcurrentFileOperations:
             executor = CodeExecutorService(str(project_root))
 
             # 第一次修改
+            # 【Read Token 机制】先读取获取 token
+            read_result1 = executor.read_file("important.py")
             change1 = executor.apply_file_change(
                 relative_path="important.py",
-                new_content="# Modified once\n"
+                new_content="# Modified once\n",
+                read_token=read_result1.read_token
             )
 
             # 验证备份已创建
@@ -138,9 +144,11 @@ class TestConcurrentFileOperations:
 
             def create_file(thread_id):
                 try:
+                    # 【Read Token 机制】新文件使用 NEW_FILE token
                     change = executor.apply_file_change(
                         relative_path="new_file.py",
                         new_content=f"# Thread {thread_id}\n{content}",
+                        read_token="NEW_FILE",
                         create_if_missing=True
                     )
                     return thread_id, change.success
@@ -184,9 +192,12 @@ class TestFileLockMechanism:
             def write_large_file(thread_id):
                 try:
                     executor = CodeExecutorService(str(project_root))
+                    # 【Read Token 机制】每次写入前重新读取获取 token
+                    read_result = executor.read_file("atomic.py")
                     change = executor.apply_file_change(
                         relative_path="atomic.py",
-                        new_content=f"# Thread {thread_id}\n{large_content}"
+                        new_content=f"# Thread {thread_id}\n{large_content}",
+                        read_token=read_result.read_token
                     )
                     return thread_id, change.success
                 except Exception as e:

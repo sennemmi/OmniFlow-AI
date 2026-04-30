@@ -2,9 +2,8 @@
 Agent 协调服务
 负责协调各个 AI Agent 的执行
 
-【增强】实现两层代码上下文注入：
-1. 语义检索结果（RAG）
-2. 完整文件内容
+【重构】上下文构建逻辑已迁移到 ContextBuilderService
+本模块现在专注于工作流调度，退化为纯粹的协调器
 
 【优化】使用 Repository 模式消除重复的数据库查询代码
 """
@@ -25,6 +24,7 @@ from app.core.sse_log_buffer import push_log
 from app.models.pipeline import PipelineStage, StageName
 from app.service.project import ProjectService
 from app.service.workflow import WorkflowService
+from app.service.context_builder import context_builder
 from app.repositories import PipelineStageRepository
 
 
@@ -116,7 +116,7 @@ class AgentCoordinatorService:
         element_context: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         """
-        【增强】根据 sourceContext 读取真实代码上下文并注入到 element_context
+        【重构】委托给 ContextBuilderService 处理
         
         Args:
             pipeline_id: Pipeline ID
@@ -125,79 +125,10 @@ class AgentCoordinatorService:
         Returns:
             Optional[Dict[str, Any]]: 增强后的 element_context
         """
-        if not element_context:
-            return element_context
-        
-        source_context = element_context.get("sourceContext")
-        if not source_context:
-            return element_context
-        
-        try:
-            from app.service.code_modifier import CodeModifierService
-            from app.core.config import settings
-            
-            file_path = source_context.get("file") or source_context.get("relativePath")
-            line = source_context.get("line", 0)
-            
-            if not file_path or line <= 0:
-                return element_context
-            
-            await push_log(
-                pipeline_id,
-                "info",
-                f"正在读取圈选元素对应的源码上下文: {file_path}:{line}",
-                stage="REQUIREMENT"
-            )
-            
-            # 创建代码修改服务
-            modifier = CodeModifierService(workspace_path=settings.TARGET_PROJECT_PATH)
-            
-            try:
-                # 读取文件上下文
-                content, surrounding, start_line, end_line = modifier.read_file_context(
-                    file_path, line, context_lines=20
-                )
-                
-                # 构建 code_context
-                code_context = {
-                    "file": file_path,
-                    "line": line,
-                    "column": source_context.get("column", 0),
-                    "surrounding_code": surrounding,
-                    "full_file_content": content,
-                    "context_start_line": start_line,
-                    "context_end_line": end_line,
-                }
-                
-                # 注入到 element_context
-                element_context["code_context"] = code_context
-                
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"成功读取源码上下文: {file_path} (行 {start_line}-{end_line})",
-                    stage="REQUIREMENT"
-                )
-                
-            except FileNotFoundError:
-                await push_log(
-                    pipeline_id,
-                    "warning",
-                    f"源文件不存在: {file_path}",
-                    stage="REQUIREMENT"
-                )
-            except Exception as e:
-                await push_log(
-                    pipeline_id,
-                    "warning",
-                    f"读取源码上下文失败: {str(e)[:100]}",
-                    stage="REQUIREMENT"
-                )
-        
-        except Exception as e:
-            logger.warning(f"增强 element_context 失败: {e}")
-        
-        return element_context
+        return await context_builder.enrich_element_context_with_code(
+            pipeline_id=pipeline_id,
+            element_context=element_context
+        )
     
     @classmethod
     async def run_architect_analysis(
@@ -209,35 +140,64 @@ class AgentCoordinatorService:
     ) -> Dict[str, Any]:
         """
         运行 ArchitectAgent 分析
-        
-        【增强】如果存在 sourceContext，会读取真实代码上下文并注入到 element_context
-        
+
+        【改造】ArchitectAgent 现在使用工具自主探索项目代码
+        - 不再预注入 code_context
+        - ArchitectAgent 使用 glob/grep/read_file 工具按需读取
+        - 简化 Prompt，降低 Token 消耗
+
         Args:
             pipeline_id: Pipeline ID
             requirement: 需求描述
-            element_context: 页面元素上下文（可能包含 sourceContext）
+            element_context: 页面元素上下文（可选）
             session: 数据库会话
-            
+
         Returns:
             Dict: 执行结果
         """
+        from app.core.config import settings
+
         await push_log(pipeline_id, "info", "开始需求分析...", stage="REQUIREMENT")
 
         try:
-            # 【增强】根据 sourceContext 读取真实代码上下文
-            if element_context and element_context.get("sourceContext"):
-                element_context = await cls._enrich_element_context_with_code(
-                    pipeline_id, element_context
-                )
-            
+            # 【改造】不再预注入 code_context
+            # ArchitectAgent 会使用工具自主探索项目
+
             # 获取项目文件树
             file_tree = await cls._get_project_file_tree()
             await push_log(pipeline_id, "info", "正在扫描项目结构...", stage="REQUIREMENT")
 
-            # 调用 ArchitectAgent
-            result = await architect_agent.analyze(requirement, file_tree, element_context, pipeline_id)
-            await push_log(pipeline_id, "info", "需求分析完成，等待审批", stage="REQUIREMENT")
-            
+            # 获取项目路径
+            project_path = settings.TARGET_PROJECT_PATH
+            if not Path(project_path).is_absolute():
+                backend_dir = Path(__file__).parent.parent
+                project_path = str(backend_dir.parent / project_path)
+
+            await push_log(
+                pipeline_id,
+                "info",
+                "ArchitectAgent 将使用工具自主探索项目代码...",
+                stage="REQUIREMENT"
+            )
+
+            # 【改造】调用 ArchitectAgent，传入 project_path 用于工具执行
+            result = await architect_agent.analyze(
+                requirement=requirement,
+                file_tree=file_tree,
+                element_context=element_context,
+                pipeline_id=pipeline_id,
+                project_path=project_path
+            )
+
+            # 记录工具调用情况
+            tool_calls = result.get("tool_calls", 0)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"需求分析完成（使用了 {tool_calls} 次工具调用），等待审批",
+                stage="REQUIREMENT"
+            )
+
             # 完成阶段并保存指标
             await cls._complete_stage_with_metrics(
                 pipeline_id, StageName.REQUIREMENT, result, session
@@ -301,117 +261,19 @@ class AgentCoordinatorService:
         architect_output: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        【核心方法】获取设计阶段所需的两层代码上下文
-        
-        两层上下文注入：
-        1. 语义检索结果（RAG）- 相关代码片段
-        2. 完整文件内容 - 用于理解代码风格和架构
+        【重构】委托给 ContextBuilderService 处理
         
         Args:
             pipeline_id: Pipeline ID
             architect_output: ArchitectAgent 的输出
             
         Returns:
-            Dict: 包含以下字段：
-                - related_code_context: 语义检索结果（字符串）
-                - full_files_context: 完整文件内容映射
-                - project_structure_summary: 项目结构摘要
-                - success: 是否成功
-                - error: 错误信息（如果有）
+            Dict: 代码上下文
         """
-        try:
-            from app.service.code_indexer import get_indexer
-            from app.core.config import settings
-
-            # 获取目标项目路径
-            project_path = settings.TARGET_PROJECT_PATH
-            if not Path(project_path).is_absolute():
-                backend_dir = Path(__file__).parent.parent
-                project_path = str(backend_dir.parent / project_path)
-
-            # 获取或创建索引服务（线程安全）
-            indexer = await get_indexer(project_path)
-
-            # 提取需求关键词进行检索
-            feature_description = architect_output.get("feature_description", "")
-            affected_files = architect_output.get("affected_files", [])
-
-            # 构建检索查询
-            search_query = feature_description
-            if affected_files:
-                search_query += " " + " ".join(affected_files)
-
-            await push_log(
-                pipeline_id,
-                "info",
-                f"正在执行语义检索: {search_query[:80]}...",
-                stage="DESIGN"
-            )
-
-            # 【第一层】执行语义检索，获取相关代码片段
-            related_code = await indexer.semantic_search(
-                query=search_query,
-                top_k=8,
-                chunk_types=["function", "class", "method"]
-            )
-
-            # 【第二层】获取完整文件内容
-            await push_log(
-                pipeline_id,
-                "info",
-                "正在读取完整文件内容...",
-                stage="DESIGN"
-            )
-
-            # 使用新的核心方法获取两层上下文
-            context_result = await indexer.get_related_files_full_content(
-                query=search_query,
-                top_k=8,
-                include_related=True
-            )
-
-            # 获取项目结构摘要
-            project_structure = indexer.get_project_structure()
-
-            # 统计信息
-            full_files_count = len(context_result.get("full_files", {}))
-            related_files_count = len(context_result.get("related_files", {}))
-
-            await push_log(
-                pipeline_id,
-                "info",
-                f"代码上下文获取完成: {full_files_count} 个核心文件, {related_files_count} 个相关文件",
-                stage="DESIGN"
-            )
-
-            # 合并完整文件内容（核心文件 + 相关文件）
-            all_full_files = {
-                **context_result.get("full_files", {}),
-                **context_result.get("related_files", {})
-            }
-
-            return {
-                "success": True,
-                "error": None,
-                "related_code_context": related_code,
-                "full_files_context": all_full_files,
-                "project_structure_summary": project_structure,
-                "file_summaries": context_result.get("file_summaries", []),
-                "related_chunks": context_result.get("related_chunks", [])
-            }
-
-        except Exception as e:
-            error_msg = f"获取代码上下文失败: {str(e)}"
-            await push_log(pipeline_id, "warning", error_msg[:100], stage="DESIGN")
-            return {
-                "success": False,
-                "error": error_msg,
-                "related_code_context": None,
-                "full_files_context": None,
-                "project_structure_summary": None,
-                "file_summaries": [],
-                "related_chunks": []
-            }
+        return await context_builder.get_code_context_for_design(
+            pipeline_id=pipeline_id,
+            architect_output=architect_output
+        )
     
     @classmethod
     async def run_designer_analysis(
@@ -633,16 +495,19 @@ class AgentCoordinatorService:
         cls,
         pipeline_id: int,
         design_output: Dict[str, Any],
-        target_files: Dict[str, str],
+        affected_files: List[str],
         session: Optional[AsyncSession] = None
     ) -> Dict[str, Any]:
         """
         运行多 Agent 协调器生成代码
 
+        【改造】使用 affected_files 替代 target_files
+        CoderAgent 现在使用工具按需读取文件
+
         Args:
             pipeline_id: Pipeline ID
             design_output: 设计阶段输出
-            target_files: 目标文件当前内容
+            affected_files: 受影响文件列表
             session: 数据库会话（可选，用于避免长时间持有连接）
 
         Returns:
@@ -651,10 +516,10 @@ class AgentCoordinatorService:
         await push_log(pipeline_id, "info", "开始代码生成...", stage="CODING")
         await push_log(pipeline_id, "info", "启动多 Agent 协作生成代码...", stage="CODING")
 
-        # 调用多 Agent 协调器
+        # 【改造】调用多 Agent 协调器，传入 affected_files 而非 target_files
         multi_agent_result = await multi_agent_coordinator.execute_parallel(
             design_output,
-            target_files,
+            affected_files,
             pipeline_id=pipeline_id
         )
 
@@ -689,8 +554,14 @@ class AgentCoordinatorService:
         target_files = {}
 
         def normalize_path(p: str) -> str:
-            """统一路径格式，移除 backend/ 前缀"""
-            if p.startswith("backend/") or p.startswith("backend\\"):
+            """统一路径格式：
+            1. 统一使用正斜杠
+            2. 移除 backend/ 前缀
+            """
+            # 统一使用正斜杠
+            p = p.replace("\\", "/")
+            # 移除 backend/ 前缀
+            if p.startswith("backend/"):
                 p = p[len("backend/"):]
             return p
 

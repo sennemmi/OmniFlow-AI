@@ -21,12 +21,15 @@ import ast
 import json
 import hashlib
 import asyncio
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
 
 import litellm
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # 尝试导入 ChromaDB，如果未安装则使用降级方案
 try:
@@ -894,3 +897,114 @@ def clear_indexer_cache():
         indexer.clear_cache()
     _indexer_cache.clear()
     _indexer_locks.clear()
+
+
+# ==================== 【新增】RAG 目标文件获取函数 ====================
+
+async def get_target_files_with_rag(
+    design_output: Dict[str, Any],
+    requirement: str,
+    project_path: str,
+    code_executor: Any = None
+) -> Dict[str, str]:
+    """
+    使用 CodeRAG (语义检索) 智能获取目标文件
+
+    结合:
+    1. DesignerAgent 输出的 affected_files
+    2. CodeRAG 语义搜索相关代码
+    3. AST 分析文件依赖
+
+    Args:
+        design_output: DesignerAgent 的输出
+        requirement: 原始需求描述
+        project_path: 项目路径
+        code_executor: CodeExecutorService 实例（可选，用于依赖分析）
+
+    Returns:
+        Dict[str, str]: 文件路径 -> 文件内容的映射
+    """
+    target_files = {}
+
+    # 1. 从 DesignerAgent 输出获取文件
+    affected_files = design_output.get("affected_files", [])
+    function_changes = design_output.get("function_changes", [])
+
+    all_files_to_read = set()
+
+    # 添加 affected_files（统一使用正斜杠）
+    for file_path in affected_files:
+        normalized_path = file_path.replace("\\", "/")
+        all_files_to_read.add(normalized_path)
+
+    # 添加 function_changes 中的文件（统一使用正斜杠）
+    for change in function_changes:
+        file_path = change.get("file", "")
+        if file_path:
+            normalized_path = file_path.replace("\\", "/")
+            all_files_to_read.add(normalized_path)
+
+    # 2. 使用 CodeRAG 搜索相关代码
+    if not all_files_to_read:
+        # 如果没有指定文件，使用 CodeRAG 根据需求搜索
+        print(f"   🔍 CodeRAG 根据需求搜索相关代码...")
+        indexer = await get_indexer(project_path)
+        search_results = await indexer.get_related_files_full_content(requirement, top_k=10)
+        full_files = search_results.get("full_files", {})
+        for file_path, content in full_files.items():
+            # 统一使用正斜杠
+            normalized_path = file_path.replace("\\", "/")
+            # 转换为 backend/ 前缀的路径
+            if not normalized_path.startswith("backend/"):
+                normalized_path = f"backend/{normalized_path}"
+            all_files_to_read.add(normalized_path)
+            target_files[normalized_path] = content
+
+    # 3. 使用 AST 分析依赖关系
+    print(f"   🔍 AST 分析文件依赖...")
+    if code_executor is None:
+        from app.service.code_executor import CodeExecutorService
+        code_executor = CodeExecutorService(project_path)
+
+    for file_path in list(all_files_to_read):
+        # file_path 已经是正斜杠格式（上面已转换）
+        clean_path = file_path.replace("backend/", "")
+        content = code_executor.get_file_content(clean_path)
+
+        if content:
+            target_files[file_path] = content
+            logger.info(f"[get_target_files_with_rag] 成功读取: {file_path} (clean_path: {clean_path})")
+        else:
+            # 【诊断】记录读取失败
+            logger.warning(f"[get_target_files_with_rag] 读取失败: {file_path} (clean_path: {clean_path})")
+            # 【方案3】尝试备用路径格式
+            # 如果去除 backend/ 失败，尝试保留 backend/ 的路径
+            if not file_path.startswith("backend/"):
+                alt_path = f"backend/{file_path}"
+                alt_content = code_executor.get_file_content(file_path)
+                if alt_content:
+                    target_files[file_path] = alt_content
+                    logger.info(f"[get_target_files_with_rag] 备用路径成功: {file_path}")
+                else:
+                    logger.error(f"[get_target_files_with_rag] 所有路径尝试失败: {file_path}")
+            else:
+                logger.error(f"[get_target_files_with_rag] 文件不存在: {file_path}")
+
+        if content:
+            # 分析依赖并添加相关文件
+            related_files = code_executor.analyze_dependencies(content, file_path)
+            for related_file in related_files:
+                # 统一使用正斜杠
+                normalized_related = related_file.replace("\\", "/")
+                if normalized_related not in target_files:
+                    clean_related = normalized_related.replace("backend/", "")
+                    related_content = code_executor.get_file_content(clean_related)
+                    if related_content:
+                        target_files[normalized_related] = related_content
+
+    print(f"   📊 共收集 {len(target_files)} 个目标文件")
+    # 【诊断】打印收集的文件列表
+    for fp in target_files.keys():
+        content_preview = target_files[fp][:50] if target_files[fp] else "(空)"
+        print(f"      - {fp}: {content_preview}...")
+    return target_files

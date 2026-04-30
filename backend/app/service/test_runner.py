@@ -282,15 +282,25 @@ class TestRunnerService:
                     }
                 )
 
-            return {
+            # 【利益隔离】TestRunner 只提供事实，不做任何推断或建议
+            result = {
                 "success": success,
                 "exit_code": process.returncode,
+                "verdict": "PASS" if success else "FAIL",  # 明确的判定结果
                 "logs": full_logs,
                 "summary": summary,
                 "error": None if success else error_message,
                 "error_type": error_type,
-                "failed_tests": failed_tests
+                "failed_tests": failed_tests,
+                # 【证据包】供 Verification Agent 引用的原始事实
+                "evidence": {
+                    "failed_output": "" if success else full_logs[-2000:],  # 仅失败时的日志片段
+                    "key_errors": cls._extract_key_errors(full_logs) if not success else [],
+                    "test_count": cls._extract_test_count(summary)
+                }
             }
+
+            return result
 
         except asyncio.TimeoutError:
             # 超时处理：尝试终止进程
@@ -653,6 +663,80 @@ class TestRunnerService:
                 "error_type": "execution_error",
                 "failed_tests": []
             }
+
+    @classmethod
+    def _extract_key_errors(cls, logs: str) -> List[str]:
+        """
+        提取关键错误消息（供 Verification Agent 使用）
+
+        【利益隔离】只提取事实，不做解释
+        """
+        key_errors = []
+        if not logs:
+            return key_errors
+
+        lines = logs.split('\n')
+
+        for line in lines:
+            line = line.strip()
+
+            # 提取 FAILED 行
+            if line.startswith('FAILED'):
+                key_errors.append(line)
+
+            # 提取 ERROR 行
+            elif line.startswith('ERROR'):
+                key_errors.append(line)
+
+            # 提取关键异常类型
+            elif any(err in line for err in [
+                'SyntaxError:', 'IndentationError:', 'ImportError:',
+                'ModuleNotFoundError:', 'NameError:', 'AttributeError:',
+                'TypeError:', 'AssertionError:'
+            ]):
+                # 限制长度，避免上下文爆炸
+                if len(line) > 200:
+                    line = line[:200] + '...'
+                key_errors.append(line)
+
+        # 去重并保持顺序
+        seen = set()
+        unique_errors = []
+        for err in key_errors:
+            if err not in seen:
+                seen.add(err)
+                unique_errors.append(err)
+
+        return unique_errors[:10]  # 最多返回10个关键错误
+
+    @classmethod
+    def _extract_test_count(cls, summary: str) -> Dict[str, int]:
+        """
+        从总结中提取测试数量
+
+        【利益隔离】只提取事实数字
+        """
+        import re
+        counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0, "total": 0}
+
+        if not summary:
+            return counts
+
+        # 匹配类似 "3 passed, 1 failed, 2 skipped"
+        patterns = [
+            (r'(\d+)\s+passed', 'passed'),
+            (r'(\d+)\s+failed', 'failed'),
+            (r'(\d+)\s+error', 'error'),
+            (r'(\d+)\s+skipped', 'skipped'),
+        ]
+
+        for pattern, key in patterns:
+            match = re.search(pattern, summary, re.IGNORECASE)
+            if match:
+                counts[key] = int(match.group(1))
+
+        counts['total'] = sum(counts.values()) - counts.get('skipped', 0)
+        return counts
 
     @classmethod
     def _extract_coverage_info(cls, logs: str) -> Optional[Dict[str, Any]]:

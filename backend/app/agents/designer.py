@@ -50,28 +50,34 @@ class DesignerAgent(LangGraphAgent[DesignerOutput]):
 2. 分析项目文件树，特别是 backend/app/api/ 目录下的现有 API 风格
 3. 【重要】仔细阅读提供的代码上下文（related_code_context 和 full_files_context）
 4. 参考现有代码的组织方式、命名规范和实现风格
-5. 输出详细的技术设计方案，包含：
-   - technical_design: 技术设计方案概述
-   - api_endpoints: API 端点列表（包含 method, path, description）
-   - function_changes: 函数修改列表（包含 file, function, action: add/modify/delete, description）
-   - logic_flow: 逻辑流图（文本描述形式）
-   - dependencies: 新增依赖列表
-   - affected_files: 受影响文件列表（相对路径）
+5. 输出详细的技术设计方案
 
-【输出格式】
-必须严格输出 JSON 格式，不要包含 Markdown 代码块标记：
-{
-    "technical_design": "...",
-    "api_endpoints": [
-        {"method": "POST", "path": "/api/v1/...", "description": "..."}
-    ],
-    "function_changes": [
-        {"file": "backend/app/...", "function": "...", "action": "add", "description": "..."}
-    ],
-    "logic_flow": "...",
-    "dependencies": ["..."],
-    "affected_files": ["backend/app/..."]
-}
+【输出格式 - 极其重要】
+你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
+输出必须是一个有效的 JSON 对象。
+
+正确示例（直接输出 JSON）：
+{"technical_design": "实现用户认证系统", "api_endpoints": [{"method": "POST", "path": "/api/v1/auth/login", "description": "用户登录"}], "function_changes": [{"file": "backend/app/api/v1/auth.py", "function": "login", "action": "add", "description": "添加登录接口"}], "logic_flow": "1. 接收用户名密码 2. 验证 3. 返回token", "dependencies": ["fastapi", "sqlmodel"], "affected_files": ["backend/app/api/v1/auth.py"]}
+
+错误示例（不要这样输出）：
+- 不要添加 ```json 标记
+- 不要添加解释文本
+- 不要使用工具调用格式如 [TOOL_CALL]
+- 不要输出 "我需要先查看..." 等思考过程
+- 只输出纯 JSON
+
+【强制要求】
+- 直接输出 JSON，不要有任何前缀或后缀
+- 确保 JSON 格式完整有效
+- 不要输出任何其他内容
+
+【字段说明】
+- technical_design: 技术设计方案概述
+- api_endpoints: API 端点列表（包含 method, path, description, request_body, response_fields）
+- function_changes: 函数修改列表（包含 file, function, action: add/modify/delete, description）
+- logic_flow: 逻辑流图（文本描述形式）
+- dependencies: 新增依赖列表
+- affected_files: 受影响文件列表（相对路径）
 
 【风格参考】
 - 路由层：backend/app/api/v1/*.py，使用 FastAPI APIRouter

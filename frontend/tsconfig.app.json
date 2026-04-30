@@ -6,6 +6,7 @@
     "module": "esnext",
     "types": ["vite/client"],
     "skipLibCheck": true,
+    "ignoreDeprecations": "5.0",
 
     /* Bundler mode */
     "moduleResolution": "bundler",
@@ -30,7 +31,8 @@
       "@hooks/*": ["src/hooks/*"],
       "@stores/*": ["src/stores/*"],
       "@utils/*": ["src/utils/*"],
-      "@types": ["src/types/index.ts"]
+      "@types": ["src/types/index.ts"],
+      "@injector": ["src/injector/index.ts"]
     }
   },
   "include": ["src"]

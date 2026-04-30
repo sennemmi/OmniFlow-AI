@@ -25,7 +25,8 @@ class Config(BaseSettings):
     CORS_ORIGINS: List[str] = ["*"]
 
     # 数据库配置
-    DATABASE_URL: str = "sqlite:///./omniflow.db"
+    # 注意：异步 SQLAlchemy 需要使用 sqlite+aiosqlite 格式
+    DATABASE_URL: str = "sqlite+aiosqlite:///./omniflow.db"
 
     # API 版本
     API_V1_PREFIX: str = "/api/v1"
@@ -78,6 +79,14 @@ class Config(BaseSettings):
 
     # AI 操作的目标项目路径（必须使用绝对路径）
     TARGET_PROJECT_PATH: str = ""
+
+    # ============================================
+    # 代码安全机制配置
+    # ============================================
+
+    # Read Token 密钥（用于验证先读后写机制）
+    # 如果不设置，系统会自动生成一个随机密钥（重启后失效）
+    READ_TOKEN_SECRET: Optional[str] = None
 
     # ============================================
     # GitHub 集成配置

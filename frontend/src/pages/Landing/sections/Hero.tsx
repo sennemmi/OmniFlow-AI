@@ -6,6 +6,7 @@ import {
   ArrowRight,
   Play,
   CheckCircle2,
+  ChevronRight,
 } from 'lucide-react';
 
 export function Hero() {
@@ -25,7 +26,8 @@ export function Hero() {
         <div className="absolute inset-0 bg-[url('data:image/svg+xml,%3Csvg%20width%3D%2260%22%20height%3D%2260%22%20viewBox%3D%220%200%2060%2060%22%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3Cg%20fill%3D%22none%22%20fill-rule%3D%22evenodd%22%3E%3Cg%20fill%3D%22%23ffffff%22%20fill-opacity%3D%220.03%22%3E%3Cpath%20d%3D%22M36%2034v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6%2034v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6%204V0H4v4H0v2h4v4h2V6h4V4H6z%22/%3E%3C/g%3E%3C/g%3E%3C/svg%3E')] opacity-50" />
       </div>
 
-      <div className="container-feishu relative z-10 pt-20">
+      {/* 将内容整体向上挪动，-mt-16 在小屏生效，lg:-mt-24 在大屏生效 */}
+      <div className="container-feishu relative z-10 -mt-16 lg:-mt-24">
         <div className="grid lg:grid-cols-2 gap-16 items-center">
           {/* 左侧文案 */}
           <div className="space-y-8">
@@ -34,7 +36,8 @@ export function Hero() {
               <span className="text-sm text-white/90">AI 驱动的开发全流程引擎</span>
             </div>
 
-            <h1 className="text-5xl lg:text-7xl font-bold leading-tight">
+            {/* 将 leading-tight 改为 leading-[1.1] 增加紧凑感 */}
+            <h1 className="text-5xl lg:text-7xl font-bold leading-[1.1]">
               <span className="bg-gradient-to-r from-blue-500 via-blue-400 to-blue-600 bg-clip-text text-transparent">
                 让 AI 重新定义
               </span>
@@ -63,18 +66,6 @@ export function Hero() {
                 </div>
                 观看产品演示
               </button>
-            </div>
-
-            {/* 信任标识 */}
-            <div className="pt-8 border-t border-white/10">
-              <p className="text-sm text-white/40 mb-6">已获得众多行业领先企业信赖</p>
-              <div className="flex items-center gap-8 opacity-40">
-                {['字节跳动', '阿里巴巴', '腾讯', '美团', '京东'].map((company) => (
-                  <span key={company} className="text-white/70 font-semibold text-lg">
-                    {company}
-                  </span>
-                ))}
-              </div>
             </div>
           </div>
 
@@ -151,13 +142,34 @@ export function Hero() {
         </div>
       </div>
 
-      {/* 滚动提示 */}
-      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 text-white/30">
-        <span className="text-xs">探索更多</span>
-        <div className="w-6 h-10 rounded-full border-2 border-white/20 flex justify-center pt-2">
-          <div className="w-1.5 h-1.5 rounded-full bg-white/50 animate-bounce" />
+      {/* 滚动提示 - 强化版 */}
+      <button
+        onClick={() => {
+          // 点击自动滚动到下一屏
+          window.scrollTo({ top: window.innerHeight, behavior: 'smooth' });
+        }}
+        className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-3 text-white/60 hover:text-blue-400 transition-all duration-300 group cursor-pointer z-20"
+      >
+        {/* 文字部分：加粗并增加字间距 */}
+        <span className="text-xs font-bold tracking-[0.2em] uppercase mb-1">
+          向下滑动 探索更多
+        </span>
+
+        <div className="relative flex flex-col items-center">
+          {/* 鼠标图标：增加亮度 */}
+          <div className="w-6 h-10 rounded-full border-2 border-white/40 flex justify-center pt-2 group-hover:border-blue-400 transition-colors">
+            <div className="w-1 h-2 rounded-full bg-blue-400 animate-bounce" />
+          </div>
+
+          {/* 新增：动态下箭头，明确指向下方 */}
+          <div className="mt-2">
+            <ChevronRight className="w-5 h-5 rotate-90 text-blue-400/80 animate-pulse" />
+          </div>
         </div>
-      </div>
+
+        {/* 背景光晕：让提示区域在深色背景下更突出 */}
+        <div className="absolute -inset-4 bg-blue-500/5 blur-xl rounded-full -z-10 opacity-0 group-hover:opacity-100 transition-opacity" />
+      </button>
     </section>
   );
 }

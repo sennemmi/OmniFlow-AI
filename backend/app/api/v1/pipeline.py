@@ -979,13 +979,13 @@ async def handle_test_decision(
     if choice == "rollback":
         # 直接回滚：调 git provider revert，标记 pipeline FAILED
         from app.service.git_provider_gitpython import GitProviderGitPython
-        from app.service.pipeline_refactored import PipelineService as RefactoredPipelineService
+        from app.service.pipeline import PipelineService
         from app.core.config import settings
         from pathlib import Path
 
         git = GitProviderGitPython(Path(settings.TARGET_PROJECT_PATH))
         await asyncio.to_thread(git.revert_last_commit)   # 视 git_provider 实现而定
-        await RefactoredPipelineService.mark_pipeline_failed(
+        await PipelineService.mark_pipeline_failed(
             pipeline_id, "用户选择回滚", session
         )
         await push_log(pipeline_id, "info", "✅ 代码已回滚", stage="CODING")
@@ -1020,8 +1020,8 @@ async def handle_test_decision(
     async def run_update_tests_task(pid: int, ctx: str):
         from app.core.database import async_session_factory
         async with async_session_factory() as s:
-            from app.service.pipeline_refactored import PipelineService as RefactoredPipelineService
-            await RefactoredPipelineService.trigger_coding_phase(pid, s, error_context=ctx)
+            from app.service.pipeline import PipelineService
+            await PipelineService.trigger_coding_phase(pid, s, error_context=ctx)
 
     background_tasks.add_task(run_update_tests_task, pipeline_id, error_context)
     await push_log(pipeline_id, "info",

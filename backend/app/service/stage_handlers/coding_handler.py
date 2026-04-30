@@ -30,7 +30,7 @@ class CodingHandler(StageHandler):
         """准备阶段：获取 DESIGN 阶段输出，创建 CODING 阶段记录"""
         from sqlmodel import select
         from app.models.pipeline import PipelineStage
-        
+
         # 获取 DESIGN 阶段输出
         statement = select(PipelineStage).where(
             PipelineStage.pipeline_id == context.pipeline_id,
@@ -38,20 +38,18 @@ class CodingHandler(StageHandler):
         )
         result = await context.session.execute(statement)
         design_stage = result.scalar_one_or_none()
-        
+
         if not design_stage or not design_stage.output_data:
             raise ValueError("No design output found for CODING stage")
-        
+
         context.previous_output = design_stage.output_data
-        
-        # 获取目标文件
-        target_files = await AgentCoordinatorService.get_target_files_for_coding(
-            pipeline_id=context.pipeline_id,
-            design_output=design_stage.output_data,
-            session=context.session
-        )
-        context.input_data["target_files"] = target_files
-        
+
+        # 【改造】不再预加载目标文件内容
+        # CoderAgent 现在使用工具按需读取文件（glob/grep/read_file）
+        # 只传递 affected_files 列表供参考，不加载内容
+        affected_files = design_stage.output_data.get("affected_files", [])
+        context.input_data["affected_files"] = affected_files
+
         # 创建 CODING 阶段
         coding_stage = await WorkflowService.create_stage(
             pipeline_id=context.pipeline_id,
@@ -60,22 +58,22 @@ class CodingHandler(StageHandler):
             session=context.session
         )
         context.stage_id = coding_stage.id
-        
+
         # 提交事务释放连接
         await context.session.commit()
-        
+
         return context
     
     async def execute(self, context: StageContext) -> StageResult:
         """执行代码生成"""
         pipeline_id = context.pipeline_id
         design_output = context.previous_output
-        target_files = context.input_data.get("target_files", {})
-        
+        affected_files = context.input_data.get("affected_files", [])
+
         await push_log(pipeline_id, "info", "开始代码生成...", stage="CODING")
-        
+
         from app.agents.multi_agent_coordinator import multi_agent_coordinator
-        
+
         multi_agent_result = None
         sandbox_info = None
         sandbox_started = False
@@ -92,10 +90,11 @@ class CodingHandler(StageHandler):
                 stage="CODING"
             )
 
-            # 调用带自动修复的协调器
+            # 【改造】调用带自动修复的协调器
+            # 不再传入预加载的 target_files，CoderAgent 使用工具按需读取
             multi_agent_result = await multi_agent_coordinator.execute_with_auto_fix(
                 design_output=design_output,
-                target_files=target_files,
+                affected_files=affected_files,
                 pipeline_id=pipeline_id,
                 workspace_path="/workspace",  # 容器内路径，固定
                 sandbox_port=sandbox_info.port,  # 透传给 coordinator，存入 output_data
@@ -149,9 +148,9 @@ class CodingHandler(StageHandler):
             }
 
             # 注意：失败时不保存 multi_agent_output，避免脏数据残留
-            # 只保存目标文件信息用于调试
-            if target_files:
-                output_data["target_files"] = target_files
+            # 只保存 affected_files 列表用于调试
+            if affected_files:
+                output_data["affected_files"] = affected_files
 
             return StageResult.failure_result(
                 message=f"Code generation failed: {error_msg}",
@@ -215,15 +214,15 @@ class CodingHandler(StageHandler):
         if result.success:
             # 创建 UNIT_TESTING 阶段
             coding_output = result.output_data.get("multi_agent_output", {})
-            target_files = result.output_data.get("target_files", {})
+            affected_files = context.input_data.get("affected_files", [])
             design_output = context.previous_output
-            
+
             await WorkflowService.create_stage(
                 pipeline_id=context.pipeline_id,
                 stage_name=StageName.UNIT_TESTING,
                 input_data={
                     "coding_output": coding_output,
-                    "target_files": target_files,
+                    "affected_files": affected_files,
                     "design_output": design_output
                 },
                 session=context.session

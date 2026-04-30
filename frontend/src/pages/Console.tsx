@@ -39,19 +39,31 @@ export function Console() {
   const navigate = useNavigate();
 
   // 获取统计数据
-  const { data: stats, refetch: refetchStats } = useQuery<SystemStats>({
+  const {
+    data: stats,
+    refetch: refetchStats,
+  } = useQuery<SystemStats>({
     queryKey: ['system-stats'],
     queryFn: () => apiGet('/system/stats'),
     refetchInterval: 30000,
   });
 
   // 获取流水线列表
-  const { data: pipelinesData, isLoading } = useQuery<PipelineListResponse>({
+  const {
+    data: pipelinesData,
+    isLoading: isLoadingPipelines,
+    refetch: refetchPipelines,
+  } = useQuery<PipelineListResponse>({
     queryKey: ['pipelines'],
     queryFn: () => apiGet('/pipelines'),
   });
 
   const pipelines = pipelinesData?.pipelines || [];
+
+  // 硬刷新 - 浏览器页面重载
+  const handleRefresh = () => {
+    window.location.reload();
+  };
 
   // 快捷操作：Cmd+K 打开创建弹窗
   useEffect(() => {
@@ -74,14 +86,55 @@ export function Console() {
   // 计算平均耗时
   const avgDuration = stats?.avg_duration ? Number(stats.avg_duration.toFixed(2)) : 0;
 
-  // 获取最近的流水线
-  const recentPipelines = pipelines.slice(0, 5);
+  // 先按创建时间倒序排列（最新的在前），再取前 5 条
+  const recentPipelines = [...pipelines]
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, 5);
 
-  // 获取待审批的流水线
-  const pendingPipelines = pipelines.filter((p) => p.status === 'paused').slice(0, 3);
+  // 同理，待审批流水线也改为显示最新的 3 条
+  const pendingPipelines = pipelines
+    .filter((p) => p.status === 'paused')
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, 3);
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-8 relative">
+      {/* 新增：顶部待审批悬浮通知 */}
+      {pendingPipelines.length > 0 && (
+        <div className="animate-in slide-in-from-top duration-500 sticky top-0 z-30 -mt-4 mb-8">
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 shadow-sm flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <div className="w-10 h-10 rounded-full bg-amber-100 flex items-center justify-center">
+                <AlertCircle className="w-5 h-5 text-amber-600" />
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-amber-900">
+                  您有 {pendingPipelines.length} 个任务等待审批
+                </h4>
+                <p className="text-xs text-amber-700">
+                  最新需求：{pendingPipelines[0].description}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {/* 如果有多个，可以显示更多，这里简化逻辑，点击直接去最新的那个 */}
+              <button
+                onClick={() => navigate(`/console/pipelines/${pendingPipelines[0].id}`)}
+                className="px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 transition-colors shadow-sm"
+              >
+                立即处理
+              </button>
+              <button
+                onClick={() => navigate('/console/pipelines')}
+                className="px-3 py-2 text-amber-700 text-sm font-medium hover:bg-amber-100 rounded-lg transition-colors"
+              >
+                查看全部
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 页面头部 */}
       <div className="flex items-center justify-between">
         <div>
@@ -90,7 +143,7 @@ export function Console() {
         </div>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => refetchStats()}
+            onClick={handleRefresh}
             className="p-2.5 text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-all"
           >
             <RefreshCw className="w-5 h-5" />
@@ -205,7 +258,7 @@ export function Console() {
             </div>
 
             <div className="divide-y divide-slate-100">
-              {isLoading ? (
+              {isLoadingPipelines ? (
                 <div className="p-8 flex items-center justify-center">
                   <RefreshCw className="w-6 h-6 text-blue-600 animate-spin" />
                 </div>
@@ -279,40 +332,7 @@ export function Console() {
             </div>
           </div>
 
-          {/* 待审批 */}
-          {pendingPipelines.length > 0 && (
-            <div className="bg-amber-50 border border-amber-200 rounded-xl p-6">
-              <div className="flex items-center gap-2 mb-4">
-                <AlertCircle className="w-5 h-5 text-amber-600" />
-                <h3 className="font-semibold text-amber-900">待您审批</h3>
-                <span className="px-2 py-0.5 bg-amber-200 text-amber-800 text-xs font-medium rounded-full">
-                  {pendingPipelines.length}
-                </span>
-              </div>
-              <div className="space-y-3">
-                {pendingPipelines.map((pipeline) => (
-                  <div
-                    key={pipeline.id}
-                    onClick={() => navigate(`/console/pipelines/${pipeline.id}`)}
-                    className="p-3 bg-white border border-amber-200 rounded-lg cursor-pointer hover:shadow-md transition-all"
-                  >
-                    <p className="text-sm font-medium text-slate-900 line-clamp-1">
-                      {pipeline.description}
-                    </p>
-                    <p className="text-xs text-slate-500 mt-1">
-                      等待审批 · {pipeline.current_stage}
-                    </p>
-                  </div>
-                ))}
-              </div>
-              <button
-                onClick={() => navigate('/console/pipelines')}
-                className="w-full mt-4 py-2 text-sm text-amber-700 font-medium hover:text-amber-800 transition-colors"
-              >
-                查看全部待审批
-              </button>
-            </div>
-          )}
+
 
           {/* 快捷入口 */}
           <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">

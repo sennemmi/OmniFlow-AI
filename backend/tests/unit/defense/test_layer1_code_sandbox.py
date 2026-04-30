@@ -221,10 +221,15 @@ def calculate_diff(a: int, b: int) -> int:
             # 初始化服务
             executor = CodeExecutorService(str(project_root))
 
-            # 模拟 AI 写入错误代码
+            # 【Read Token 机制】先读取文件获取 read_token
+            read_result = executor.read_file("calculator.py")
+            assert read_result.read_token, "应该能获取 read_token"
+
+            # 模拟 AI 写入错误代码（使用 read_token）
             change = executor.apply_file_change(
                 relative_path="calculator.py",
-                new_content=corrupted_content
+                new_content=corrupted_content,
+                read_token=read_result.read_token
             )
 
             # 验证变更已应用
@@ -255,13 +260,25 @@ def calculate_diff(a: int, b: int) -> int:
 
             executor = CodeExecutorService(str(project_root))
 
-            # 批量变更
+            # 【Read Token 机制】先读取所有文件获取 read_token
+            read_result1 = executor.read_file("file1.py")
+            read_result2 = executor.read_file("file2.py")
+
+            # 批量变更（使用 read_token）
             corrupted_content_1 = original_content + "\n# Modified by AI 1"
             corrupted_content_2 = original_content + "\n# Modified by AI 2"
-            changes = {
-                "file1.py": corrupted_content_1,
-                "file2.py": corrupted_content_2
-            }
+            changes = [
+                {
+                    "file_path": "file1.py",
+                    "new_content": corrupted_content_1,
+                    "read_token": read_result1.read_token
+                },
+                {
+                    "file_path": "file2.py",
+                    "new_content": corrupted_content_2,
+                    "read_token": read_result2.read_token
+                }
+            ]
 
             result = executor.apply_changes(changes)
             assert result.success
@@ -300,9 +317,11 @@ class TestPathTraversalProtection:
             # 这不是一个安全漏洞，因为只是在这个测试项目目录下创建奇怪的子目录
 
             # 真正的测试：验证服务只操作 project_root 下的文件
+            # 【Read Token 机制】新文件使用 NEW_FILE token
             result = executor.apply_file_change(
                 relative_path="subdir/file.py",
                 new_content="# test",
+                read_token="NEW_FILE",
                 create_if_missing=True
             )
 
@@ -327,9 +346,13 @@ class TestPathTraversalProtection:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("# original")
 
+            # 【Read Token 机制】先读取文件获取 read_token
+            read_result = executor.read_file("backend/app/test.py")
+
             result = executor.apply_file_change(
                 relative_path="backend/app/test.py",
-                new_content="# modified"
+                new_content="# modified",
+                read_token=read_result.read_token
             )
 
             assert result.success

@@ -134,51 +134,73 @@ class TestMaxRetriesLimitTerminatesLoop:
     def test_max_retries_limit_stops_loop(self):
         """测试最大重试次数限制能终止循环"""
         import asyncio
+        from app.agents.auto_fix_loop import AutoFixLoop
 
         async def run_test():
-            coordinator = MultiAgentCoordinator()
+            # 【改造】直接测试 AutoFixLoop 模块
+            auto_fix = AutoFixLoop()
 
             # 验证 MAX_FIX_RETRIES 是 3
-            assert coordinator.MAX_FIX_RETRIES == 3
+            assert auto_fix.MAX_FIX_RETRIES == 3
 
-            # 模拟一个永远返回失败的 execute_with_auto_fix
-            with patch.object(coordinator, '_execute_code_agent') as mock_code:
+            # 模拟 _execute_code_agent 永远返回成功（生成代码）
+            with patch.object(auto_fix, '_execute_code_agent') as mock_code:
                 mock_code.return_value = {
                     "success": True,
-                    "code_output": {"files": [{"file_path": "test.py", "content": "# test"}]},
+                    "code_output": {
+                        "files": [{
+                            "file_path": "backend/test.py",
+                            "content": "# test",
+                            "change_type": "add",
+                            "read_token": "NEW_FILE"
+                        }]
+                    },
                     "input_tokens": 100,
                     "output_tokens": 50
                 }
 
-                # 模拟测试永远失败
-                with patch('app.service.layered_test_runner.LayeredTestRunner.run') as mock_test:
-                    mock_test.return_value = MagicMock(
-                        all_passed=False,
-                        failure_cause="code_bug",
-                        layers=[MagicMock(layer="new_tests", passed=False)],
-                        regression_failed_tests=[]
-                    )
+                # 模拟 _verify_fixes 永远返回失败（测试不通过）
+                with patch.object(auto_fix, '_verify_fixes') as mock_verify:
+                    mock_verify.return_value = {
+                        "verdict": "FAIL",
+                        "errors": ["Test failed"],
+                        "summary": "测试失败",
+                        "structured_errors": {"errors": [{"file_path": "test.py", "line": 1, "summary": "assertion failed"}]},
+                        "message": "Verification FAILED"
+                    }
 
-                    # 模拟 ReviewAgent 永远返回 auto_fix
-                    with patch('app.agents.reviewer.ReviewAgent.decide') as mock_decide:
-                        mock_decide.return_value = MagicMock(
-                            action="auto_fix",
-                            error_context="Test failure"
-                        )
+                    # 模拟 RepairerAgent 修复（但仍然失败）
+                    with patch('app.agents.repairer.RepairerAgent.execute_with_reread') as mock_repair:
+                        mock_repair.return_value = {
+                            "success": True,
+                            "output": {
+                                "files": [{
+                                    "file_path": "backend/test.py",
+                                    "content": "# fixed test",
+                                    "change_type": "modify",
+                                    "read_token": "TOKEN123"
+                                }]
+                            }
+                        }
 
-                        # 执行
-                        result = await coordinator.execute_with_auto_fix(
-                            design_output={},
-                            target_files={},
-                            pipeline_id=1,
-                            workspace_path="/tmp",
-                            sandbox_port=None
-                        )
+                        # 模拟文件写入（避免实际文件操作）
+                        with patch('app.service.file_write_handler.file_write_handler.write_files_to_project'):
+                            with patch.object(auto_fix, '_write_files_to_sandbox'):
+                                # 执行
+                                result = await auto_fix.execute(
+                                    design_output={},
+                                    affected_files=[],
+                                    pipeline_id=1,
+                                    workspace_path="/tmp",
+                                    sandbox_port=None
+                                )
 
-                        # 验证在达到最大重试次数后停止
-                        assert result["success"] is False
-                        # 验证 attempt 不会超过 MAX_FIX_RETRIES
-                        assert result["attempt"] <= coordinator.MAX_FIX_RETRIES + 1
+                                # 验证在达到最大重试次数后停止
+                                assert result["success"] is False
+                                # 验证返回结果包含 error 键
+                                assert "error" in result
+                                # 验证 attempt 不会超过 MAX_FIX_RETRIES
+                                assert result["attempt"] <= auto_fix.MAX_FIX_RETRIES + 1
 
         asyncio.run(run_test())
 

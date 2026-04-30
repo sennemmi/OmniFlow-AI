@@ -13,6 +13,8 @@ Agent 基类
 import json
 import re
 import time
+import asyncio
+import random
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, TypeVar, Generic, TypedDict
 
@@ -270,42 +272,80 @@ class LangGraphAgent(ABC, Generic[T]):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        retry_count: int = 3
     ) -> Dict[str, Any]:
         """
         统一 LLM 调用方法（异步）
 
-        使用注入的 LLM Provider 进行调用
+        使用注入的 LLM Provider 进行调用，支持指数退避重试
 
         Args:
             system_prompt: 系统提示
             user_prompt: 用户提示
             temperature: 温度参数
             max_tokens: 最大 Token 数
+            retry_count: 重试次数
 
         Returns:
             Dict: {content, input_tokens, output_tokens}
 
         Raises:
-            LLMCallError: 调用失败
+            LLMCallError: 调用失败（所有重试都失败）
         """
-        try:
-            # 检查 API Key
-            if not settings.llm_api_key:
-                raise LLMCallError(
-                    f"{self._llm_provider.provider_name} API Key 未配置"
+        last_error = None
+
+        for attempt in range(retry_count):
+            try:
+                # 检查 API Key
+                if not settings.llm_api_key:
+                    raise LLMCallError(
+                        f"{self._llm_provider.provider_name} API Key 未配置"
+                    )
+
+                # 使用注入的 Provider 调用 LLM
+                result = await self._llm_provider.call(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens
                 )
 
-            # 使用注入的 Provider 调用 LLM
-            return await self._llm_provider.call(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
+                # 成功返回
+                if attempt > 0:
+                    logger.info(f"[{self.agent_name}] LLM 调用在重试 {attempt} 次后成功")
+                return result
 
-        except Exception as e:
-            raise LLMCallError(f"LLM 调用失败: {e}")
+            except LLMCallError as e:
+                last_error = e
+                error_msg = str(e)
+
+                # 判断是否应该重试
+                # 某些错误不应该重试（如 API Key 错误）
+                if "API Key" in error_msg or "未配置" in error_msg:
+                    raise  # 不重试，直接抛出
+
+                # 记录重试日志
+                if attempt < retry_count - 1:
+                    # 指数退避 + 随机抖动
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        f"[{self.agent_name}] LLM 调用失败 (尝试 {attempt + 1}/{retry_count}): {error_msg[:100]}，"
+                        f"{delay:.1f}s 后重试..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[{self.agent_name}] LLM 调用失败，已重试 {retry_count} 次")
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"[{self.agent_name}] LLM 调用异常: {e}")
+                if attempt < retry_count - 1:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    await asyncio.sleep(delay)
+
+        # 所有重试都失败
+        raise LLMCallError(f"LLM 调用失败（重试 {retry_count} 次）: {last_error}")
     
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """

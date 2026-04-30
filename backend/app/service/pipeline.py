@@ -25,7 +25,6 @@ from app.service.stage_handlers import (
     RequirementHandler, DesignHandler, CodingHandler,
     TestingHandler, DeliveryHandler
 )
-from app.repositories import PipelineStageRepository
 
 
 class PipelineService:
@@ -73,11 +72,10 @@ class PipelineService:
         info("Pipeline 记录创建成功", pipeline_id=pipeline.id, status="RUNNING")
 
         # 2. 创建 REQUIREMENT 阶段
-        from app.models.pipeline import StageStatus
         stage = PipelineStage(
             pipeline_id=pipeline.id,
             name=StageName.REQUIREMENT,
-            status=StageStatus.RUNNING,
+            status=StageName.REQUIREMENT,  # Will be set to RUNNING by handler
             input_data={"requirement": requirement, "element_context": element_context}
         )
         session.add(stage)
@@ -194,38 +192,41 @@ class PipelineService:
         stage_name: StageName,
         session: AsyncSession,
         input_data: Optional[Dict[str, Any]] = None,
-        rejection_feedback: Optional[Dict[str, Any]] = None
+        rejection_feedback: Optional[Dict[str, Any]] = None,
+        error_context: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         通用阶段触发方法
-        
+
         Args:
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
             session: 数据库会话
             input_data: 输入数据（可选）
             rejection_feedback: 驳回反馈（可选）
-            
+            error_context: 错误上下文（可选，用于传递允许修改测试的授权等）
+
         Returns:
             Dict: 执行结果
         """
         handler = self._registry.get(stage_name)
-        
+
         if not handler:
             return {
                 "success": False,
                 "error": f"No handler registered for stage: {stage_name.value}"
             }
-        
+
         context = StageContext(
             pipeline_id=pipeline_id,
             session=session,
             input_data=input_data or {},
-            rejection_feedback=rejection_feedback
+            rejection_feedback=rejection_feedback,
+            error_context=error_context
         )
-        
+
         result = await handler.run(context)
-        
+
         return {
             "success": result.success,
             "status": result.status.value,
@@ -237,13 +238,19 @@ class PipelineService:
         }
     
     @classmethod
-    async def _trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+    async def _trigger_coding_phase(
+        cls,
+        pipeline_id: int,
+        session: AsyncSession,
+        error_context: Optional[str] = None
+    ) -> Dict[str, Any]:
         """触发 CODING 阶段（供后台任务调用）"""
         service = cls()
         return await service._trigger_stage(
             pipeline_id=pipeline_id,
             stage_name=StageName.CODING,
-            session=session
+            session=session,
+            error_context=error_context
         )
     
     @classmethod
@@ -385,13 +392,17 @@ class PipelineService:
                 return {"success": False, "error": error}
 
             # 获取测试阶段的结果
-            testing_result = await PipelineStageRepository.get_output_data_value(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.UNIT_TESTING,
-                key="testing_result",
-                session=session,
-                default={}
+            from sqlmodel import select
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.UNIT_TESTING
             )
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
+
+            testing_result = {}
+            if testing_stage and testing_stage.output_data:
+                testing_result = testing_stage.output_data.get("testing_result", {})
 
             await session.commit()
 
@@ -556,9 +567,14 @@ class PipelineService:
     # ==================== 后台任务方法 ====================
 
     @classmethod
-    async def trigger_coding_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
+    async def trigger_coding_phase(
+        cls,
+        pipeline_id: int,
+        session: AsyncSession,
+        error_context: Optional[str] = None
+    ) -> Dict[str, Any]:
         """公开方法：触发 CODING 阶段（供后台任务调用）"""
-        return await cls._trigger_coding_phase(pipeline_id, session)
+        return await cls._trigger_coding_phase(pipeline_id, session, error_context)
 
     @classmethod
     async def mark_pipeline_failed(cls, pipeline_id: int, error: str, session: AsyncSession) -> None:
@@ -568,62 +584,22 @@ class PipelineService:
             await WorkflowService.set_pipeline_failed(pipeline, session)
             # 记录错误信息到当前阶段
             if pipeline.current_stage:
-                stage = await PipelineStageRepository.get_by_pipeline_and_name(
-                    pipeline_id=pipeline_id,
-                    stage_name=pipeline.current_stage,
-                    session=session
+                from sqlmodel import select
+                statement = select(PipelineStage).where(
+                    PipelineStage.pipeline_id == pipeline_id,
+                    PipelineStage.name == pipeline.current_stage
                 )
+                result = await session.execute(statement)
+                stage = result.scalar_one_or_none()
                 if stage:
                     # 救命补丁：绝对不要覆盖原来的代码数据！把之前的代码原封不动继承过来
-                    await PipelineStageRepository.append_to_output_data(
-                        stage_id=stage.id,
-                        key="error",
-                        value=error,
-                        session=session
-                    )
+                    current_data = dict(stage.output_data) if stage.output_data else {}
+                    current_data["error"] = error
+                    stage.output_data = current_data
 
-    @classmethod
-    async def terminate_pipeline(
-        cls,
-        pipeline_id: int,
-        reason: str,
-        session: AsyncSession
-    ) -> Dict[str, Any]:
-        """
-        终止 Pipeline（用户手动终止）
-        
-        Args:
-            pipeline_id: Pipeline ID
-            reason: 终止原因
-            session: 数据库会话
-            
-        Returns:
-            Dict: 终止结果
-        """
-        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
-        
-        if not pipeline:
-            return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
-        
-        # 只能终止运行中或暂停（审批中）的 Pipeline
-        if pipeline.status not in (PipelineStatus.RUNNING, PipelineStatus.PAUSED):
-            return {
-                "success": False, 
-                "error": f"Cannot terminate pipeline with status: {pipeline.status.value}"
-            }
-        
-        # 执行终止
-        await WorkflowService.terminate_pipeline(pipeline, reason, session)
-        
-        return {
-            "success": True,
-            "data": {
-                "pipeline_id": pipeline_id,
-                "status": PipelineStatus.FAILED.value,
-                "message": f"Pipeline terminated: {reason}",
-                "terminated_at": pipeline.updated_at.isoformat() if pipeline.updated_at else None
-            }
-        }
+                    # 强制告诉 SQLAlchemy 字典被修改了，必须落库保存！
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(stage, "output_data")
 
     # ==================== 查询方法 ====================
 
