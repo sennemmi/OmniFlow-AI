@@ -7,6 +7,8 @@
 - 支持带反馈的重新设计
 """
 
+from typing import Optional
+
 from app.core.logging import info, error
 from app.core.sse_log_buffer import push_log
 from app.models.pipeline import StageName, PipelineStatus
@@ -119,4 +121,73 @@ class DesignHandler(StageHandler):
         return StageResult.failure_result(
             message=f"Technical design failed: {str(error)}",
             output_data={"error": str(error), "error_type": type(error).__name__}
+        )
+
+    async def on_approved(
+        self,
+        context: StageContext,
+        notes: Optional[str] = None,
+        feedback: Optional[str] = None
+    ) -> StageResult:
+        """
+        DESIGN 阶段被批准后：触发后台 CODING 任务
+        
+        注意：此阶段需要后台异步执行，避免 HTTP 超时
+        """
+        from app.models.pipeline import PipelineStatus
+        
+        await push_log(
+            context.pipeline_id,
+            "info",
+            "技术设计已批准，代码生成任务将在后台启动...",
+            stage="DESIGN"
+        )
+        
+        # 返回 async=True 信息，由 PipelineService 处理后台任务
+        return StageResult.success_result(
+            message="代码生成任务已在后台启动，请通过日志监控进度",
+            output_data={
+                "previous_stage": StageName.DESIGN.value,
+                "next_stage": StageName.CODING.value,
+                "async": True,
+                "requires_background_task": True
+            },
+            status=PipelineStatus.RUNNING
+        )
+    
+    async def on_rejected(
+        self,
+        context: StageContext,
+        reason: str,
+        suggested_changes: Optional[str] = None
+    ) -> StageResult:
+        """
+        DESIGN 阶段被驳回后：重新执行 DESIGN 阶段
+        """
+        await push_log(
+            context.pipeline_id,
+            "info",
+            f"技术设计被驳回，原因: {reason}，重新设计...",
+            stage="DESIGN"
+        )
+        
+        # 重新执行当前阶段
+        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
+        
+        result = await self.run(StageContext(
+            pipeline_id=context.pipeline_id,
+            session=context.session,
+            input_data={},
+            rejection_feedback=rejection_feedback
+        ))
+        
+        return StageResult(
+            success=result.success,
+            status=result.status,
+            message=result.message,
+            output_data={
+                "previous_stage": StageName.DESIGN.value,
+                "current_stage": StageName.DESIGN.value,
+                "feedback": rejection_feedback
+            }
         )

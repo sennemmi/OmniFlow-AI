@@ -3,6 +3,8 @@
 路由层 - 只负责路由定义和参数解析
 """
 
+import time
+from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Request, Depends
 from pydantic import BaseModel, Field
@@ -10,9 +12,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import func, select
 
 from app.service.system_stats import SystemStatsService
-from app.core.response import ResponseModel
-from app.core.database import get_session
+from app.core.response import ResponseModel, success_response
+from app.core.database import get_session, get_db_status
 from app.models.pipeline import Pipeline, PipelineStage, PipelineStatus
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -111,6 +114,361 @@ async def get_system_stats(
     except Exception as e:
         from app.core.logging import error
         error("获取系统统计失败", exc_info=True)
+        return ResponseModel(
+            success=False,
+            data=None,
+            error=str(e),
+            request_id=request_id
+        )
+
+
+# ============================================
+# 新增系统资源统计端点
+# ============================================
+
+class SystemResourceStats(BaseModel):
+    """系统资源统计响应模型"""
+    cpu_percent: float = Field(
+        ...,
+        description="CPU 使用率 (百分比，0-100)",
+        ge=0,
+        le=100,
+        example=45.5
+    )
+    memory_percent: float = Field(
+        ...,
+        description="内存使用率 (百分比，0-100)",
+        ge=0,
+        le=100,
+        example=62.3
+    )
+    memory_used_mb: int = Field(
+        ...,
+        description="已使用内存 (MB)",
+        example=4096
+    )
+    memory_total_mb: int = Field(
+        ...,
+        description="总内存 (MB)",
+        example=8192
+    )
+    disk_percent: float = Field(
+        ...,
+        description="磁盘使用率 (百分比，0-100)",
+        ge=0,
+        le=100,
+        example=75.0
+    )
+    disk_used_gb: float = Field(
+        ...,
+        description="已使用磁盘空间 (GB)",
+        example=150.5
+    )
+    disk_total_gb: float = Field(
+        ...,
+        description="总磁盘空间 (GB)",
+        example=200.0
+    )
+    uptime_seconds: int = Field(
+        ...,
+        description="服务运行时间 (秒)",
+        example=3600
+    )
+
+
+@router.get(
+    "/system/stats",
+    response_model=ResponseModel,
+    summary="获取系统资源使用统计",
+    description="""
+    获取服务器实时的 CPU 使用率、内存占用情况和磁盘使用情况。
+
+    返回数据说明：
+    - **cpu_percent**: CPU 使用率百分比（0-100）
+    - **memory_percent**: 内存使用率百分比（0-100）
+    - **memory_used_mb**: 已使用内存（MB）
+    - **memory_total_mb**: 总内存（MB）
+    - **disk_percent**: 磁盘使用率百分比（0-100）
+    - **disk_used_gb**: 已使用磁盘空间（GB）
+    - **disk_total_gb**: 总磁盘空间（GB）
+    - **uptime_seconds**: 服务运行时间（秒）
+
+    适用于：
+    - 系统监控面板
+    - 资源使用趋势分析
+    - 告警阈值判断
+    """,
+    response_description="系统 CPU、内存和磁盘使用统计"
+)
+async def get_system_stats(request: Request):
+    """
+    获取系统资源使用统计（CPU、内存、磁盘）
+    """
+    request_id = getattr(request.state, "request_id", None)
+    try:
+        stats = await SystemStatsService.get_resource_stats()
+        return ResponseModel(
+            success=True,
+            data=SystemResourceStats(
+                cpu_percent=stats["cpu_percent"],
+                memory_percent=stats["memory_percent"],
+                memory_used_mb=stats["memory_used_mb"],
+                memory_total_mb=stats["memory_total_mb"],
+                disk_percent=stats["disk_percent"],
+                disk_used_gb=stats["disk_used_gb"],
+                disk_total_gb=stats["disk_total_gb"],
+                uptime_seconds=stats["uptime_seconds"]
+            ).model_dump(),
+            error=None,
+            request_id=request_id
+        )
+    except Exception as e:
+        from app.core.logging import error
+        error("获取系统资源统计失败", exc_info=True)
+        return ResponseModel(
+            success=False,
+            data=None,
+            error=str(e),
+            request_id=request_id
+        )
+
+
+# ============================================
+# 新增数据库状态检查端点
+# ============================================
+
+class DatabaseStatusResponse(BaseModel):
+    """数据库状态响应模型"""
+    connected: bool = Field(
+        ...,
+        description="数据库是否连接成功",
+        example=True
+    )
+    database_url: str = Field(
+        ...,
+        description="数据库连接URL（已脱敏）",
+        example="sqlite+aiosqlite:///./omniflow.db"
+    )
+    pool_size: int = Field(
+        ...,
+        description="连接池大小",
+        example=5
+    )
+    active_connections: int = Field(
+        ...,
+        description="当前活跃连接数",
+        example=1
+    )
+
+
+@router.get(
+    "/system/db-status",
+    response_model=ResponseModel,
+    summary="检查数据库连接状态",
+    description="""
+    检查数据库连接状态和连接池统计信息。
+
+    返回数据说明：
+    - **connected**: 数据库是否连接成功
+    - **database_url**: 数据库连接URL（已脱敏处理）
+    - **pool_size**: 连接池大小
+    - **active_connections**: 当前活跃连接数
+
+    适用于：
+    - 数据库健康检查
+    - 连接池监控
+    """,
+    response_description="数据库连接状态信息"
+)
+async def get_db_status_endpoint(request: Request):
+    """
+    检查数据库连接状态和统计信息
+    """
+    request_id = getattr(request.state, "request_id", None)
+    try:
+        db_status = await get_db_status()
+        return ResponseModel(
+            success=True,
+            data=DatabaseStatusResponse(**db_status).model_dump(),
+            error=None,
+            request_id=request_id
+        )
+    except Exception as e:
+        from app.core.logging import error
+        error("获取数据库状态失败", exc_info=True)
+        return ResponseModel(
+            success=False,
+            data=None,
+            error=str(e),
+            request_id=request_id
+        )
+
+
+# ============================================
+# 新增综合健康检查端点
+# ============================================
+
+class ServiceCheck(BaseModel):
+    """服务状态检查"""
+    status: str = Field(..., description="状态 (healthy/degraded/unhealthy)")
+    version: str = Field(..., description="服务版本")
+    uptime_seconds: int = Field(..., description="运行时间（秒）")
+
+
+class DatabaseCheck(BaseModel):
+    """数据库状态检查"""
+    status: str = Field(..., description="状态 (healthy/degraded/unhealthy)")
+    connected: bool = Field(..., description="是否已连接")
+
+
+class ResourcesCheck(BaseModel):
+    """资源状态检查"""
+    status: str = Field(..., description="状态 (healthy/degraded/unhealthy)")
+    cpu_percent: float = Field(..., description="CPU使用率")
+    memory_percent: float = Field(..., description="内存使用率")
+    disk_percent: float = Field(..., description="磁盘使用率")
+
+
+class DetailedHealthResponse(BaseModel):
+    """综合健康检查响应模型"""
+    overall_status: str = Field(
+        ...,
+        description="整体状态 (healthy/degraded/unhealthy)",
+        example="healthy"
+    )
+    checks: dict = Field(
+        ...,
+        description="各项检查结果",
+        example={
+            "service": {"status": "healthy", "version": "0.1.0", "uptime_seconds": 3600},
+            "database": {"status": "healthy", "connected": True},
+            "resources": {"status": "healthy", "cpu_percent": 45.5, "memory_percent": 62.3, "disk_percent": 75.0}
+        }
+    )
+    timestamp: str = Field(
+        ...,
+        description="检查时间戳",
+        example="2024-01-15T10:30:00"
+    )
+
+
+# 记录服务启动时间
+SERVICE_START_TIME = time.time()
+
+
+@router.get(
+    "/system/health-detailed",
+    response_model=ResponseModel,
+    summary="综合健康检查",
+    description="""
+    综合健康检查，包含服务状态、数据库状态和资源使用情况。
+
+    返回数据说明：
+    - **overall_status**: 整体健康状态 (healthy/degraded/unhealthy)
+    - **checks**: 各项检查结果
+        - **service**: 服务状态（版本、运行时间）
+        - **database**: 数据库状态（连接状态）
+        - **resources**: 资源状态（CPU、内存、磁盘使用率）
+    - **timestamp**: 检查时间戳
+
+    状态判定规则：
+    - **healthy**: 所有检查项正常
+    - **degraded**: 部分检查项警告（如资源使用率高但未超限）
+    - **unhealthy**: 存在严重问题（如数据库连接失败）
+
+    适用于：
+    - 生产环境健康监控
+    - 负载均衡器健康检查
+    - 告警系统
+    """,
+    response_description="综合健康检查报告"
+)
+async def get_detailed_health(request: Request):
+    """
+    综合健康检查，聚合服务状态、数据库状态和资源使用信息
+    """
+    request_id = getattr(request.state, "request_id", None)
+    try:
+        # 1. 服务状态
+        uptime_seconds = int(time.time() - SERVICE_START_TIME)
+        service_check = ServiceCheck(
+            status="healthy",
+            version=settings.APP_VERSION,
+            uptime_seconds=uptime_seconds
+        )
+
+        # 2. 数据库状态
+        try:
+            db_status = await get_db_status()
+            db_connected = db_status.get("connected", False)
+            db_check = DatabaseCheck(
+                status="healthy" if db_connected else "unhealthy",
+                connected=db_connected
+            )
+        except Exception:
+            db_check = DatabaseCheck(
+                status="unhealthy",
+                connected=False
+            )
+
+        # 3. 资源状态
+        try:
+            resource_stats = await SystemStatsService.get_resource_stats()
+            cpu_percent = resource_stats["cpu_percent"]
+            memory_percent = resource_stats["memory_percent"]
+            disk_percent = resource_stats["disk_percent"]
+
+            # 判定资源状态
+            if cpu_percent > 90 or memory_percent > 90 or disk_percent > 95:
+                resources_status = "unhealthy"
+            elif cpu_percent > 70 or memory_percent > 70 or disk_percent > 85:
+                resources_status = "degraded"
+            else:
+                resources_status = "healthy"
+
+            resources_check = ResourcesCheck(
+                status=resources_status,
+                cpu_percent=cpu_percent,
+                memory_percent=memory_percent,
+                disk_percent=disk_percent
+            )
+        except Exception:
+            resources_check = ResourcesCheck(
+                status="unhealthy",
+                cpu_percent=0.0,
+                memory_percent=0.0,
+                disk_percent=0.0
+            )
+
+        # 计算整体状态
+        checks = {
+            "service": service_check.model_dump(),
+            "database": db_check.model_dump(),
+            "resources": resources_check.model_dump()
+        }
+
+        if db_check.status == "unhealthy" or resources_check.status == "unhealthy":
+            overall_status = "unhealthy"
+        elif resources_check.status == "degraded":
+            overall_status = "degraded"
+        else:
+            overall_status = "healthy"
+
+        health_data = DetailedHealthResponse(
+            overall_status=overall_status,
+            checks=checks,
+            timestamp=datetime.now().isoformat()
+        )
+
+        return ResponseModel(
+            success=True,
+            data=health_data.model_dump(),
+            error=None,
+            request_id=request_id
+        )
+    except Exception as e:
+        from app.core.logging import error
+        error("综合健康检查失败", exc_info=True)
         return ResponseModel(
             success=False,
             data=None,

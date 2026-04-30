@@ -43,8 +43,8 @@ def apply_search_replace(
 def test_real_scenario():
     """测试真实场景"""
 
-    # 读取真实的 health.py 文件
-    health_py_path = Path(r"d:\feishuProj\backend\app\api\v1\health.py")
+    # 读取真实的 health.py 文件（使用脚本所在目录推导路径）
+    health_py_path = Path(__file__).parent.parent / "app/api/v1/health.py"
 
     if not health_py_path.exists():
         print(f"[ERROR] 文件不存在: {health_py_path}")

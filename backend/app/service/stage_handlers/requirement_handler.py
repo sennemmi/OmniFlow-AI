@@ -122,3 +122,90 @@ class RequirementHandler(StageHandler):
             message=f"Requirement analysis failed: {str(error)}",
             output_data={"error": str(error), "error_type": type(error).__name__}
         )
+    
+    async def on_approved(
+        self,
+        context: StageContext,
+        notes: Optional[str] = None,
+        feedback: Optional[str] = None
+    ) -> StageResult:
+        """
+        REQUIREMENT 阶段被批准后：触发 DESIGN 阶段
+        """
+        from app.service.stage_handlers import DesignHandler
+        
+        await push_log(
+            context.pipeline_id,
+            "info",
+            "需求分析已批准，开始技术设计...",
+            stage="REQUIREMENT"
+        )
+        
+        # 创建 DESIGN 阶段的 Handler 并执行
+        design_handler = DesignHandler()
+        design_context = StageContext(
+            pipeline_id=context.pipeline_id,
+            session=context.session,
+            input_data={}
+        )
+        
+        result = await design_handler.run(design_context)
+        
+        return StageResult(
+            success=result.success,
+            status=result.status,
+            message=result.message,
+            output_data={
+                "previous_stage": StageName.REQUIREMENT.value,
+                "next_stage": StageName.DESIGN.value,
+                "design_result": result.output_data
+            },
+            git_branch=result.git_branch,
+            commit_hash=result.commit_hash,
+            pr_url=result.pr_url
+        )
+    
+    async def on_rejected(
+        self,
+        context: StageContext,
+        reason: str,
+        suggested_changes: Optional[str] = None
+    ) -> StageResult:
+        """
+        REQUIREMENT 阶段被驳回后：重新执行 REQUIREMENT 阶段
+        """
+        await push_log(
+            context.pipeline_id,
+            "info",
+            f"需求分析被驳回，原因: {reason}，重新分析...",
+            stage="REQUIREMENT"
+        )
+        
+        # 获取 pipeline 描述
+        pipeline = await WorkflowService.get_pipeline_with_stages(
+            context.pipeline_id, context.session
+        )
+        
+        if not pipeline:
+            return StageResult.failure_result("Pipeline not found")
+        
+        # 重新执行当前阶段
+        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
+        
+        result = await self.run(StageContext(
+            pipeline_id=context.pipeline_id,
+            session=context.session,
+            input_data={"requirement": pipeline.description},
+            rejection_feedback=rejection_feedback
+        ))
+        
+        return StageResult(
+            success=result.success,
+            status=result.status,
+            message=result.message,
+            output_data={
+                "previous_stage": StageName.REQUIREMENT.value,
+                "current_stage": StageName.REQUIREMENT.value,
+                "feedback": rejection_feedback
+            }
+        )

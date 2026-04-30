@@ -2,15 +2,15 @@
 SandboxManager - Docker 沙箱管理器
 
 管理 Pipeline 的 Docker 沙箱容器生命周期，包括启动、停止、执行命令等功能。
+提供文件操作、命令执行、Git 操作等高级接口。
 """
 
 import asyncio
+import base64
 import socket
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
-
-import httpx
 
 from app.core.logging import info, error, set_pipeline_id
 
@@ -118,7 +118,6 @@ class SandboxManager:
                 stdout, _ = await check_proc.communicate()
                 if stdout.decode().strip():
                     # 容器正在运行，认为就绪
-                    info("Container is running")
                     return True
                 else:
                     error(f"Container {container_name} is not running")
@@ -170,7 +169,7 @@ class SandboxManager:
 
             # 检查是否已存在
             if pipeline_id in self._sandboxes:
-                info(f"Sandbox already exists for pipeline {pipeline_id}")
+                info("Sandbox already exists", pipeline_id=pipeline_id)
                 return self._sandboxes[pipeline_id]
 
             # 强制清理可能存在的残留容器
@@ -182,10 +181,8 @@ class SandboxManager:
 
             # 查找可用端口
             port = await self._find_available_port()
-            info(f"Using port {port} for sandbox", port=port)
 
             # 构建 docker run 命令
-            # 使用预构建的 omniflowai/sandbox 镜像，依赖已预装
             cmd = [
                 "docker", "run", "--rm", "-d",
                 "--name", container_name,
@@ -194,10 +191,10 @@ class SandboxManager:
                 "--memory", "512m",
                 "--cpus", "1",
                 "--network", self._network_name,
-                "omniflowai/sandbox:latest",  # 使用预构建镜像
+                "omniflowai/sandbox:latest",
             ]
 
-            info("Starting sandbox container", container_name=container_name)
+            info("Starting sandbox", container_name=container_name, port=port)
 
             # 启动容器
             proc = await asyncio.create_subprocess_exec(
@@ -213,10 +210,8 @@ class SandboxManager:
                 raise RuntimeError(f"Failed to start sandbox: {error_msg}")
 
             container_id = stdout.decode().strip()
-            info(f"Container started", container_id=container_id[:12])
 
             # 等待容器就绪（检查容器是否运行）
-            info("Waiting for container to be ready...")
             if not await self._wait_for_container_ready(container_name, timeout=10):
                 # 获取容器日志以便调试
                 try:
@@ -233,9 +228,9 @@ class SandboxManager:
 
                 # 启动失败，清理容器
                 await self._stop_container(container_name)
-                raise RuntimeError("Container failed to become ready within 180 seconds")
+                raise RuntimeError("Container failed to become ready within timeout")
 
-            info("Container is ready")
+            info("Sandbox started", container_id=container_id[:12])
 
             # 创建沙箱信息
             sandbox_info = SandboxInfo(
@@ -325,7 +320,7 @@ class SandboxManager:
                 )
 
             container_name = f"omniflow-sandbox-{pipeline_id}"
-            info(f"Executing command in sandbox", cmd=cmd[:100])
+            info("Executing command", cmd=cmd[:50])
 
             # 构建 docker exec 命令
             exec_cmd = [
@@ -399,6 +394,112 @@ class SandboxManager:
             List[SandboxInfo]: 沙箱信息列表
         """
         return list(self._sandboxes.values())
+
+    # ==================== 高级工具方法 ====================
+
+    async def read_file(self, pipeline_id: int, path: str) -> str:
+        """
+        读取容器内 /workspace/{path} 的文件内容
+
+        Args:
+            pipeline_id: Pipeline ID
+            path: 文件路径（相对于 /workspace）
+
+        Returns:
+            str: 文件内容
+
+        Raises:
+            FileNotFoundError: 文件不存在或读取失败
+        """
+        result = await self.exec(pipeline_id, f"cat /workspace/{path}")
+        if result.exit_code != 0:
+            raise FileNotFoundError(result.stderr)
+        return result.stdout
+
+    async def write_file(self, pipeline_id: int, path: str, content: str) -> bool:
+        """
+        将 content 写入容器内 /workspace/{path}
+
+        Args:
+            pipeline_id: Pipeline ID
+            path: 文件路径（相对于 /workspace）
+            content: 文件内容
+
+        Returns:
+            bool: 是否写入成功
+        """
+        # 用 base64 传输内容避免引号转义问题
+        b64 = base64.b64encode(content.encode()).decode()
+        result = await self.exec(
+            pipeline_id,
+            f"echo {b64} | base64 -d > /workspace/{path}"
+        )
+        return result.exit_code == 0
+
+    async def exec_command(self, pipeline_id: int, cmd: str, timeout: int = 30) -> dict:
+        """
+        在容器内执行命令
+
+        Args:
+            pipeline_id: Pipeline ID
+            cmd: 要执行的命令
+            timeout: 超时时间（秒）
+
+        Returns:
+            dict: 包含 stdout, stderr, exit_code, timed_out 的字典
+        """
+        result = await self.exec(pipeline_id, cmd, timeout)
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out
+        }
+
+    async def list_directory(self, pipeline_id: int, path: str = ".", depth: int = 2) -> str:
+        """
+        列出容器内目录内容
+
+        Args:
+            pipeline_id: Pipeline ID
+            path: 目录路径（相对于 /workspace）
+            depth: 遍历深度
+
+        Returns:
+            str: 目录列表字符串
+        """
+        result = await self.exec(
+            pipeline_id, f"find /workspace/{path} -maxdepth {depth} -not -path '*/.git/*'"
+        )
+        return result.stdout
+
+    async def git_diff(self, pipeline_id: int) -> str:
+        """
+        获取 Git 变更差异
+
+        Args:
+            pipeline_id: Pipeline ID
+
+        Returns:
+            str: git diff 输出
+        """
+        result = await self.exec(pipeline_id, "cd /workspace && git diff")
+        return result.stdout
+
+    async def git_reset(self, pipeline_id: int) -> bool:
+        """
+        重置 Git 工作区（丢弃所有变更）
+
+        Args:
+            pipeline_id: Pipeline ID
+
+        Returns:
+            bool: 是否重置成功
+        """
+        result = await self.exec(
+            pipeline_id, "cd /workspace && git checkout -- . && git clean -fd"
+        )
+        return result.exit_code == 0
 
 
 # 全局单例

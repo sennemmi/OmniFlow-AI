@@ -10,17 +10,19 @@ from app.service.stage_handlers.requirement_handler import RequirementHandler
 from app.service.stage_handlers.design_handler import DesignHandler
 from app.service.stage_handlers.coding_handler import CodingHandler
 from app.service.stage_handlers.testing_handler import TestingHandler
+from app.service.stage_handlers.code_review_handler import CodeReviewHandler
 from app.service.stage_handlers.delivery_handler import DeliveryHandler
 from app.service.stage_handlers.registry import StageHandlerRegistry
 
 __all__ = [
     "StageHandler",
-    "StageContext", 
+    "StageContext",
     "StageResult",
     "RequirementHandler",
     "DesignHandler",
     "CodingHandler",
     "TestingHandler",
+    "CodeReviewHandler",
     "DeliveryHandler",
     "StageHandlerRegistry",
 ]

@@ -5,6 +5,7 @@ Auto-Fix 循环模块
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Dict, List, Optional, Any
@@ -13,9 +14,10 @@ from pathlib import Path
 from app.agents.coder import coder_agent
 from app.agents.tester import test_agent
 from app.agents.repairer import RepairerAgent
-from app.service.sandbox_tools import write_file as sandbox_write_file, exec_command, read_file
+from app.service.sandbox_manager import sandbox_manager
 from app.service.code_executor import CodeExecutorService
 from app.service.file_write_handler import file_write_handler
+from app.service.file_writer import FileWriterService
 from app.service.import_sanitizer import ImportSanitizer
 from app.service.error_context_parser import parse_error_context
 from app.core.code_validator import code_validator
@@ -25,6 +27,23 @@ from app.core.config import settings
 from app.core.resilience import ResilienceManager, RetryConfig, CircuitBreakerOpenError
 
 logger = logging.getLogger(__name__)
+
+# 【致命错误】上下文超限等不可重试的错误签名
+FATAL_ERRORS = [
+    "choices': None",       # 上下文超限，重试无效
+    "choices is None",
+    "completion_tokens': 0, 'prompt_tokens': 0",
+    "context length exceeded",
+    "maximum context length",
+    "token limit exceeded",
+]
+
+
+def _is_fatal_error(error_msg: str) -> bool:
+    """判断是否是不可重试的致命错误（如上下文超限）"""
+    if not error_msg:
+        return False
+    return any(sig in error_msg for sig in FATAL_ERRORS)
 
 
 class AutoFixLoop:
@@ -52,13 +71,16 @@ class AutoFixLoop:
         pipeline_id: int,
         workspace_path: str,
         sandbox_port: Optional[int] = None,
-        error_context: Optional[str] = None
+        error_context: Optional[str] = None,
+        injected_files: Optional[Dict[str, str]] = None,
+        file_service: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         执行带自动修复的多 Agent 代码生成
 
         【改造】不再传入预加载的 target_files，改为传入 affected_files 列表
-        CoderAgent 使用工具按需读取文件内容
+        【核心】支持 injected_files 参数，由上游 ArchitectAgent 预读取的文件内容
+        【新架构】支持 file_service 参数，用于直接操作 Sandbox 中的文件
         """
         current_error_context = error_context
         attempt = 0
@@ -79,6 +101,14 @@ class AutoFixLoop:
                 stage="CODING"
             )
 
+        if injected_files:
+            await push_log(
+                pipeline_id,
+                "info",
+                f"📦 从 ArchitectAgent 获取到 {len(injected_files)} 个预读取文件",
+                stage="CODING"
+            )
+
         while attempt <= self.MAX_FIX_RETRIES:
             if attempt > 0:
                 await push_log(
@@ -88,12 +118,13 @@ class AutoFixLoop:
                     stage="CODING"
                 )
 
-            # 1. Coder 生成代码
+            # 1. Coder 生成代码（透传 injected_files）
             code_result = await self._execute_code_agent(
                 design_output,
                 test_files,
                 pipeline_id=pipeline_id,
-                error_context=current_error_context
+                error_context=current_error_context,
+                injected_files=injected_files  # 【核心】透传上游注入的文件内容
             )
 
             self.total_input_tokens += code_result.get("input_tokens", 0) or 0
@@ -103,16 +134,44 @@ class AutoFixLoop:
                 last_code_output = code_result["code_output"]
 
             if not code_result["success"]:
+                error_msg = code_result.get("error", "")
+
+                # 【致命错误判断】如果是上下文超限等不可重试错误，直接返回
+                if _is_fatal_error(error_msg):
+                    logger.error(f"AutoFixLoop: 检测到不可重试的致命错误（上下文超限），中止重试", extra={
+                        "pipeline_id": pipeline_id,
+                        "attempt": attempt,
+                        "error": error_msg,
+                        "total_input_tokens": self.total_input_tokens,
+                        "total_output_tokens": self.total_output_tokens
+                    })
+                    await push_log(
+                        pipeline_id,
+                        "error",
+                        f"❌ 检测到上下文超限错误，无法继续。建议减少同时修改的文件数量。",
+                        stage="CODING"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Context limit exceeded: {error_msg}",
+                        "output": None,
+                        "attempt": attempt,
+                        "input_tokens": self.total_input_tokens,
+                        "output_tokens": self.total_output_tokens,
+                        "duration_ms": int((time.time() - start_time) * 1000),
+                        "fatal_error": True
+                    }
+
                 logger.error(f"AutoFixLoop: CoderAgent 执行失败", extra={
                     "pipeline_id": pipeline_id,
                     "attempt": attempt,
-                    "error": code_result["error"],
+                    "error": error_msg,
                     "total_input_tokens": self.total_input_tokens,
                     "total_output_tokens": self.total_output_tokens
                 })
                 return {
                     "success": False,
-                    "error": f"Code generation failed: {code_result['error']}",
+                    "error": f"Code generation failed: {error_msg}",
                     "output": None,
                     "attempt": attempt,
                     "input_tokens": self.total_input_tokens,
@@ -123,6 +182,31 @@ class AutoFixLoop:
             # 2. 处理生成的文件
             code_output = code_result.get("code_output", {})
             all_files = code_output.get("files", [])
+
+            # 【工具驱动写入】检查工具执行结果中的文件修改
+            tool_results = code_result.get("tool_results", [])
+            files_from_tools = []
+            for tool_result in tool_results:
+                if tool_result.get("tool") == "replace_lines" and tool_result.get("success"):
+                    file_path = tool_result.get("arguments", {}).get("file_path", "")
+                    if file_path:
+                        files_from_tools.append({
+                            "file_path": file_path,
+                            "change_type": "modify",
+                            "description": f"通过 replace_lines 工具修改"
+                        })
+
+            # 合并工具修改的文件和输出中声明的文件
+            if files_from_tools:
+                # 以工具实际修改的文件为准
+                all_files = files_from_tools
+                logger.info(f"[Pipeline {pipeline_id}] 从工具结果中提取 {len(files_from_tools)} 个修改文件")
+                await push_log(
+                    pipeline_id, "info",
+                    f"📝 通过工具调用完成 {len(files_from_tools)} 个文件的修改",
+                    stage="CODING"
+                )
+
             if not all_files:
                 return {
                     "success": False,
@@ -152,41 +236,38 @@ class AutoFixLoop:
                 code_output["files"] = all_files
                 code_output["import_fixes"] = fix_report
 
-            # 写入文件（带 Read Token 校验）
-            try:
-                await file_write_handler.write_files_to_project(all_files, pipeline_id)
-                await self._write_files_to_sandbox(all_files, pipeline_id)
-            except PermissionError as e:
-                # 【Read Token 失效】文件可能被修改，需要重新读取
-                logger.warning(f"[Pipeline {pipeline_id}] Read Token 失效，重新读取文件: {e}")
+            # 【改造后】使用 FileWriterService 写入文件（CoderAgent 已不再使用工具）
+            file_writer = FileWriterService(settings.TARGET_PROJECT_PATH)
+            write_results = file_writer.apply_changes(all_files)
+
+            # 检查写入结果
+            failed_writes = [r for r in write_results if not r.get("success")]
+            if failed_writes:
+                failed_files = [r.get("file") for r in failed_writes]
+                error_msgs = [f"{r.get('file')}: {r.get('error')}" for r in failed_writes]
+                logger.error(f"[Pipeline {pipeline_id}] 文件写入失败: {failed_files}")
                 await push_log(
-                    pipeline_id, "warning",
-                    f"文件已被修改，search_block 可能过时，正在重新读取...",
+                    pipeline_id, "error",
+                    f"❌ 文件写入失败 ({len(failed_writes)} 个): {', '.join(failed_files[:3])}",
                     stage="CODING"
                 )
 
-                # 重新读取所有 affected_files 获取新的 read_token
-                code_executor = CodeExecutorService()
-                refreshed_files = {}
-                for file_path in design_output.get("affected_files", []):
-                    relative_path = file_path.replace("backend/", "").replace("backend\\", "")
-                    read_result = code_executor.read_file(relative_path)
-                    if read_result.exists and read_result.content:
-                        refreshed_files[file_path] = read_result.content
-                        logger.info(f"[Pipeline {pipeline_id}] 重新读取: {file_path}")
+                # 构建错误上下文，让 CoderAgent 在下次重试时修复
+                current_error_context = (
+                    f"文件写入失败，请检查 search_block 是否精确匹配文件内容。\n"
+                    f"失败文件:\n" + "\n".join(error_msgs[:5])
+                )
+                attempt += 1
+                continue
 
-                if refreshed_files:
-                    current_error_context = (
-                        f"文件已被外部修改，read_token 失效。\n"
-                        f"错误: {str(e)}\n"
-                        f"请使用 read_file 工具重新读取以下文件，获取最新的 read_token：\n"
-                        f"{list(refreshed_files.keys())}\n"
-                        f"然后基于最新内容重新生成 search_block。"
-                    )
-                    attempt += 1
-                    continue
-                else:
-                    raise
+            # 写入成功，同步到 sandbox
+            await self._sync_files_to_sandbox(all_files, pipeline_id)
+
+            await push_log(
+                pipeline_id, "info",
+                f"✅ 文件写入成功 ({len(all_files)} 个文件)",
+                stage="CODING"
+            )
 
             # 3. 【阶段二：独立验证步骤】使用 VerifyAgent 进行验证
             verify_result = await self._verify_fixes(pipeline_id, all_files)
@@ -228,6 +309,12 @@ class AutoFixLoop:
                 evidence = verify_result.get("evidence", {})
                 snippet = evidence.get("failed_output", "")[:1500]
 
+                # 【调试】打印详细错误信息
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】验证失败详情:")
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】 - failed_tests 数量: {len(failed_tests)}")
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】 - structured_errors: {structured_errors}")
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】 - all_files: {[f.get('file_path', '') for f in all_files]}")
+
                 fix_order = {
                     "type": "fix_order",
                     "category": "code_bug",
@@ -239,11 +326,24 @@ class AutoFixLoop:
                     "fix_hint": "根据以上测试输出修复代码，务必使所有测试通过。"
                 }
 
+                # 【调试】打印修复工单
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】修复工单: {json.dumps(fix_order, indent=2, ensure_ascii=False)[:1000]}")
+
                 await push_log(
                     pipeline_id, "info",
                     f"📋 修复工单已生成: {len(fix_order['errors'])} 个错误项",
                     stage="CODING"
                 )
+
+                # 【新架构】优先使用 file_service（Sandbox 模式），否则使用本地路径
+                if file_service:
+                    logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 进行修复")
+                    project_path = None  # Sandbox 模式下不需要本地路径
+                else:
+                    # 【修复】使用 workspace_path 而不是 settings.TARGET_PROJECT_PATH
+                    # 因为在 E2E 测试中，代码实际在临时工作目录中
+                    project_path = workspace_path
+                    logger.info(f"[Pipeline {pipeline_id}] 【调试】项目路径: {project_path}")
 
                 # 【利益隔离核心】调用 RepairerAgent 进行修复
                 repairer = RepairerAgent()
@@ -251,7 +351,8 @@ class AutoFixLoop:
                     pipeline_id=pipeline_id,
                     stage_name="CODING_REPAIR",
                     fix_order=fix_order,
-                    project_path=str(Path(settings.TARGET_PROJECT_PATH).resolve()),
+                    project_path=project_path,
+                    file_service=file_service,  # 【新架构】传入 SandboxFileService
                     initial_state={
                         "design_output": design_output,
                         "error_context": structured_errors,
@@ -265,11 +366,17 @@ class AutoFixLoop:
 
                 if not repair_result.get("success"):
                     logger.error(f"[Pipeline {pipeline_id}] RepairerAgent 修复失败")
+                    logger.error(f"[Pipeline {pipeline_id}] 【调试】修复结果: {json.dumps(repair_result, indent=2, ensure_ascii=False)[:1000]}")
                     await push_log(
                         pipeline_id, "error",
                         f"❌ RepairerAgent 修复失败: {repair_result.get('error', '未知错误')}",
                         stage="CODING"
                     )
+                    # 【调试】打印更多错误信息
+                    if repair_result.get('tool_results'):
+                        logger.info(f"[Pipeline {pipeline_id}] 【调试】工具调用结果: {repair_result.get('tool_results')}")
+                    if repair_result.get('injected_files'):
+                        logger.info(f"[Pipeline {pipeline_id}] 【调试】读取的文件: {list(repair_result.get('injected_files', {}).keys())}")
                     attempt += 1
                     continue
 
@@ -317,7 +424,8 @@ class AutoFixLoop:
         design_output: Dict[str, Any],
         test_files: Dict[str, str],
         pipeline_id: Optional[int] = None,
-        error_context: Optional[str] = None
+        error_context: Optional[str] = None,
+        injected_files: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """执行 CoderAgent"""
         from app.agents.coder import coder_agent
@@ -325,7 +433,8 @@ class AutoFixLoop:
         logger.info(f"AutoFixLoop: 开始执行 CoderAgent", extra={
             "pipeline_id": pipeline_id,
             "affected_files": design_output.get("affected_files", []),
-            "test_files_count": len(test_files)
+            "test_files_count": len(test_files),
+            "injected_files_count": len(injected_files) if injected_files else 0
         })
 
         # 构建增强的 design_output（包含测试文件参考）
@@ -333,9 +442,10 @@ class AutoFixLoop:
 
         try:
             code_result = await coder_agent.generate_code(
-                enhanced_design,
-                pipeline_id,
-                error_context=error_context
+                design_output=enhanced_design,
+                pipeline_id=pipeline_id,
+                error_context=error_context,
+                injected_files=injected_files  # 【核心】透传上游注入的文件内容
             )
 
             if code_result["success"]:
@@ -394,7 +504,7 @@ class AutoFixLoop:
 
             for test_path in possible_test_paths:
                 try:
-                    content = await read_file(pipeline_id, test_path)
+                    content = await sandbox_manager.read_file(pipeline_id, test_path)
                     if content:
                         test_files[test_path] = content
                         logger.info(f"读取测试文件成功: {test_path}", extra={
@@ -435,11 +545,53 @@ class AutoFixLoop:
     ) -> None:
         """写入文件到容器（用于实时预览）"""
         for file_change in all_files:
-            await sandbox_write_file(
+            await sandbox_manager.write_file(
                 pipeline_id=pipeline_id,
                 path=file_change["file_path"],
                 content=file_change["content"]
             )
+
+    async def _sync_files_to_sandbox(
+        self,
+        all_files: List[Dict[str, Any]],
+        pipeline_id: int
+    ) -> None:
+        """
+        同步已修改的文件到 sandbox（工具驱动模式）
+
+        在工具驱动模式下，文件已通过 replace_lines 工具写入项目目录，
+        此方法将文件同步到 sandbox 容器用于预览。
+        """
+        from app.core.config import settings
+        from pathlib import Path
+
+        target_path = Path(settings.TARGET_PROJECT_PATH)
+        if not target_path.is_absolute():
+            backend_dir = Path(__file__).parent.parent
+            target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
+
+        for file_change in all_files:
+            file_path = file_change.get("file_path", "")
+            if not file_path:
+                continue
+
+            # 读取项目目录中的文件内容
+            relative_path = file_path.replace("backend/", "").replace("backend\\", "")
+            full_path = target_path / relative_path
+
+            try:
+                if full_path.exists():
+                    content = full_path.read_text(encoding='utf-8')
+                    await sandbox_manager.write_file(
+                        pipeline_id=pipeline_id,
+                        path=file_path,
+                        content=content
+                    )
+                    logger.info(f"[Pipeline {pipeline_id}] 同步文件到 sandbox: {file_path}")
+                else:
+                    logger.warning(f"[Pipeline {pipeline_id}] 文件不存在，跳过同步: {full_path}")
+            except Exception as e:
+                logger.error(f"[Pipeline {pipeline_id}] 同步文件失败 {file_path}: {e}")
 
     async def _verify_fixes(
         self,
@@ -534,7 +686,7 @@ class AutoFixLoop:
         )
 
         async def _do_run_tests():
-            test_result_cmd = await exec_command(
+            test_result_cmd = await sandbox_manager.exec_command(
                 pipeline_id=pipeline_id,
                 cmd="cd /workspace/backend && python -m pytest tests/ -v --tb=short --color=no -x 2>&1 | tail -100",
                 timeout=120
@@ -632,7 +784,7 @@ class AutoFixLoop:
         )
 
         # 首先检查 8000 端口
-        health_check_8000 = await exec_command(
+        health_check_8000 = await sandbox_manager.exec_command(
             pipeline_id=pipeline_id,
             cmd="curl -s http://localhost:8000/api/v1/health 2>&1",
             timeout=5
@@ -655,7 +807,7 @@ class AutoFixLoop:
             stage="CODING"
         )
 
-        await exec_command(
+        await sandbox_manager.exec_command(
             pipeline_id=pipeline_id,
             cmd="cd /workspace/backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --log-level info > /tmp/preview_server.log 2>&1 &",
             timeout=3
@@ -663,7 +815,7 @@ class AutoFixLoop:
 
         await asyncio.sleep(5)
 
-        health_check = await exec_command(
+        health_check = await sandbox_manager.exec_command(
             pipeline_id=pipeline_id,
             cmd="curl -s http://localhost:8001/api/v1/health 2>&1",
             timeout=10

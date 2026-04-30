@@ -143,7 +143,8 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
         pipeline_id: int,
         stage_name: str,
         fix_order: Dict[str, Any],
-        project_path: str,
+        project_path: Optional[str] = None,
+        file_service: Optional[Any] = None,
         initial_state: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -156,13 +157,29 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
             fix_order: 修复工单
-            project_path: 项目路径
+            project_path: 项目路径（本地模式使用）
+            file_service: SandboxFileService 实例（新架构，优先使用）
             initial_state: 初始状态（可选）
 
         Returns:
             Dict[str, Any]: 执行结果
         """
         logger.info(f"[Pipeline {pipeline_id}] RepairerAgent 开始执行（带强制重新读取）")
+
+        # 【新架构】优先使用 file_service（Sandbox 模式）
+        if file_service:
+            logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 读取文件")
+            return await self._execute_with_sandbox_service(
+                pipeline_id, stage_name, fix_order, file_service, initial_state
+            )
+
+        # 本地模式：使用 CodeExecutorService
+        if not project_path:
+            logger.error(f"[Pipeline {pipeline_id}] project_path 和 file_service 都未提供")
+            return {
+                "success": False,
+                "error": "project_path 或 file_service 必须提供一个"
+            }
 
         # 1. 从 fix_order 中提取需要读取的文件
         files_to_read = set()
@@ -181,15 +198,28 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
         read_tokens = {}  # 记录 read_token 用于后续写入
 
         for clean_path in files_to_read:
+            logger.info(f"[Pipeline {pipeline_id}] 正在读取文件: {clean_path}")
             read_result = code_executor.read_file(clean_path)
+            logger.info(f"[Pipeline {pipeline_id}] 读取结果: exists={read_result.exists}, content_len={len(read_result.content) if read_result.content else 0}")
             if read_result.exists and read_result.content is not None:
                 # 存储完整路径（带 backend/ 前缀）
                 full_path = f"backend/{clean_path}"
                 target_files[full_path] = read_result.content
                 read_tokens[full_path] = read_result.read_token
-                logger.debug(f"[Pipeline {pipeline_id}] 重新读取: {full_path}")
+                logger.info(f"[Pipeline {pipeline_id}] 成功读取: {full_path} ({len(read_result.content)} 字符)")
             else:
-                logger.warning(f"[Pipeline {pipeline_id}] 无法读取文件: {clean_path}")
+                logger.warning(f"[Pipeline {pipeline_id}] 无法读取文件: {clean_path}, exists={read_result.exists}, error={read_result.error}")
+                # 【调试】尝试列出目录内容
+                try:
+                    import os
+                    dir_path = os.path.dirname(os.path.join(project_path, clean_path))
+                    if os.path.exists(dir_path):
+                        files = os.listdir(dir_path)
+                        logger.info(f"[Pipeline {pipeline_id}] 目录 {dir_path} 内容: {files}")
+                    else:
+                        logger.warning(f"[Pipeline {pipeline_id}] 目录不存在: {dir_path}")
+                except Exception as e:
+                    logger.error(f"[Pipeline {pipeline_id}] 列出目录失败: {e}")
 
         if not target_files:
             logger.error(f"[Pipeline {pipeline_id}] 没有成功读取任何文件")
@@ -227,11 +257,116 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 
         return result
 
+    async def _execute_with_sandbox_service(
+        self,
+        pipeline_id: int,
+        stage_name: str,
+        fix_order: Dict[str, Any],
+        file_service: Any,
+        initial_state: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        使用 SandboxFileService 执行修复
+
+        Args:
+            pipeline_id: Pipeline ID
+            stage_name: 阶段名称
+            fix_order: 修复工单
+            file_service: SandboxFileService 实例
+            initial_state: 初始状态
+
+        Returns:
+            Dict[str, Any]: 执行结果
+        """
+        logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 执行修复")
+
+        # 1. 从 fix_order 中提取需要读取的文件
+        files_to_read = set()
+        for err in fix_order.get("errors", []):
+            file_path = err.get("file_path")
+            if file_path:
+                # 移除 backend/ 前缀
+                clean_path = file_path.replace("backend/", "").replace("backend\\", "")
+                files_to_read.add(clean_path)
+
+        logger.info(f"[Pipeline {pipeline_id}] 需要从 Sandbox 读取 {len(files_to_read)} 个文件")
+
+        # 2. 使用 SandboxFileService 读取文件
+        target_files = {}
+        read_tokens = {}
+
+        for clean_path in files_to_read:
+            logger.info(f"[Pipeline {pipeline_id}] 正在从 Sandbox 读取: {clean_path}")
+            read_result = await file_service.read_file(clean_path)
+            logger.info(f"[Pipeline {pipeline_id}] Sandbox 读取结果: exists={read_result.exists}")
+
+            if read_result.exists and read_result.content is not None:
+                # 存储完整路径（带 backend/ 前缀）
+                full_path = f"backend/{clean_path}"
+                target_files[full_path] = read_result.content
+                read_tokens[full_path] = read_result.read_token
+                logger.info(f"[Pipeline {pipeline_id}] 成功从 Sandbox 读取: {full_path} ({len(read_result.content)} 字符)")
+            else:
+                logger.warning(f"[Pipeline {pipeline_id}] 无法从 Sandbox 读取: {clean_path}, error={read_result.error}")
+
+        if not target_files:
+            logger.error(f"[Pipeline {pipeline_id}] 没有成功读取任何文件")
+            return {
+                "success": False,
+                "error": "无法读取任何目标文件",
+                "output": None
+            }
+
+        logger.info(f"[Pipeline {pipeline_id}] 成功从 Sandbox 读取 {len(target_files)} 个文件")
+
+        # 3. 构建状态
+        state = initial_state or {}
+        state.update({
+            "fix_order": fix_order,
+            "target_files": target_files,
+            "read_tokens": read_tokens,
+            "file_service": file_service  # 传递给后续步骤用于写入
+        })
+
+        # 4. 调用父类的 execute 方法
+        result = await self.execute(
+            pipeline_id=pipeline_id,
+            stage_name=stage_name,
+            initial_state=state
+        )
+
+        # 5. 如果修复成功，将修改写回 Sandbox
+        if result.get("success") and result.get("output"):
+            output = result["output"]
+            if isinstance(output, dict) and "files" in output:
+                for file_obj in output["files"]:
+                    file_path = file_obj.get("file_path", "")
+                    search_block = file_obj.get("search_block", "")
+                    replace_block = file_obj.get("replace_block", "")
+
+                    if search_block and replace_block:
+                        # 读取当前文件内容
+                        clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                        current_result = await file_service.read_file(clean_path)
+
+                        if current_result.exists and current_result.content:
+                            # 应用替换
+                            new_content = current_result.content.replace(search_block, replace_block, 1)
+                            # 写回 Sandbox
+                            write_result = await file_service.write_file(clean_path, new_content)
+                            if write_result.get("success"):
+                                logger.info(f"[Pipeline {pipeline_id}] 成功将修复写入 Sandbox: {file_path}")
+                            else:
+                                logger.error(f"[Pipeline {pipeline_id}] 写入 Sandbox 失败: {file_path} - {write_result.get('error')}")
+
+        return result
+
 
 # 便捷函数
 async def repair_code(
     fix_order: Dict[str, Any],
-    project_path: str,
+    project_path: Optional[str] = None,
+    file_service: Optional[Any] = None,
     pipeline_id: int = 0
 ) -> Dict[str, Any]:
     """
@@ -239,7 +374,8 @@ async def repair_code(
 
     Args:
         fix_order: 修复工单
-        project_path: 项目路径
+        project_path: 项目路径（本地模式）
+        file_service: SandboxFileService 实例（新架构）
         pipeline_id: Pipeline ID
 
     Returns:
@@ -250,5 +386,6 @@ async def repair_code(
         pipeline_id=pipeline_id,
         stage_name="REPAIR",
         fix_order=fix_order,
-        project_path=project_path
+        project_path=project_path,
+        file_service=file_service
     )

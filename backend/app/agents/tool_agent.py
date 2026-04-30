@@ -54,21 +54,23 @@ class ToolUsingAgent(LangGraphAgent[T]):
         system_prompt: str,
         user_prompt: str,
         project_path: str,
+        pipeline_id: int = 0,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        调用 LLM，支持工具调用循环
+        调用 LLM，支持工具调用循环（包含写入工具）
 
         Args:
             system_prompt: 系统提示
             user_prompt: 用户提示
             project_path: 项目路径（用于工具执行）
+            pipeline_id: Pipeline ID（用于日志推送）
             temperature: 温度参数
-            max_tokens: 最大 Token 数
+            max_tokens: 最大 Token 数（仅用于最终输出，工具调用使用较小值）
 
         Returns:
-            Dict: {content, input_tokens, output_tokens, tool_calls}
+            Dict: {content, input_tokens, output_tokens, tool_calls, tool_results}
         """
         # 获取工具定义
         agent_tools = self._get_agent_tools(project_path)
@@ -83,11 +85,28 @@ class ToolUsingAgent(LangGraphAgent[T]):
         total_input_tokens = 0
         total_output_tokens = 0
         tool_call_count = 0
+        tool_results = []  # 记录所有工具执行结果
 
         while tool_call_count < self.MAX_TOOL_CALLS:
             try:
                 # 调用 LLM（带工具）
                 import litellm
+
+                # 【关键】区分工具调用和最终输出的 max_tokens
+                # 工具调用阶段使用较小值（1000），最终输出阶段使用传入的值
+                is_final_output = tool_call_count > 0 and not any(
+                    m.get("role") == "assistant" and m.get("tool_calls")
+                    for m in messages[-3:]  # 检查最近3条消息是否有工具调用
+                )
+                
+                if is_final_output and max_tokens:
+                    # 最终输出阶段，使用完整的 max_tokens
+                    current_max_tokens = max_tokens
+                    logger.info(f"[{self.agent_name}] 最终输出阶段，使用 max_tokens={max_tokens}")
+                else:
+                    # 工具调用阶段，使用较小的 max_tokens 节省预算
+                    current_max_tokens = 1000
+                    logger.debug(f"[{self.agent_name}] 工具调用阶段，使用 max_tokens=1000")
 
                 response = await litellm.acompletion(
                     model=settings.llm_model,
@@ -95,9 +114,10 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     tools=tools,
                     tool_choice="auto",  # 允许模型选择是否使用工具
                     temperature=temperature,
-                    max_tokens=max_tokens,
+                    max_tokens=current_max_tokens,
                     api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base
+                    api_base=settings.llm_api_base,
+                    custom_llm_provider="openai"  # 强制使用 OpenAI 兼容方式
                 )
 
                 # 记录 Token 使用
@@ -129,36 +149,139 @@ class ToolUsingAgent(LangGraphAgent[T]):
                         ]
                     })
 
-                    # 执行工具调用
+                    # 执行工具调用（支持异步工具）
                     for tool_call in message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = json.loads(tool_call.function.arguments)
 
                         logger.info(f"[{self.agent_name}] Executing tool: {tool_name}({tool_args})")
 
-                        # 执行工具
-                        result = agent_tools.execute_tool(tool_name, tool_args)
+                        # 执行工具（传入 pipeline_id 用于日志推送）
+                        result = await agent_tools.execute_tool(tool_name, tool_args, pipeline_id)
+
+                        # 记录工具结果
+                        try:
+                            result_data = json.loads(result)
+                            tool_results.append({
+                                "tool": tool_name,
+                                "arguments": tool_args,
+                                "result": result_data,
+                                "success": result_data.get("success", True)
+                            })
+                        except:
+                            tool_results.append({
+                                "tool": tool_name,
+                                "arguments": tool_args,
+                                "result": result,
+                                "success": True
+                            })
+
+                        # 【层面一】工具返回内容截断，防止上下文爆炸
+                        MAX_TOOL_RESULT_CHARS = 8000  # 约 2000 tokens
+
+                        tool_content = result
+                        if len(result) > MAX_TOOL_RESULT_CHARS:
+                            # 解析 JSON，只截断 lines 字段，保留元信息
+                            try:
+                                result_obj = json.loads(result)
+                                if "lines" in result_obj:
+                                    lines_text = result_obj["lines"]
+                                    if len(lines_text) > MAX_TOOL_RESULT_CHARS:
+                                        kept_lines = lines_text[:MAX_TOOL_RESULT_CHARS]
+                                        result_obj["lines"] = kept_lines + f"\n... [已截断，原文件共 {result_obj.get('total_lines', '?')} 行，超出部分省略]"
+                                        result_obj["truncated"] = True
+                                        tool_content = json.dumps(result_obj, ensure_ascii=False)
+                            except (json.JSONDecodeError, KeyError):
+                                tool_content = result[:MAX_TOOL_RESULT_CHARS] + "\n... [内容已截断]"
 
                         # 添加工具结果到消息
                         messages.append({
                             "role": "tool",
-                            "content": result,
+                            "content": tool_content,
                             "tool_call_id": tool_call.id
                         })
+
+                    # 【层面二】防止总消息历史过大
+                    MAX_CONTEXT_CHARS = 60000  # Kimi-K2.5 约 128K tokens，留 50% 安全边距
+
+                    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+                    if total_chars > MAX_CONTEXT_CHARS:
+                        logger.warning(
+                            f"[{self.agent_name}] 上下文过大 ({total_chars} chars)，"
+                            f"停止工具调用，请求 LLM 输出简短结论"
+                        )
+                        # 【修复】不再直接返回 fallback，而是让 LLM 基于已有信息输出简短 JSON
+                        # 添加提示消息，要求 LLM 输出简短结论
+                        messages.append({
+                            "role": "user",
+                            "content": "上下文已接近上限，请立即基于以上信息输出简短 JSON 结论（不要详细设计，只输出核心字段），不要再调用工具。"
+                        })
+                        # 继续循环，让 LLM 输出最终答案
+                        continue
 
                     # 继续循环，让 LLM 基于工具结果继续思考
                     continue
 
                 # 不是工具调用，返回最终答案
+                # 【调试】记录 message.content 的详细信息
+                if message.content:
+                    logger.info(f"[{self.agent_name}] LLM 返回内容长度: {len(message.content)} 字符")
+                    logger.info(f"[{self.agent_name}] LLM 返回内容前200字符: {repr(message.content[:200])}")
+                    logger.info(f"[{self.agent_name}] LLM 返回内容后200字符: {repr(message.content[-200:])}")
+                    # 检查 finish_reason
+                    if hasattr(response.choices[0], 'finish_reason'):
+                        finish_reason = response.choices[0].finish_reason
+                        logger.info(f"[{self.agent_name}] LLM finish_reason: {finish_reason}")
+                        if finish_reason == 'length':
+                            logger.error(f"[{self.agent_name}] LLM 输出因长度限制被截断！")
+                else:
+                    logger.warning(f"[{self.agent_name}] LLM 返回空内容")
+                
                 return {
                     "content": message.content,
                     "input_tokens": total_input_tokens,
                     "output_tokens": total_output_tokens,
-                    "tool_calls": tool_call_count
+                    "tool_calls": tool_call_count,
+                    "tool_results": tool_results
                 }
 
             except Exception as e:
+                error_str = str(e)
                 logger.error(f"[{self.agent_name}] LLM call with tools failed: {e}")
+
+                # 【层面三】识别"上下文超限"导致的空响应（不可重试，重试只会再次超限）
+                is_context_overflow = (
+                    "choices': None" in error_str or
+                    "choices is None" in error_str or
+                    ("completion_tokens': 0" in error_str and "prompt_tokens': 0" in error_str) or
+                    "context length exceeded" in error_str.lower() or
+                    "maximum context length" in error_str.lower()
+                )
+
+                if is_context_overflow:
+                    logger.warning(
+                        f"[{self.agent_name}] 检测到上下文超限（choices=None），"
+                        f"已完成 {tool_call_count} 次工具调用，尝试从已有结果构建输出"
+                    )
+                    # 不抛异常，而是尝试从已有工具结果降级输出
+                    fallback = self._build_output_from_tool_results(tool_results)
+                    if fallback:
+                        return {
+                            "content": None,
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "tool_calls": tool_call_count,
+                            "tool_results": tool_results,
+                            "fallback_output": fallback,  # 标记为降级输出
+                            "error": "context_overflow_with_fallback"
+                        }
+                    # 没有 fallback，才真正抛出
+                    raise RuntimeError(
+                        f"上下文超限且无法降级：已读取文件过多或单文件过大。"
+                        f"工具调用次数={tool_call_count}"
+                    ) from e
+
+                # 其他错误正常抛出
                 raise
 
         # 达到最大工具调用次数
@@ -168,6 +291,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens,
             "tool_calls": tool_call_count,
+            "tool_results": tool_results,
             "error": "Max tool calls reached"
         }
 
@@ -175,7 +299,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
         self,
         pipeline_id: int,
         stage_name: str,
-        initial_state: Optional[Dict[str, Any]] = None
+        initial_state: Optional[Dict[str, Any]] = None,
+        max_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         执行 Agent（支持工具调用）
@@ -184,11 +309,12 @@ class ToolUsingAgent(LangGraphAgent[T]):
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
             initial_state: 初始状态（必须包含 project_path）
+            max_tokens: 最大 Token 数（默认 None，表示不限制）
 
         Returns:
             Dict: 执行结果
         """
-        start_time = logging.info(f"[{self.agent_name}] Starting execution with tools")
+        logger.info(f"[{self.agent_name}] Starting execution with tools")
 
         try:
             # 获取 project_path
@@ -202,11 +328,106 @@ class ToolUsingAgent(LangGraphAgent[T]):
             result = await self._call_llm_with_tools(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                project_path=project_path
+                project_path=project_path,
+                pipeline_id=pipeline_id,
+                max_tokens=max_tokens
             )
 
+            # 提取本次工具调用中读取过的文件内容（用于传递给下游 Agent）
+            injected_files = {}
+            if self._agent_tools:
+                for file_path, cached in self._agent_tools._file_cache.items():
+                    content = cached.get("content")
+                    if content:
+                        # 统一路径格式，移除 backend/ 前缀
+                        clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                        injected_files[clean_path] = content
+
+            # 【层面三续】处理上下文超限降级输出
+            if result.get("error") == "context_overflow_with_fallback":
+                fallback = result.get("fallback_output")
+                output_dict = fallback.model_dump() if hasattr(fallback, 'model_dump') else fallback
+                return {
+                    "success": True,   # 降级成功，不是失败
+                    "output": output_dict,
+                    "injected_files": injected_files,  # ← 新增：传递读取的文件内容
+                    "input_tokens": result["input_tokens"],
+                    "output_tokens": result["output_tokens"],
+                    "tool_calls": result.get("tool_calls", 0),
+                    "tool_results": result.get("tool_results", []),
+                    "note": "上下文超限，基于已读文件降级输出"
+                }
+
+            # 检查是否达到最大工具调用次数
+            if result.get("error") == "Max tool calls reached":
+                logger.warning(f"[{self.agent_name}] 达到最大工具调用次数，尝试从工具结果构建输出")
+                # 尝试从工具结果构建一个有效的输出
+                fallback_output = self._build_output_from_tool_results(result.get("tool_results", []))
+                if fallback_output:
+                    # 将 Pydantic 模型转换为字典
+                    output_dict = fallback_output.model_dump() if hasattr(fallback_output, 'model_dump') else fallback_output
+                    return {
+                        "success": True,
+                        "output": output_dict,
+                        "injected_files": injected_files,  # ← 新增：传递读取的文件内容
+                        "input_tokens": result["input_tokens"],
+                        "output_tokens": result["output_tokens"],
+                        "tool_calls": result.get("tool_calls", 0),
+                        "tool_results": result.get("tool_results", []),
+                        "raw_output": result["content"],
+                        "note": "从工具调用结果构建的输出（达到最大工具调用次数）"
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": "达到最大工具调用次数，且无法从工具结果构建有效输出",
+                        "injected_files": injected_files,  # ← 新增：即使失败也传递已读取的文件内容
+                        "input_tokens": result["input_tokens"],
+                        "output_tokens": result["output_tokens"],
+                        "tool_calls": result.get("tool_calls", 0),
+                        "tool_results": result.get("tool_results", []),
+                        "raw_output": result["content"][:500]
+                    }
+
             # 解析输出
-            raw_output = result["content"]
+            raw_output = result.get("content")
+            
+            # 【调试】记录 raw_output 的详细信息
+            if raw_output:
+                logger.info(f"[{self.agent_name}] raw_output 长度: {len(raw_output)} 字符")
+                logger.info(f"[{self.agent_name}] raw_output 前200字符: {repr(raw_output[:200])}")
+                logger.info(f"[{self.agent_name}] raw_output 后200字符: {repr(raw_output[-200:])}")
+                # 检查是否是不完整的 JSON
+                if raw_output.strip().startswith('{') and not raw_output.strip().endswith('}'):
+                    logger.error(f"[{self.agent_name}] raw_output 可能是不完整的 JSON（以 {{ 开头但不以 }} 结尾）")
+            
+            # 【修复】检查 content 是否为空
+            if not raw_output:
+                logger.warning(f"[{self.agent_name}] LLM 返回空内容，尝试从工具结果构建输出")
+                fallback = self._build_output_from_tool_results(result.get("tool_results", []))
+                if fallback:
+                    output_dict = fallback.model_dump() if hasattr(fallback, 'model_dump') else fallback
+                    return {
+                        "success": True,
+                        "output": output_dict,
+                        "injected_files": injected_files,  # ← 新增：传递读取的文件内容
+                        "input_tokens": result.get("input_tokens", 0),
+                        "output_tokens": result.get("output_tokens", 0),
+                        "tool_calls": result.get("tool_calls", 0),
+                        "tool_results": result.get("tool_results", []),
+                        "note": "LLM 返回空内容，从工具结果构建输出"
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": "LLM 返回空内容，且无法从工具结果构建输出",
+                        "injected_files": injected_files,  # ← 新增：即使失败也传递已读取的文件内容
+                        "input_tokens": result.get("input_tokens", 0),
+                        "output_tokens": result.get("output_tokens", 0),
+                        "tool_calls": result.get("tool_calls", 0),
+                        "tool_results": result.get("tool_results", [])
+                    }
+            
             parsed_output = self.parse_output(raw_output)
 
             # 验证输出
@@ -219,12 +440,17 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     "raw_output": raw_output[:500]
                 }
 
+            # 将 Pydantic 模型转换为字典
+            output_dict = validated_output.model_dump() if hasattr(validated_output, 'model_dump') else validated_output
+
             return {
                 "success": True,
-                "output": validated_output,
+                "output": output_dict,
+                "injected_files": injected_files,  # ← 新增：传递读取的文件内容
                 "input_tokens": result["input_tokens"],
                 "output_tokens": result["output_tokens"],
                 "tool_calls": result.get("tool_calls", 0),
+                "tool_results": result.get("tool_results", []),
                 "raw_output": raw_output
             }
 
@@ -234,3 +460,18 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 "success": False,
                 "error": str(e)
             }
+
+    def _build_output_from_tool_results(self, tool_results: List[Dict[str, Any]]) -> Optional[Any]:
+        """
+        从工具调用结果构建输出（当达到最大工具调用次数时使用）
+
+        子类可以重写此方法，根据工具执行结果构建一个有效的输出对象。
+        默认返回 None，表示无法从工具结果构建输出。
+
+        Args:
+            tool_results: 工具执行结果列表
+
+        Returns:
+            Optional[Any]: 构建的输出对象，或 None
+        """
+        return None

@@ -151,8 +151,7 @@ class TestMaxRetriesLimitTerminatesLoop:
                         "files": [{
                             "file_path": "backend/test.py",
                             "content": "# test",
-                            "change_type": "add",
-                            "read_token": "NEW_FILE"
+                            "change_type": "add"
                         }]
                     },
                     "input_tokens": 100,
@@ -178,13 +177,16 @@ class TestMaxRetriesLimitTerminatesLoop:
                                     "file_path": "backend/test.py",
                                     "content": "# fixed test",
                                     "change_type": "modify",
-                                    "read_token": "TOKEN123"
+                                    "search_block": "# test",
+                                    "replace_block": "# fixed test"
                                 }]
                             }
                         }
 
                         # 模拟文件写入（避免实际文件操作）
-                        with patch('app.service.file_write_handler.file_write_handler.write_files_to_project'):
+                        # 【新架构】使用 FileWriterService 替代 file_write_handler
+                        with patch('app.service.file_writer.FileWriterService.apply_changes') as mock_write:
+                            mock_write.return_value = [{"file": "backend/test.py", "success": True}]
                             with patch.object(auto_fix, '_write_files_to_sandbox'):
                                 # 执行
                                 result = await auto_fix.execute(

@@ -148,6 +148,56 @@ class StageHandler(ABC):
             output_data={"error": str(error), "error_type": type(error).__name__}
         )
     
+    async def on_approved(
+        self,
+        context: StageContext,
+        notes: Optional[str] = None,
+        feedback: Optional[str] = None
+    ) -> StageResult:
+        """
+        阶段被批准后的处理逻辑
+        
+        子类可重写此方法实现自定义的审批后逻辑。
+        默认实现返回成功结果，表示直接进入下一阶段。
+        
+        Args:
+            context: 阶段上下文
+            notes: 审批备注
+            feedback: 反馈建议
+            
+        Returns:
+            StageResult: 处理结果
+        """
+        return StageResult.success_result(
+            message=f"{self.stage_name.value} stage approved",
+            status=PipelineStatus.PAUSED
+        )
+    
+    async def on_rejected(
+        self,
+        context: StageContext,
+        reason: str,
+        suggested_changes: Optional[str] = None
+    ) -> StageResult:
+        """
+        阶段被驳回后的处理逻辑
+        
+        子类可重写此方法实现自定义的驳回后逻辑。
+        默认实现返回成功结果，表示重新执行当前阶段。
+        
+        Args:
+            context: 阶段上下文
+            reason: 驳回原因
+            suggested_changes: 建议修改
+            
+        Returns:
+            StageResult: 处理结果
+        """
+        return StageResult.success_result(
+            message=f"{self.stage_name.value} stage rejected, will rerun",
+            status=PipelineStatus.RUNNING
+        )
+    
     async def run(self, context: StageContext) -> StageResult:
         """
         运行完整阶段流程

@@ -47,3 +47,50 @@ async def init_db():
     # 设置 SQLAlchemy 慢查询监听
     from app.core.logging import setup_sqlalchemy_logging
     setup_sqlalchemy_logging(engine)
+
+
+async def get_db_status() -> dict:
+    """
+    获取数据库连接池状态
+    
+    Returns:
+        dict: 包含以下字段的字典：
+            - connected: 是否连接成功
+            - database_url: 数据库连接URL（已脱敏）
+            - pool_size: 连接池大小
+            - active_connections: 当前活跃连接数
+    """
+    from app.core.config import settings
+    
+    # 脱敏处理数据库URL
+    database_url = settings.DATABASE_URL
+    if "@" in database_url:
+        # 如果有用户名密码，进行脱敏
+        parts = database_url.split("@")
+        protocol_part = parts[0].split("://")[0]
+        host_part = parts[1]
+        database_url = f"{protocol_part}://***@{host_part}"
+    
+    try:
+        # 检查连接池状态
+        pool = engine.pool
+        pool_size = pool.size() if hasattr(pool, 'size') else 5
+        
+        # 尝试执行简单查询来验证连接
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+            connected = True
+    except Exception:
+        connected = False
+        pool_size = 0
+    
+    # 获取活跃连接数（SQLAlchemy 异步引擎不直接提供，使用估算值）
+    active_connections = 1 if connected else 0
+    
+    return {
+        "connected": connected,
+        "database_url": database_url,
+        "pool_size": pool_size,
+        "active_connections": active_connections
+    }

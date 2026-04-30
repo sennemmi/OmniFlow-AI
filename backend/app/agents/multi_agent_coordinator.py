@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from app.agents.coder import coder_agent
 from app.agents.tester import test_agent
 from app.agents.auto_fix_loop import auto_fix_loop
-from app.service.sandbox_tools import write_file as sandbox_write_file
+from app.service.sandbox_manager import sandbox_manager
 from app.service.code_executor import CodeExecutorService
 from app.service.search_replace_engine import search_replace_engine
 from app.service.file_write_handler import file_write_handler
@@ -197,23 +197,34 @@ class MultiAgentCoordinator:
         self,
         design_output: Dict,
         affected_files: List[str],
-        pipeline_id: Optional[int] = None
+        pipeline_id: Optional[int] = None,
+        injected_files: Optional[Dict[str, str]] = None,
+        file_service: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
-        并行执行 CoderAgent 和 TestAgent（非沙箱模式）
+        并行执行 CoderAgent 和 TestAgent（支持 Sandbox 优先架构）
+
+        Args:
+            design_output: 设计阶段输出
+            affected_files: 受影响文件列表
+            pipeline_id: Pipeline ID
+            injected_files: 上游预读取的文件内容 {path: content}，用于传递给 CoderAgent
+            file_service: SandboxFileService 实例（新架构），如果提供则直接写入 Sandbox
         """
         start_time = time.time()
 
         logger.info(f"MultiAgentCoordinator: 开始并行执行", extra={
             "pipeline_id": pipeline_id,
-            "mode": "parallel"
+            "mode": "parallel",
+            "injected_files_count": len(injected_files) if injected_files else 0
         })
 
-        # 1. 执行 CoderAgent
+        # 1. 执行 CoderAgent（透传 injected_files）
         code_result = await self._execute_code_agent(
             design_output,
             {},
-            pipeline_id=pipeline_id
+            pipeline_id=pipeline_id,
+            injected_files=injected_files  # 【核心】透传上游注入的文件内容
         )
 
         if not code_result["success"]:
@@ -253,12 +264,123 @@ class MultiAgentCoordinator:
                 code_output["files"] = all_files
                 code_output["import_fixes"] = fix_report
 
+        # 【新架构】如果提供了 file_service，直接将代码写入 Sandbox
+        if file_service and all_files:
+            logger.info(f"MultiAgentCoordinator: 使用 SandboxFileService 写入 {len(all_files)} 个文件", extra={
+                "pipeline_id": pipeline_id
+            })
+            await push_log(
+                pipeline_id,
+                "info",
+                f"🐳 正在将 {len(all_files)} 个文件写入 Docker Sandbox...",
+                stage="CODING"
+            )
+
+            write_results = []
+            for file_change in all_files:
+                file_path = file_change.get("file_path", "")
+                change_type = file_change.get("change_type", "modify")
+
+                if change_type == "add":
+                    # 新文件：直接写入 content
+                    content = file_change.get("content", "")
+                    if content:
+                        result = await file_service.write_file(file_path, content)
+                        write_results.append(result)
+                elif change_type == "modify":
+                    # 修改文件：读取原文件，应用 search/replace
+                    search_block = file_change.get("search_block", "")
+                    replace_block = file_change.get("replace_block", "")
+
+                    if search_block:
+                        # 读取原文件
+                        read_result = await file_service.read_file(file_path)
+                        if read_result.exists and read_result.content:
+                            # 应用替换
+                            new_content = read_result.content.replace(search_block, replace_block, 1)
+                            # 写入新内容
+                            result = await file_service.write_file(file_path, new_content)
+                            write_results.append(result)
+
+            # 检查写入结果
+            failed_writes = [r for r in write_results if not r.get("success")]
+            if failed_writes:
+                logger.error(f"MultiAgentCoordinator: {len(failed_writes)} 个文件写入 Sandbox 失败", extra={
+                    "pipeline_id": pipeline_id,
+                    "errors": [r.get("error") for r in failed_writes]
+                })
+                await push_log(
+                    pipeline_id,
+                    "error",
+                    f"❌ {len(failed_writes)} 个文件写入 Sandbox 失败",
+                    stage="CODING"
+                )
+            else:
+                logger.info(f"MultiAgentCoordinator: 所有文件成功写入 Sandbox", extra={
+                    "pipeline_id": pipeline_id
+                })
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    f"✅ 所有文件成功写入 Docker Sandbox",
+                    stage="CODING"
+                )
+
         # 3. 执行 TestAgent
         test_result = await self._execute_test_agent(
             design_output,
             code_output,
             pipeline_id=pipeline_id
         )
+
+        # 【新架构】如果提供了 file_service，将测试文件也写入 Sandbox
+        if file_service and test_result.get("test_output"):
+            test_output = test_result["test_output"]
+            test_files = test_output.get("test_files", []) if isinstance(test_output, dict) else []
+
+            if test_files:
+                logger.info(f"MultiAgentCoordinator: 使用 SandboxFileService 写入 {len(test_files)} 个测试文件", extra={
+                    "pipeline_id": pipeline_id
+                })
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    f"🐳 正在将 {len(test_files)} 个测试文件写入 Docker Sandbox...",
+                    stage="TESTING"
+                )
+
+                write_results = []
+                for test_file in test_files:
+                    file_path = test_file.get("file_path", "")
+                    content = test_file.get("content", "")
+
+                    if content:
+                        result = await file_service.write_file(file_path, content)
+                        write_results.append(result)
+
+                # 检查写入结果
+                failed_writes = [r for r in write_results if not r.get("success")]
+                if failed_writes:
+                    logger.error(f"MultiAgentCoordinator: {len(failed_writes)} 个测试文件写入 Sandbox 失败", extra={
+                        "pipeline_id": pipeline_id,
+                        "errors": [r.get("error") for r in failed_writes]
+                    })
+                    await push_log(
+                        pipeline_id,
+                        "error",
+                        f"❌ {len(failed_writes)} 个测试文件写入 Sandbox 失败",
+                        stage="TESTING"
+                    )
+                else:
+                    logger.info(f"MultiAgentCoordinator: 所有测试文件成功写入 Sandbox", extra={
+                        "pipeline_id": pipeline_id
+                    })
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        f"✅ 所有测试文件成功写入 Docker Sandbox",
+                        stage="TESTING"
+                    )
 
         # 4. 合并结果
         merge_result = self._merge_results(
@@ -314,13 +436,15 @@ class MultiAgentCoordinator:
         design_output: Dict[str, Any],
         test_files: Dict[str, str],
         pipeline_id: Optional[int] = None,
-        error_context: Optional[str] = None
+        error_context: Optional[str] = None,
+        injected_files: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """执行 CoderAgent"""
         logger.info(f"MultiAgentCoordinator: 开始执行 CoderAgent", extra={
             "pipeline_id": pipeline_id,
             "affected_files": design_output.get("affected_files", []),
-            "test_files_count": len(test_files)
+            "test_files_count": len(test_files),
+            "injected_files_count": len(injected_files) if injected_files else 0
         })
 
         # 构建增强的 design_output
@@ -328,9 +452,10 @@ class MultiAgentCoordinator:
 
         try:
             code_result = await coder_agent.generate_code(
-                enhanced_design,
-                pipeline_id,
-                error_context=error_context
+                design_output=enhanced_design,
+                pipeline_id=pipeline_id,
+                error_context=error_context,
+                injected_files=injected_files  # 【核心】透传上游注入的文件内容
             )
 
             if code_result["success"]:

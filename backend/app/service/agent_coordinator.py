@@ -25,6 +25,7 @@ from app.models.pipeline import PipelineStage, StageName
 from app.service.project import ProjectService
 from app.service.workflow import WorkflowService
 from app.service.context_builder import context_builder
+from app.service.sandbox_orchestrator import get_sandbox_orchestrator, cleanup_sandbox_orchestrator
 from app.repositories import PipelineStageRepository
 
 
@@ -179,6 +180,30 @@ class AgentCoordinatorService:
                 "ArchitectAgent 将使用工具自主探索项目代码...",
                 stage="REQUIREMENT"
             )
+
+            # 【新架构】在 Architect 阶段就拉起 Docker Sandbox
+            # 这样整个流程都在 Sandbox 中运行，节省本地开销
+            sandbox_orchestrator = get_sandbox_orchestrator(pipeline_id)
+            sandbox_result = await sandbox_orchestrator.initialize(
+                project_path=project_path,
+                timeout=120
+            )
+
+            if not sandbox_result["success"]:
+                logger.error(f"[Pipeline {pipeline_id}] Sandbox 初始化失败，回退到本地模式")
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    "⚠️ Sandbox 初始化失败，将使用本地模式运行",
+                    stage="REQUIREMENT"
+                )
+            else:
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    "✅ Sandbox 优先架构已激活，整个流程将在 Docker 中运行",
+                    stage="REQUIREMENT"
+                )
 
             # 【改造】调用 ArchitectAgent，传入 project_path 用于工具执行
             result = await architect_agent.analyze(
@@ -502,7 +527,7 @@ class AgentCoordinatorService:
         运行多 Agent 协调器生成代码
 
         【改造】使用 affected_files 替代 target_files
-        CoderAgent 现在使用工具按需读取文件
+        【核心】从 REQUIREMENT 阶段获取 injected_files 并传递给 CoderAgent
 
         Args:
             pipeline_id: Pipeline ID
@@ -516,169 +541,52 @@ class AgentCoordinatorService:
         await push_log(pipeline_id, "info", "开始代码生成...", stage="CODING")
         await push_log(pipeline_id, "info", "启动多 Agent 协作生成代码...", stage="CODING")
 
-        # 【改造】调用多 Agent 协调器，传入 affected_files 而非 target_files
-        multi_agent_result = await multi_agent_coordinator.execute_parallel(
-            design_output,
-            affected_files,
-            pipeline_id=pipeline_id
-        )
-
-        return multi_agent_result
-    
-    @classmethod
-    async def get_target_files_for_coding(
-        cls,
-        pipeline_id: int,
-        design_output: Dict[str, Any],
-        session: AsyncSession
-    ) -> Dict[str, str]:
-        """
-        【增强】获取 CODING 阶段所需的目标文件内容
-
-        优先级：
-        1. 如果存在 sourceContext，优先使用该文件
-        2. 从 design_output 中提取 affected_files
-        3. 从 function_changes 获取文件（兼容旧格式）
-
-        Args:
-            pipeline_id: Pipeline ID
-            design_output: 设计阶段输出
-            session: 数据库会话
-
-        Returns:
-            Dict[str, str]: 文件路径到内容的映射
-        """
-        from app.service.code_executor import CodeExecutorService
-        from app.core.config import settings
-
-        target_files = {}
-
-        def normalize_path(p: str) -> str:
-            """统一路径格式：
-            1. 统一使用正斜杠
-            2. 移除 backend/ 前缀
-            """
-            # 统一使用正斜杠
-            p = p.replace("\\", "/")
-            # 移除 backend/ 前缀
-            if p.startswith("backend/"):
-                p = p[len("backend/"):]
-            return p
-
-        try:
-            # 获取目标项目路径
-            target_path = Path(settings.TARGET_PROJECT_PATH)
-            if not target_path.is_absolute():
-                backend_dir = Path(__file__).parent.parent.parent
-                target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
-
-            code_executor = CodeExecutorService(str(target_path))
-
-            # 1. 优先处理 sourceContext
-            source_context = design_output.get("sourceContext")
-            if source_context:
-                source_file = source_context.get("file") or source_context.get("relativePath")
-                source_line = source_context.get("line", 0)
-
-                if source_file:
-                    await push_log(
-                        pipeline_id,
-                        "info",
-                        f"使用精确源码定位: {source_file}:{source_line}",
-                        stage="CODING"
-                    )
-
-                    source_file = normalize_path(source_file)
-                    content = code_executor.get_file_content(source_file)
-
-                    # 如果失败且是绝对路径，尝试提取相对路径
-                    if not content and Path(source_file).is_absolute():
-                        parts = Path(source_file).parts
-                        for i, part in enumerate(parts):
-                            if part in ["src", "frontend", "components", "pages"]:
-                                relative_path = str(Path(*parts[i:]))
-                                content = code_executor.get_file_content(relative_path)
-                                if content:
-                                    source_file = relative_path
-                                    break
-
-                    if content:
-                        target_files[source_file] = content
+        # 【核心】从 REQUIREMENT 阶段获取 injected_files（ArchitectAgent 预读取的文件内容）
+        injected_files = None
+        if session:
+            try:
+                requirement_stage = await PipelineStageRepository.get_by_pipeline_and_name(
+                    pipeline_id, StageName.REQUIREMENT, session
+                )
+                if requirement_stage and requirement_stage.output_data:
+                    # ArchitectAgent 将 injected_files 存储在 output_data 中
+                    injected_files = requirement_stage.output_data.get("injected_files")
+                    if injected_files:
                         await push_log(
                             pipeline_id,
                             "info",
-                            f"已加载圈选元素对应的源文件: {source_file}",
+                            f"从 ArchitectAgent 获取到 {len(injected_files)} 个预读取文件",
                             stage="CODING"
                         )
+            except Exception as e:
+                logger.warning(f"[AgentCoordinator] 获取 injected_files 失败: {e}")
 
-            # 2. 从 affected_files 获取文件
-            affected_files = design_output.get("affected_files", [])
-            if affected_files:
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"从 affected_files 读取 {len(affected_files)} 个文件...",
-                    stage="CODING"
-                )
-                for file_path in affected_files:
-                    file_path = normalize_path(file_path)
-                    if file_path not in target_files:
-                        content = code_executor.get_file_content(file_path)
-                        if content:
-                            target_files[file_path] = content
+        # 【新架构】获取 SandboxOrchestrator 和 FileService
+        sandbox_orchestrator = get_sandbox_orchestrator(pipeline_id)
+        file_service = sandbox_orchestrator.get_file_service()
 
-            # 3. 从 function_changes 获取文件（兼容旧格式）
-            function_changes = design_output.get("function_changes", [])
-            if function_changes:
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"从 function_changes 读取文件...",
-                    stage="CODING"
-                )
-                for change in function_changes:
-                    file_path = change.get("file", "")
-                    if file_path:
-                        file_path = normalize_path(file_path)
-                        if file_path not in target_files:
-                            content = code_executor.get_file_content(file_path)
-                            if content:
-                                target_files[file_path] = content
-
-            # === 新增：补充关键上下文文件 ===
-            # 如果 affected_files 中包含 modify 类型的文件，无论如何要强制读取它们
-            function_changes = design_output.get("function_changes", [])
-            for change in function_changes:
-                file_path = change.get("file", "")
-                action = change.get("action", "").lower()
-                if action in ("modify", "update"):
-                    file_path = normalize_path(file_path)
-                    if file_path not in target_files:
-                        content = code_executor.get_file_content(file_path)
-                        if content:
-                            target_files[file_path] = content
-                        # 如果文件确实不存在（允许新建 but marked as modify），则记录警告
-                        else:
-                            await push_log(
-                                pipeline_id,
-                                "warning",
-                                f"[修改] 目标文件不存在，将创建新文件: {file_path}",
-                                stage="CODING"
-                            )
-
+        if file_service:
             await push_log(
                 pipeline_id,
                 "info",
-                f"成功读取 {len(target_files)} 个目标文件",
+                "🐳 使用 Sandbox 优先架构，代码将直接写入 Docker 容器",
                 stage="CODING"
             )
-
-        except Exception as e:
+        else:
             await push_log(
                 pipeline_id,
                 "warning",
-                f"读取目标文件失败: {str(e)[:100]}",
+                "⚠️ Sandbox 未初始化，将使用本地文件系统",
                 stage="CODING"
             )
 
-        return target_files
+        # 【改造】调用多 Agent 协调器，传入 affected_files、injected_files 和 file_service
+        multi_agent_result = await multi_agent_coordinator.execute_parallel(
+            design_output,
+            affected_files,
+            pipeline_id=pipeline_id,
+            injected_files=injected_files,  # 【核心】透传给 CoderAgent
+            file_service=file_service  # 【新架构】传入 Sandbox 文件服务
+        )
+
+        return multi_agent_result

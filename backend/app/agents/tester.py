@@ -103,8 +103,21 @@ Layer 4 - 健康检查（服务启动验证）：
   import main                       # ❌ 错误！不能导入 main 模块
   from backend.app.main import app  # ❌ 错误！不需要 backend 前缀
 
-【输出格式】
-必须严格输出 JSON 格式，不要包含 Markdown 代码块标记：
+【输出格式 - 极其重要】
+你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
+输出必须是一个有效的 JSON 对象。
+
+正确示例（直接输出 JSON）：
+{"test_files": [{"file_path": "backend/tests/ai_generated/test_example.py", "content": "import pytest...", "target_module": "app.api.v1.example", "test_cases_count": 5}], "summary": "生成了 5 个测试用例", "coverage_targets": ["正常登录", "密码错误"], "dependencies_added": ["pytest"]}
+
+错误示例（不要这样输出）：
+- 不要添加 ```json 标记
+- 不要添加解释文本
+- 不要输出工具调用格式如 <|tool_calls_section_begin|>
+- 不要输出 "我需要先分析..." 等思考过程
+- 只输出纯 JSON
+
+JSON 格式：
 {
     "test_files": [
         {
@@ -114,12 +127,8 @@ Layer 4 - 健康检查（服务启动验证）：
             "test_cases_count": 5
         }
     ],
-    "summary": "本次生成了 5 个测试用例，覆盖了用户认证功能的正常路径和异常路径",
-    "coverage_targets": [
-        "用户登录接口 - 正常登录",
-        "用户登录接口 - 密码错误",
-        "用户登录接口 - 用户不存在"
-    ],
+    "summary": "本次生成了 5 个测试用例...",
+    "coverage_targets": ["用户登录接口 - 正常登录", "用户登录接口 - 密码错误"],
     "dependencies_added": ["pytest", "pytest-asyncio", "pytest-mock"]
 }
 
@@ -176,11 +185,6 @@ Layer 4 - 健康检查（服务启动验证）：
 【CoderAgent 生成的代码】
 {code_str}
 
-【重要 - 使用工具读取目标文件】
-在填充断言前，请使用以下工具读取目标文件的最新内容：
-1. glob("app/**/*.py") - 发现相关文件
-2. read_file("app/xxx.py", 1, 50) - 读取文件内容
-
 请输出完整的测试文件（JSON 格式），不要保留任何 TODO 占位。"""
 
         # ── 原有完整模式（兜底）─────────────────────────────────────────
@@ -191,17 +195,13 @@ Layer 4 - 健康检查（服务启动验证）：
 【CoderAgent 生成的代码】
 {code_str}
 
-【重要 - 使用工具读取目标文件】
-在编写测试前，请使用以下工具读取目标文件的最新内容：
-1. glob("app/**/*.py") - 发现相关文件
-2. read_file("app/xxx.py", 1, 50) - 读取文件内容
-
 请根据技术设计方案和生成的代码，编写完整的单元测试。
 注意：
 1. 使用 pytest 框架
 2. 保持与主代码相同的缩进风格和注释风格
 3. 覆盖正常路径、异常路径和边界条件
 4. 测试代码必须可以直接运行
+5. 直接输出 JSON，不要调用任何工具
 """
     
     def parse_output(self, response: str) -> Dict[str, Any]:

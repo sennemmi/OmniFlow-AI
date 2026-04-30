@@ -1,38 +1,44 @@
 """
 编码 Agent
-基于 ToolUsingAgent 实现，支持工具调用
+基于 LangGraphAgent 实现，纯代码生成，不持有任何工具
 
 职责：
 1. 分析 DesignerAgent 的技术方案
-2. 使用工具主动获取需要的文件内容
-3. 生成符合项目风格的代码
+2. 基于上游注入的文件内容生成代码变更
+3. 输出 JSON 格式的 search_block/replace_block 变更
+
+【改造】从 ToolUsingAgent 迁移到 LangGraphAgent
+- 不再直接调用工具（glob/grep/read_file/replace_lines）
+- 所需文件内容由上游（ArchitectAgent）预读后注入到 state 中
+- 纯 LLM 生成，只输出 JSON 格式的变更描述
 """
 
 import json
 import logging
 from typing import Dict, Optional, Any
 
-from app.agents.tool_agent import ToolUsingAgent
+from app.agents.base import LangGraphAgent
 from app.agents.schemas import CoderOutput
 
 logger = logging.getLogger(__name__)
 
 
-class CoderAgent(ToolUsingAgent[CoderOutput]):
+class CoderAgent(LangGraphAgent[CoderOutput]):
     """
     编码 Agent
-    
+
     根据设计方案生成代码变更
-    继承 ToolUsingAgent，支持工具调用（glob/grep/read_file）
+    继承 LangGraphAgent，纯代码生成，不持有任何工具
+    所需文件内容由上游（ArchitectAgent）预读后注入到 state 中
     """
-    
+
     def __init__(self):
         super().__init__(agent_name="CoderAgent")
-    
+
     @property
     def system_prompt(self) -> str:
-        """系统 Prompt - 强调工具使用和架构保持"""
-        return """你是 OmniFlowAI 的编码 Agent，使用**搜索-替换块**格式输出代码变更。
+        """系统 Prompt - 强调纯 JSON 输出"""
+        return """你是 OmniFlowAI 的编码 Agent，负责生成代码变更。
 
 【八荣八耻准则】
 以架构分层为荣，以循环依赖为耻
@@ -64,72 +70,11 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
 
 违反上述契约会导致系统级错误，你的修改会被拒绝！
 
-【工具使用 - 极其重要】
-你拥有文件系统工具，在编写任何代码前，**必须**通过这些工具获取必要的上下文：
-
-1. **glob** - 查找文件：
-   - 用途：发现项目中的文件
-   - 示例：`glob("app/api/v1/*.py")` 查找所有 API 文件
-
-2. **grep** - 搜索内容：
-   - 用途：查找代码片段
-   - 示例：`grep("def health", "app/api/v1")` 查找 health 函数
-
-3. **read_file** - 读取文件（核心工具）：
-   - 用途：获取文件内容和 read_token
-   - **【重要】修改文件前必须先调用此工具获取 read_token！**
-   - 示例：`read_file("app/api/v1/health.py", 1, 50)` 读取前50行
-   - 返回的 read_token 用于后续的写入操作
-
-【工作流程】
-1. 使用 **glob** 查找相关文件
-2. 使用 **grep** 定位具体代码位置
-3. 使用 **read_file** 精确读取需要的代码段（获取 read_token）
-4. 基于实际读取的内容生成 search_block 和 replace_block
-5. 输出 JSON 格式的代码变更
-
 【代码完整性铁律 - 违反会导致系统错误】
 1. **所有使用的变量必须先定义后使用**
 2. **所有装饰器必须在导入和初始化之后**
 3. **文件必须包含完整的导入语句**
 4. **使用到的每个对象都必须有明确的来源**
-
-【输出格式 - Search-Replace Block Protocol】
-必须严格输出 JSON 格式。采用搜索-替换块格式。
-
-**模式 A - 修改现有文件：**
-- change_type: "modify"
-- 必须提供: search_block 和 replace_block
-- **search_block 必须是你通过 read_file 工具实际读取到的代码片段**
-```json
-{
-    "file_path": "backend/app/api/v1/health.py",
-    "change_type": "modify",
-    "search_block": "    # 旧的健康检查逻辑\n    return {\"status\": \"ok\"}",
-    "replace_block": "    db_status = await check_db()\n    return {\"status\": \"ok\", \"db\": db_status}",
-    "description": "修改健康检查返回值"
-}
-```
-
-**模式 B - 创建新文件：**
-- change_type: "add"
-- 必须提供: content（完整文件内容）
-```json
-{
-    "file_path": "backend/app/utils/new_helper.py",
-    "change_type": "add",
-    "content": "def helper():\n    pass",
-    "description": "新建辅助函数"
-}
-```
-
-【搜索-替换铁律】
-1. **search_block 必须精确匹配**目标文件中的内容（包括空格和换行）
-2. **search_block 必须来源于 read_file 工具的输出**
-3. **切勿替换整个文件！** 只替换需要修改的代码部分
-4. **保持原有缩进和风格**
-5. **已存在的文件**：必须用 "modify" 模式 + search_block/replace_block
-6. **新文件**：用 "add" 模式 + content 字段
 
 【Import 铁律】
 所有业务代码文件必须使用如下 import 方式：
@@ -146,82 +91,126 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
 
 【输出格式 - 极其重要】
 你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
+输出必须是一个有效的 JSON 对象。
 
 正确示例（直接输出 JSON）：
-{"files": [{"file_path": "backend/app/api/v1/health.py", "change_type": "modify", "search_block": "def health_check():\n    return {\"status\": \"ok\"}", "replace_block": "def health_check():\n    return {\"status\": \"ok\", \"version\": \"1.0.0\"}", "description": "添加版本字段"}], "summary": "修改健康检查端点"}
+{"files": [{"file_path": "app/api/v1/health.py", "change_type": "modify", "search_block": "def health_check():\\n    return {\"status\": \"ok\"}", "replace_block": "def health_check():\\n    db_status = await check_db()\\n    return {\"status\": \"ok\", \"db\": db_status}", "description": "添加数据库状态检查"}]}
 
 错误示例（不要这样输出）：
 - 不要添加 ```json 标记
 - 不要添加解释文本
-- 不要使用工具调用格式如 [TOOL_CALL]
-- 不要输出 "我需要先查看..." 等思考过程
+- 不要输出 "我需要先分析..." 等思考过程
 - 只输出纯 JSON
 
 【强制要求】
 - 直接输出 JSON，不要有任何前缀或后缀
 - 确保 JSON 格式完整有效
 - 不要输出任何其他内容
+
+【字段说明】
+- files: 变更文件列表
+  - file_path: 文件相对路径
+  - change_type: 变更类型 (add/modify/delete)
+  - search_block: 要替换的旧代码块（精确匹配）
+  - replace_block: 新代码块
+  - description: 改动说明
+- summary: 变更摘要
 """
-    
+
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
         """
         构建用户 Prompt
 
         Args:
-            state: 包含 design_output, error_context, project_path 的状态
+            state: 包含 design_output, injected_files, error_context 的状态
         """
         design_output = state.get("design_output", {})
         error_context = state.get("error_context")
-        project_path = state.get("project_path", "/workspace/backend")
 
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
-        affected_files = design_output.get("affected_files", [])
-        affected_files_str = json.dumps(affected_files, indent=2, ensure_ascii=False)
 
-        # 【改造】强调工具驱动的按需读取
+        # 【核心改造】使用上游注入的文件内容，不再让 LLM 自己读取
+        injected_files: Dict[str, str] = state.get("injected_files", {})
+        
+        # 【调试】记录 injected_files 信息
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[CoderAgent] 接收到的 injected_files: {len(injected_files)} 个文件")
+        for path in injected_files.keys():
+            content_len = len(injected_files[path])
+            logger.info(f"[CoderAgent]   - {path}: {content_len} 字符")
+
+        files_section = ""
+        if injected_files:
+            files_section = "\n【已存在文件列表 - 这些文件已存在，必须使用 change_type=\"modify\"】\n"
+            files_section += "文件路径列表：\n"
+            for path in injected_files.keys():
+                files_section += f"  - {path} (已存在，使用 modify)\n"
+
+            files_section += "\n【文件现有内容 - search_block 必须从这里精确复制】\n"
+            for path, content in injected_files.items():
+                # 限制每个文件最多 150 行，避免 prompt 过长
+                lines = content.splitlines()
+                shown = "\n".join(lines[:150])
+                truncated = f"\n... (共{len(lines)}行，已截断)" if len(lines) > 150 else ""
+                files_section += f"\n### {path}\n```python\n{shown}{truncated}\n```\n"
+        else:
+            files_section = "\n⚠️ 警告：未提供文件内容，请确保 search_block 与实际文件完全一致\n"
+
         prompt = f"""【技术设计方案】
 {design_str}
+{files_section}
 
-【项目路径】
-{project_path}
+请根据设计方案，对上述文件输出 JSON 格式的 search_block/replace_block 变更。
+不要输出任何解释，只输出 JSON。
 
-【受影响文件列表（参考）】
-{affected_files_str}
+【change_type 选择规则 - 极其重要】
+1. **如果文件在【已存在文件列表】中，必须使用 change_type="modify"**
+2. **只有真正的新文件（不在上述列表中）才使用 change_type="add"**
+3. modify 文件需要 search_block（从文件内容中精确复制）
+4. add 文件不需要 search_block，直接提供 content
 
-请根据技术设计方案，生成需要修改或新增的代码。
+【search_block/replace_block 格式说明】
+1. **search_block: 必须从上方【文件现有内容】中精确复制**，禁止猜测或编造
+2. replace_block: 替换后的新代码块
+3. 必须保持原有的缩进和换行
 
-【核心要求 - 工具驱动的按需读取】
-你**必须**使用以下工具主动获取需要的文件内容，而不是依赖预加载的上下文：
+【⚠️ 关键警告 - 违反会导致写入失败】
+- **injected_files 中的文件都是已存在的，必须用 modify，禁止用 add**
+- search_block 必须与文件现有内容**完全一致**（包括空格、换行、注释）
+- **绝对禁止在 search_block 中使用 "..." 省略号** - 必须复制完整的代码块
+- **绝对禁止在 search_block 中使用 "# ..." 或 "// ..." 等省略标记**
+- 如果不确定文件内容，请只修改你确定的部分
+- 错误的 search_block 会导致写入失败
 
-1. **glob 工具 - 发现文件**：
-   - 用途：查找项目中的文件
-   - 示例：`glob("app/api/v1/*.py")` 查找所有 API 文件
-   - 示例：`glob("app/service/*.py")` 查找所有服务层文件
+【示例】
+如果文件内容是：
+```python
+def hello():
+    print("hello")
+```
 
-2. **grep 工具 - 定位代码**：
-   - 用途：在文件中搜索特定模式
-   - 示例：`grep("def health", "app/api/v1")` 查找 health 函数
-   - 示例：`grep("class User", "app/models")` 查找 User 类
+要修改为：
+```python
+def hello():
+    print("hello world")
+```
 
-3. **read_file 工具 - 读取内容（核心）**：
-   - 用途：获取文件内容和 read_token
-   - **【强制】修改任何文件前必须先调用此工具！**
-   - 示例：`read_file("app/api/v1/health.py", 1, 50)` 读取前50行
-   - 返回的 read_token 是后续写入操作的凭证
-
-【工作流程】
-1. 使用 **glob** 发现相关文件
-2. 使用 **grep** 定位具体代码位置
-3. 使用 **read_file** 精确读取需要的代码段（获取 read_token）
-4. 基于实际读取的内容生成 search_block 和 replace_block
-5. 输出 JSON 格式的代码变更
-
-【重要约束】
-1. **search_block 必须精确匹配**目标文件中的内容（包括空格和换行）
-2. **search_block 必须来源于 read_file 工具的实际输出**
-3. **严禁虚构代码** - 所有 search_block 必须是你真实读取到的内容
-4. 保持原有代码的缩进风格、注释风格和架构分层
-5. 修改范围尽量小，只修改必要的部分
+则输出：
+```json
+{{
+  "files": [
+    {{
+      "file_path": "app/example.py",
+      "change_type": "modify",
+      "search_block": "def hello():\\n    print(\"hello\")",
+      "replace_block": "def hello():\\n    print(\"hello world\")",
+      "description": "修改问候语"
+    }}
+  ],
+  "summary": "修改问候语"
+}}
+```
 """
 
         # 如果有报错上下文，注入到 Prompt 头部，强制 Agent 进入修复模式
@@ -235,17 +224,17 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
 
 请仔细分析报错原因（是语法错误、逻辑错误还是测试用例不匹配），并给出修复后的完整代码。
 
-**修复流程**：
-1. 使用工具重新读取相关文件，获取最新的 read_token
-2. 基于最新内容生成正确的 search_block 和 replace_block
-3. 确保修复后的代码能通过测试
+**修复要求**：
+1. 基于上述文件内容生成正确的 search_block 和 replace_block
+2. 确保修复后的代码能通过测试
+3. 只输出 JSON 格式的变更
 
 ---
 
 {prompt}"""
 
         return prompt
-    
+
     def parse_output(self, response: str) -> Dict[str, Any]:
         """解析 LLM 输出为字典"""
         return self._parse_json_response(response)
@@ -296,23 +285,25 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
                             f["fallback_end_line"] = f.get("end_line")
 
         return CoderOutput(**output)
-    
+
     async def generate_code(
         self,
         design_output: Dict[str, Any],
         pipeline_id: Optional[int] = None,
-        error_context: Optional[str] = None
+        error_context: Optional[str] = None,
+        injected_files: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
         根据设计方案生成代码
 
-        【改造】CoderAgent 现在使用工具按需读取文件（glob/grep/read_file）
-        不再依赖预加载的 target_files 内容
+        【改造】CoderAgent 现在是纯代码生成器，不直接调用工具
+        所需文件内容由上游（ArchitectAgent）预读后通过 injected_files 注入
 
         Args:
             design_output: DesignerAgent 的输出内容（包含 affected_files 列表）
             pipeline_id: Pipeline ID，用于日志记录
             error_context: 测试失败的错误上下文（用于修复模式）
+            injected_files: 上游预读取的文件内容 {path: content}
 
         Returns:
             Dict: 包含生成结果或错误信息
@@ -323,7 +314,8 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
         logger.info(f"CoderAgent 开始生成代码", extra={
             "pipeline_id": pipeline_id,
             "affected_files_count": len(affected_files),
-            "affected_files": affected_files
+            "affected_files": affected_files,
+            "injected_files_count": len(injected_files) if injected_files else 0
         })
 
         if pipeline_id:
@@ -331,7 +323,8 @@ class CoderAgent(ToolUsingAgent[CoderOutput]):
 
         initial_state = {
             "design_output": design_output,
-            "error_context": error_context
+            "error_context": error_context,
+            "injected_files": injected_files or {}  # 【核心】上游注入的文件内容
         }
 
         result = await self.execute(

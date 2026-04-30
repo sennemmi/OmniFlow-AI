@@ -34,12 +34,15 @@ from app.service.sandbox_manager import SandboxManager, sandbox_manager
 from app.service.agent_coordinator import AgentCoordinatorService
 from app.service.code_executor import CodeExecutorService
 from app.service.code_indexer import CodeIndexerService
+from app.service.file_writer import FileWriterService
+from app.service.sandbox_orchestrator import get_sandbox_orchestrator, cleanup_sandbox_orchestrator
+from app.service.sandbox_file_service import SandboxFileService
 from app.agents.reviewer import ReviewAgent, ReviewDecision
-from app.agents.coder import CoderAgent
+from app.agents.coder import coder_agent
 from app.agents.repairer import RepairerAgent
 from app.agents.verify_agent import VerifyAgent, verify_fixes
 from app.agents.tester import TesterAgent
-from app.agents.architect import ArchitectAgent
+from app.agents.architect import architect_agent
 from app.agents.designer import DesignerAgent
 from app.agents.schemas import CoderOutput, TesterOutput, ArchitectOutput, DesignerOutput
 from app.core.resilience import RetryExecutor, ResilienceManager, RetryConfig, CircuitBreakerOpenError
@@ -156,14 +159,6 @@ class DockerSandboxTester:
             print("请在 .env 文件中设置 MODELSCOPE_API_KEY 或 OPENAI_API_KEY")
             return False
 
-        use_modelscope = os.getenv("USE_MODELSCOPE", "false").lower() == "true"
-        if use_modelscope:
-            print(f"✅ 使用 ModelScope API")
-            print(f"   API Base: {os.getenv('MODELSCOPE_API_BASE', 'https://api-inference.modelscope.cn/v1')}")
-            print(f"   模型: {os.getenv('DEFAULT_MODEL', 'Qwen/Qwen3.5-122B-A10B')}")
-        else:
-            print(f"✅ 使用 OpenAI API")
-
         return True
 
     def check_docker_available(self) -> bool:
@@ -276,11 +271,21 @@ class DockerSandboxTester:
         """
         code_executor = CodeExecutorService(str(self.backend_dir))
         print(f"   📂 查找相关测试文件...")
-        test_files = code_executor.get_related_test_files(affected_files)
-        for full_path in test_files:
+
+        # 逐个处理 affected_files 列表中的每个文件
+        all_test_files = []
+        for source_file in affected_files:
+            if isinstance(source_file, str):
+                test_files = code_executor.get_related_test_files(source_file)
+                all_test_files.extend(test_files)
+
+        # 去重
+        unique_test_files = list(set(all_test_files))
+
+        for full_path in unique_test_files:
             print(f"      ✓ 找到测试文件: {full_path}")
-        print(f"   📊 共找到 {len(test_files)} 个测试文件")
-        return test_files
+        print(f"   📊 共找到 {len(unique_test_files)} 个测试文件")
+        return unique_test_files
 
     def prepare_workspace(self, code_files: List[Dict], test_files: List[Dict]) -> str:
         """
@@ -328,15 +333,11 @@ class DockerSandboxTester:
             shutil.copy2(env_src, backend_workspace / ".env")
             print(f"      ✓ .env")
 
-        # ========== 第 2 步：写入生成的代码文件（覆盖旧版本）==========
-        print(f"   📝 写入生成的代码文件（使用 Read Token 机制）...")
+        # ========== 第 2 步：写入生成的代码文件（使用 FileWriterService）==========
+        print(f"   📝 写入生成的代码文件（使用 FileWriterService）...")
 
-        # 【核心】使用 CodeExecutorService 进行安全的文件写入
-        code_executor = CodeExecutorService(str(backend_workspace))
-
-        # 导入 MultiAgentCoordinator 用于搜索替换
-        from app.agents.multi_agent_coordinator import MultiAgentCoordinator
-        coordinator = MultiAgentCoordinator()
+        # 【新架构】使用 FileWriterService 进行文件写入（纯 Python，不走 LLM）
+        file_writer = FileWriterService(str(backend_workspace))
 
         # 按文件分组收集所有修改
         from collections import defaultdict
@@ -358,115 +359,51 @@ class DockerSandboxTester:
 
             file_changes_map[file_path_key].append(f)
 
-        # 处理每个文件的修改
+        # 使用 FileWriterService 批量应用变更
+        all_changes = []
         for file_path_key, changes in file_changes_map.items():
-            # 移除 backend/ 前缀，转换为相对路径
-            relative_path = file_path_key.replace("backend/", "").replace("backend\\", "")
+            # 合并多个修改为一个（FileWriterService 会处理）
+            for change in changes:
+                all_changes.append(change)
 
-            # 【Read Token 机制】先读取文件获取 read_token
-            read_result = code_executor.read_file(relative_path)
+        # 【调试】显示即将应用的变更
+        print(f"   [调试] 即将应用 {len(all_changes)} 个代码变更:")
+        for change in all_changes:
+            change_type = change.get('change_type', 'modify')
+            file_path = change.get('file_path', 'unknown')
+            has_search = 'search_block' in change and change['search_block']
+            has_content = 'content' in change and change['content']
+            print(f"      - {file_path} [{change_type}] search={has_search}, content={has_content}")
 
-            if len(changes) == 1:
-                # 单个修改
-                f = changes[0]
-                content = f.get('content')
-                change_type = f.get('change_type', 'modify')
+        write_results = file_writer.apply_changes(all_changes)
 
-                if content is not None:
-                    # 直接有 content，使用 read_token 写入
-                    pass
-                elif change_type == 'add':
-                    # 新建文件，使用 NEW_FILE token
-                    content = f.get('replace_block', '') or f.get('content', '')
-                elif change_type in ['modify', 'update']:
-                    # 使用搜索替换应用修改（直接复用 coordinator 的方法）
-                    # 【新架构】从工作目录读取原始内容，不再依赖 target_files
-                    original = read_result.content
+        # 检查写入结果
+        failed_writes = [r for r in write_results if not r.get('success')]
+        if failed_writes:
+            for result in failed_writes:
+                print(f"      ❌ 写入失败: {result.get('file')} - {result.get('error')}")
+            raise PermissionError(f"写入文件失败: {failed_writes[0].get('error')}")
 
-                    if not original:
-                        raise ValueError(f"找不到文件 {file_path_key} 的原始内容，请确保文件已存在于工作目录")
+        for result in write_results:
+            if result.get('success'):
+                print(f"      ✓ {result.get('file')}")
 
-                    search_block = f.get('search_block')
-                    replace_block = f.get('replace_block', '')
+        # ========== 第 3 步：写入生成的测试文件（使用 FileWriterService）==========
+        print(f"   📝 写入生成的测试文件（使用 FileWriterService）...")
+        test_write_results = file_writer.apply_changes(test_files)
 
-                    if not search_block:
-                        raise ValueError(f"文件 {file_path_key} 缺少 search_block")
+        failed_test_writes = [r for r in test_write_results if not r.get('success')]
+        if failed_test_writes:
+            for result in failed_test_writes:
+                print(f"      ❌ 写入失败: {result.get('file')} - {result.get('error')}")
+            raise PermissionError(f"写入测试文件失败: {failed_test_writes[0].get('error')}")
 
-                    content = coordinator._apply_search_replace(
-                        original, search_block, replace_block, None, None
-                    )
-
-                    if content is None:
-                        raise ValueError(f"搜索块匹配失败: {file_path_key}")
-                else:
-                    raise ValueError(f"文件 {file_path_key} 无法处理(change_type={change_type})")
-            else:
-                # 多个修改，需要合并应用（直接复用 coordinator 的方法）
-                print(f"      [INFO] 文件 {file_path_key} 有 {len(changes)} 个修改，合并应用...")
-                # 【新架构】从工作目录读取原始内容
-                original = read_result.content
-
-                if not original:
-                    raise ValueError(f"找不到文件 {file_path_key} 的原始内容，请确保文件已存在于工作目录")
-
-                content = original
-                valid_changes = [c for c in changes if c.get('search_block')]
-
-                for i, change in enumerate(valid_changes):
-                    search_block = change.get('search_block', '')
-                    replace_block = change.get('replace_block', '')
-
-                    new_content = coordinator._apply_search_replace(
-                        content, search_block, replace_block, None, None
-                    )
-
-                    if new_content is not None:
-                        content = new_content
-                        print(f"        [PASS] 修改 {i+1}/{len(valid_changes)}: 搜索替换成功")
-                    else:
-                        raise ValueError(f"修改 {i+1} 搜索块匹配失败")
-
-            # 【核心】使用 CodeExecutorService 安全写入（带 read_token 校验）
-            is_new_file = (changes[0].get('change_type') == 'add') if changes else False
-            read_token = read_result.read_token if read_result.read_token else "NEW_FILE"
-
-            result = code_executor.apply_file_change(
-                relative_path=relative_path,
-                new_content=content,
-                read_token=read_token,
-                create_if_missing=is_new_file
-            )
-
-            if not result.success:
-                raise PermissionError(f"写入文件失败 [{file_path_key}]: {result.error}")
-
-            print(f"      ✓ {file_path_key} (read_token 校验通过)")
-
-        # ========== 第 3 步：写入生成的测试文件（使用 Read Token）==========
-        print(f"   📝 写入生成的测试文件（使用 Read Token 机制）...")
-        for f in test_files:
-            relative_path = f['file_path'].replace("backend/", "").replace("backend\\", "")
-            content = f.get('content', '')
-
-            # 读取获取 read_token（测试文件可能已存在）
-            read_result = code_executor.read_file(relative_path)
-            read_token = read_result.read_token if read_result.read_token else "NEW_FILE"
-
-            result = code_executor.apply_file_change(
-                relative_path=relative_path,
-                new_content=content,
-                read_token=read_token,
-                create_if_missing=True
-            )
-
-            if not result.success:
-                raise PermissionError(f"写入测试文件失败 [{f['file_path']}]: {result.error}")
-
-            print(f"      ✓ {f['file_path']} (read_token 校验通过)")
+        for result in test_write_results:
+            if result.get('success'):
+                print(f"      ✓ {result.get('file')}")
 
         # 【修复模块缓存问题】清除 Python 模块缓存，确保新文件能被正确导入
         print(f"   🧹 清除 Python 模块缓存...")
-        import shutil
         pycache_count = 0
         for root, dirs, files in os.walk(backend_workspace):
             for dir_name in dirs:
@@ -501,19 +438,25 @@ class DockerSandboxTester:
         design_data: Dict[str, Any],
         test_files_ref: Dict[str, str],
         feature_description: str,
-        attempt: int
+        attempt: int,
+        injected_files: Optional[Dict[str, str]] = None,
+        file_service: Optional[Any] = None
     ) -> tuple:
         """
-        生成代码和测试（新架构：CoderAgent 通过工具主动获取文件）
+        生成代码和测试（新架构：CoderAgent 通过 injected_files 获取文件内容）
+
+        Args:
+            file_service: SandboxFileService 实例（新架构），如果提供则直接写入 Sandbox
 
         Returns:
             (code_files, test_files, success)
         """
         print(f"\n📝 Step 3: CoderAgent 生成代码...")
         print(f"   正在调用 LLM，请稍候...")
-        print(f"   💡 新架构：CoderAgent 将通过工具主动获取需要的文件")
-
-        coder = CoderAgent()
+        if injected_files:
+            print(f"   💡 新架构：CoderAgent 将通过 injected_files 获取 {len(injected_files)} 个文件内容")
+        if file_service:
+            print(f"   🐳 代码将直接写入 Docker Sandbox")
 
         # 构建增强的 design_output
         enhanced_design = dict(design_data)
@@ -527,7 +470,7 @@ class DockerSandboxTester:
         enhanced_design["coding_constraints"] = {
             "description": "【编码约束】请严格遵守以下规则",
             "rules": [
-                "1. 使用 glob/grep/read_file 工具主动获取需要的文件",
+                "1. 基于 injected_files 中的文件内容生成代码变更",
                 "2. 所有 import 必须基于项目中实际存在的模块路径",
                 "3. 禁止假设存在未提供的工具函数或类",
                 "4. 保持与现有代码风格一致（命名规范、错误处理等）",
@@ -542,15 +485,12 @@ class DockerSandboxTester:
                 "note": "这是第 {} 次尝试，请仔细检查代码并修复之前的问题".format(attempt + 1)
             }
 
-        coder_initial_state = {
-            "design_output": enhanced_design,
-            "project_path": str(self.backend_dir)  # 传递项目路径，供工具使用
-        }
-
-        coder_result = await coder.execute(
+        # 【新架构】使用 generate_code 方法，传入 injected_files
+        coder_result = await coder_agent.generate_code(
+            design_output=enhanced_design,
             pipeline_id=99999,
-            stage_name="CODING",
-            initial_state=coder_initial_state
+            error_context=None if attempt == 0 else f"第 {attempt} 次重试",
+            injected_files=injected_files
         )
 
         print(f"✅ CoderAgent 执行完成")
@@ -603,6 +543,51 @@ class DockerSandboxTester:
             else:
                 print(f"     - {file_path} [{change_type}] (content={f.get('content') is not None})")
 
+        # 【新架构】如果提供了 file_service，直接将代码写入 Sandbox
+        if file_service:
+            print(f"\n🐳 将代码直接写入 Docker Sandbox...")
+            write_results = []
+            for file_change in code_files:
+                file_path = file_change.get("file_path", "")
+                change_type = file_change.get("change_type", "modify")
+
+                if change_type == "add":
+                    # 新文件：直接写入 content
+                    content = file_change.get("content", "")
+                    if content:
+                        result = await file_service.write_file(file_path, content)
+                        write_results.append(result)
+                        if result.get("success"):
+                            print(f"   ✓ {file_path} [add]")
+                        else:
+                            print(f"   ❌ {file_path} [add] - {result.get('error')}")
+                elif change_type == "modify":
+                    # 修改文件：读取原文件，应用 search/replace
+                    search_block = file_change.get("search_block", "")
+                    replace_block = file_change.get("replace_block", "")
+
+                    if search_block:
+                        # 读取原文件
+                        clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                        read_result = await file_service.read_file(clean_path)
+                        if read_result.exists and read_result.content:
+                            # 应用替换
+                            new_content = read_result.content.replace(search_block, replace_block, 1)
+                            # 写入新内容
+                            result = await file_service.write_file(clean_path, new_content)
+                            write_results.append(result)
+                            if result.get("success"):
+                                print(f"   ✓ {file_path} [modify]")
+                            else:
+                                print(f"   ❌ {file_path} [modify] - {result.get('error')}")
+
+            # 检查写入结果
+            failed_writes = [r for r in write_results if not r.get("success")]
+            if failed_writes:
+                print(f"   ❌ {len(failed_writes)} 个文件写入 Sandbox 失败")
+            else:
+                print(f"   ✅ 所有文件成功写入 Docker Sandbox")
+
         self.total_input_tokens += coder_result.get('input_tokens', 0)
         self.total_output_tokens += coder_result.get('output_tokens', 0)
 
@@ -634,14 +619,39 @@ class DockerSandboxTester:
 
         test_output = tester_result.get('output', {})
         if isinstance(test_output, TesterOutput):
-            test_files = [{"file_path": f.file_path, "content": f.content} for f in test_output.test_files]
+            # 【修复】测试文件是新创建的，需要标记 change_type="add"
+            test_files = [
+                {
+                    "file_path": f.file_path,
+                    "content": f.content,
+                    "change_type": getattr(f, 'change_type', 'add')  # 默认为 add（新文件）
+                }
+                for f in test_output.test_files
+            ]
         else:
+            # 【修复】确保测试文件有 change_type 字段
             test_files = test_output.get('test_files', [])
+            for f in test_files:
+                if 'change_type' not in f:
+                    f['change_type'] = 'add'  # 测试文件默认为 add
 
         if test_files:
             print(f"   生成 {len(test_files)} 个测试文件:")
             for f in test_files:
                 print(f"     - {f['file_path']}")
+
+            # 【新架构】如果提供了 file_service，将测试文件也写入 Sandbox
+            if file_service:
+                print(f"\n🐳 将测试文件写入 Docker Sandbox...")
+                for test_file in test_files:
+                    file_path = test_file.get("file_path", "")
+                    content = test_file.get("content", "")
+                    if content:
+                        result = await file_service.write_file(file_path, content)
+                        if result.get("success"):
+                            print(f"   ✓ {file_path}")
+                        else:
+                            print(f"   ❌ {file_path} - {result.get('error')}")
         else:
             print(f"   未生成测试文件")
             test_files = []
@@ -653,9 +663,10 @@ class DockerSandboxTester:
 
     async def _verify_with_agent(
         self,
-        workspace_path: str,
+        workspace_path: Optional[str],
         code_files: List[Dict],
-        pipeline_id: int = 99999
+        pipeline_id: int = 99999,
+        file_service: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         【阶段二：独立验证步骤 - 利益隔离核心】
@@ -669,32 +680,87 @@ class DockerSandboxTester:
         - 只报告事实（PASS/FAIL），绝不提供修复建议
 
         Args:
-            workspace_path: 工作目录路径
+            workspace_path: 工作目录路径（本地模式使用）
             code_files: 生成的代码文件列表
             pipeline_id: Pipeline ID
+            file_service: SandboxFileService 实例（新架构）
 
         Returns:
             Dict[str, Any]: 验证结果
         """
         print(f"   🔍 独立验证步骤（VerifyAgent）- 只检测，不修复...")
 
-        # 【复用后端代码】使用 TestRunnerService 运行测试
-        from app.service.test_runner import TestRunnerService
+        # 【新架构】如果提供了 file_service，直接在 Sandbox 中运行测试
+        if file_service:
+            print(f"   🐳 在 Docker Sandbox 中运行验证测试...")
+            # 使用 sandbox_manager 直接在容器中运行测试
+            pytest_cmd = f"cd /workspace && PYTHONPATH=/workspace python -m pytest tests/ -v --tb=short -p no:cacheprovider 2>&1"
+            exec_result = await sandbox_manager.exec(pipeline_id, pytest_cmd, timeout=120)
 
-        # 运行测试
-        test_result = await TestRunnerService.run_tests(
-            project_path=workspace_path,
-            test_path="tests/",
-            timeout=120
-        )
+            # 解析结果
+            stdout = exec_result.stdout
+            exit_code = exec_result.exit_code
+
+            # 构建测试结果
+            test_result = {
+                "success": exit_code == 0,
+                "returncode": exit_code,
+                "passed": stdout.count(" passed") if " passed" in stdout else 0,
+                "failed": stdout.count(" failed") if " failed" in stdout else 0,
+                "output": stdout
+            }
+        else:
+            # 【复用后端代码】使用 TestRunnerService 运行测试（本地模式）
+            from app.service.test_runner import TestRunnerService
+
+            if not workspace_path:
+                print(f"   ❌ workspace_path 和 file_service 都未提供")
+                return {"verdict": "ERROR", "message": "无法运行测试：未提供路径或文件服务"}
+
+            # 运行测试
+            test_result = await TestRunnerService.run_tests(
+                project_path=workspace_path,
+                test_path="tests/",
+                timeout=120
+            )
+
+        # 【调试】打印测试结果的详细信息
+        print(f"   [调试] 测试执行结果:")
+        print(f"      - 成功: {test_result.get('success')}")
+        print(f"      - 返回码: {test_result.get('returncode')}")
+        print(f"      - 通过: {test_result.get('passed', 0)}")
+        print(f"      - 失败: {test_result.get('failed', 0)}")
+
+        # 如果有失败，显示详细错误
+        if test_result.get('failed', 0) > 0:
+            print(f"   [调试] 测试失败详情:")
+            failures = test_result.get('failures', [])
+            for i, failure in enumerate(failures[:5]):  # 只显示前5个
+                test_name = failure.get('test', 'unknown')
+                error = failure.get('error', 'no error message')
+                print(f"      {i+1}. {test_name}")
+                print(f"         错误: {error[:200]}...")
 
         # 【复用后端代码】使用 verify_fixes 便捷函数进行验证
-        verify_result = await verify_fixes(
-            test_runner=TestRunnerService,
-            test_path="tests/",
-            generated_files=[f.get("file_path", "") for f in code_files],
-            project_path=workspace_path
-        )
+        # 【修复】在 Sandbox 模式下不使用 TestRunnerService
+        if file_service:
+            # Sandbox 模式：直接使用测试结果构建验证结果
+            verify_result = {
+                "verdict": "PASS" if test_result.get("success") else "FAIL",
+                "message": "测试通过" if test_result.get("success") else "测试失败",
+                "error_count": test_result.get("failed", 0),
+                "errors": [],
+                "structured_errors": {"errors": []}
+            }
+        else:
+            # 本地模式：使用 verify_fixes
+            from app.service.test_runner import TestRunnerService
+            verify_result = await verify_fixes(
+                test_runner=TestRunnerService,
+                test_path="tests/",
+                generated_files=[f.get("file_path", "") for f in code_files],
+                project_path=workspace_path
+            )
 
         # 添加测试运行结果到验证结果
         verify_result["test_result"] = test_result
@@ -709,7 +775,7 @@ class DockerSandboxTester:
             print(f"   ❌ {message}")
             print(f"      发现 {error_count} 个错误")
             errors = verify_result.get("errors", [])
-            for err in errors[:3]:  # 只显示前3个
+            for err in errors[:5]:  # 显示前5个
                 print(f"         - {err}")
         else:
             print(f"   ⚠️  验证过程出错: {message}")
@@ -720,7 +786,8 @@ class DockerSandboxTester:
         self,
         code_files: List[Dict],
         verify_result: Dict[str, Any],
-        workspace_path: str
+        workspace_path: str,
+        file_service: Optional[Any] = None
     ) -> bool:
         """
         【利益隔离】RepairerAgent 修复阶段
@@ -733,10 +800,15 @@ class DockerSandboxTester:
         - 永远看不到原始测试日志，只能看到结构化工单
         - 没有任何测试工具的访问权限
 
+        Args:
+            file_service: SandboxFileService 实例（新架构），如果提供则直接操作 Sandbox
+
         Returns:
             bool: 修复是否成功
         """
         print(f"   🔧 调用 RepairerAgent 进行精确修复（利益隔离）...")
+        if file_service:
+            print(f"   🐳 将使用 SandboxFileService 进行修复")
 
         # 【利益隔离】构建结构化工单
         structured_errors = verify_result.get("structured_errors", {})
@@ -782,12 +854,14 @@ class DockerSandboxTester:
         print(f"   📋 修复工单已生成: {len(fix_order['errors'])} 个错误项")
 
         # 【利益隔离核心】调用 RepairerAgent 进行修复
+        # 【新架构】传入 file_service，使用 Sandbox 模式
         repairer = RepairerAgent()
         repair_result = await repairer.execute_with_reread(
             pipeline_id=99999,
             stage_name="REPAIR",
             fix_order=fix_order,
-            project_path=workspace_path,
+            project_path=workspace_path if not file_service else None,
+            file_service=file_service,
             initial_state={
                 "verification_report": {
                     "verdict": verify_result.get("verdict"),
@@ -861,39 +935,52 @@ class DockerSandboxTester:
 
     async def run_tests_in_sandbox(
         self,
-        workspace_path: str,
-        pipeline_id: int = 99999
+        workspace_path: Optional[str],
+        pipeline_id: int = 99999,
+        use_existing_sandbox: bool = True
     ) -> LayeredTestResult:
         """
         在 Docker Sandbox 中运行分层测试（带智能重试）
 
         【智能重试】对于环境错误（如 Docker 容器启动失败）会进行静默重试。
+        【新架构】支持复用已有的 Sandbox（Sandbox 优先架构）
 
         流程：
-        1. 启动 Docker 容器（带重试）
+        1. 启动 Docker 容器（带重试）或复用已有容器
         2. 在容器中运行 pytest
         3. 解析结果并返回 LayeredTestResult
         """
-        print(f"\n   🐳 启动 Docker Sandbox...")
-
-        # 【智能重试】启动沙箱（带重试）
-        async def _do_start_sandbox():
-            return await sandbox_manager.start(
-                pipeline_id=pipeline_id,
-                project_path=workspace_path
-            )
-
-        try:
-            sandbox_info = await self._sandbox_retry_executor.execute(_do_start_sandbox)
-            print(f"   ✅ Sandbox 已启动")
+        # 【新架构】检查是否已有 Sandbox 在运行
+        if use_existing_sandbox and pipeline_id in sandbox_manager._sandboxes:
+            print(f"\n   🐳 复用已有的 Docker Sandbox...")
+            sandbox_info = sandbox_manager._sandboxes[pipeline_id]
+            print(f"   ✅ 复用 Sandbox")
             print(f"      容器: {sandbox_info.container_id[:12]}")
             print(f"      端口: {sandbox_info.port}")
-        except CircuitBreakerOpenError:
-            print(f"   ❌ 启动 Sandbox 失败: 服务暂时不可用，系统正在冷却")
-            raise RuntimeError("Docker Sandbox 服务暂时不可用，请稍后再试...")
-        except Exception as e:
-            print(f"   ❌ 启动 Sandbox 失败: {e}")
-            raise
+        elif workspace_path:
+            print(f"\n   🐳 启动 Docker Sandbox...")
+
+            # 【智能重试】启动沙箱（带重试）
+            async def _do_start_sandbox():
+                return await sandbox_manager.start(
+                    pipeline_id=pipeline_id,
+                    project_path=workspace_path
+                )
+
+            try:
+                sandbox_info = await self._sandbox_retry_executor.execute(_do_start_sandbox)
+                print(f"   ✅ Sandbox 已启动")
+                print(f"      容器: {sandbox_info.container_id[:12]}")
+                print(f"      端口: {sandbox_info.port}")
+            except CircuitBreakerOpenError:
+                print(f"   ❌ 启动 Sandbox 失败: 服务暂时不可用，系统正在冷却")
+                raise RuntimeError("Docker Sandbox 服务暂时不可用，请稍后再试...")
+            except Exception as e:
+                print(f"   ❌ 启动 Sandbox 失败: {e}")
+                raise
+        else:
+            print(f"   ❌ 没有可用的 Sandbox 且没有提供 workspace_path")
+            raise RuntimeError("没有可用的 Sandbox")
 
         try:
             # 在容器中运行分层测试
@@ -907,6 +994,7 @@ class DockerSandboxTester:
             # 实际运行时在容器中验证
 
             # Layer 2-4: 在容器中运行 pytest
+            # 【修复】因为 backend 目录被挂载到 /workspace，所以测试路径是 /workspace/tests/...
             test_commands = [
                 ("defense", "tests/unit/defense", "防御性测试"),
                 ("regression", "tests/unit", "回归测试"),
@@ -916,8 +1004,8 @@ class DockerSandboxTester:
             for layer_name, test_path, description in test_commands:
                 print(f"\n   📋 Layer: {description} ({layer_name})")
 
-                # 检查测试目录是否存在
-                check_cmd = f"ls -la /workspace/backend/{test_path} 2>/dev/null | head -5 || echo 'Directory not found'"
+                # 检查测试目录是否存在（注意路径是 /workspace/ 而不是 /workspace/backend/）
+                check_cmd = f"ls -la /workspace/{test_path} 2>/dev/null | head -5 || echo 'Directory not found'"
                 check_result = await sandbox_manager.exec(pipeline_id, check_cmd, timeout=10)
 
                 if "Directory not found" in check_result.stdout or "No such file" in check_result.stderr:
@@ -929,8 +1017,8 @@ class DockerSandboxTester:
                     ))
                     continue
 
-                # 运行 pytest
-                pytest_cmd = f"cd /workspace/backend && PYTHONPATH=/workspace/backend python -m pytest {test_path} -v --tb=short -p no:cacheprovider 2>&1"
+                # 运行 pytest（注意路径是 /workspace/ 而不是 /workspace/backend/）
+                pytest_cmd = f"cd /workspace && PYTHONPATH=/workspace python -m pytest {test_path} -v --tb=short -p no:cacheprovider 2>&1"
                 print(f"      运行: {pytest_cmd[:80]}...")
 
                 exec_result = await sandbox_manager.exec(pipeline_id, pytest_cmd, timeout=120)
@@ -1061,10 +1149,13 @@ class DockerSandboxTester:
             )
 
         finally:
-            # 停止沙箱
-            print(f"\n   🛑 停止 Docker Sandbox...")
-            await sandbox_manager.stop(pipeline_id)
-            print(f"   ✅ Sandbox 已停止")
+            # 【新架构】如果 use_existing_sandbox=True，不要在这里停止 Sandbox
+            # 因为 Sandbox 是在 Step 0 启动的，会在最后统一清理
+            if not use_existing_sandbox:
+                # 停止沙箱
+                print(f"\n   🛑 停止 Docker Sandbox...")
+                await sandbox_manager.stop(pipeline_id)
+                print(f"   ✅ Sandbox 已停止")
 
     async def run_scenario_with_real_llm(self) -> E2ETestResult:
         """
@@ -1088,11 +1179,40 @@ class DockerSandboxTester:
         workspace_path = None
 
         try:
+            # 【新架构】Step 0: 在 Architect 阶段前就拉起 Docker Sandbox
+            # 这样所有文件操作都在 Sandbox 中进行
+            print("🐳 Step 0: 启动 Docker Sandbox（Sandbox 优先架构）...")
+            print("   所有后续操作将在 Docker 容器中进行...")
+
+            from app.service.sandbox_orchestrator import get_sandbox_orchestrator
+
+            sandbox_orchestrator = get_sandbox_orchestrator(99999)
+            sandbox_result = await sandbox_orchestrator.initialize(
+                project_path=str(self.backend_dir)
+            )
+
+            if not sandbox_result["success"]:
+                print(f"   ❌ Sandbox 启动失败: {sandbox_result.get('error')}")
+                return E2ETestResult(
+                    scenario_name="real_llm_docker_sandbox",
+                    success=False,
+                    code_generated=False,
+                    tests_generated=False,
+                    tests_passed=False,
+                    error_message=f"Sandbox 启动失败: {sandbox_result.get('error')}"
+                )
+
+            print(f"   ✅ Sandbox 启动成功")
+            print(f"   🐳 所有文件操作将在 Docker 容器中进行")
+
+            # 获取 FileService 用于后续操作
+            file_service = sandbox_orchestrator.get_file_service()
+
             # ========== Step 1: ArchitectAgent 分析需求 ==========
-            print("📋 Step 1: ArchitectAgent 分析需求...")
+            print("\n📋 Step 1: ArchitectAgent 分析需求...")
             print("   正在调用 LLM，请稍候...")
 
-            architect = ArchitectAgent()
+            # 使用已导入的 architect_agent 单例实例
 
             # 动态构建项目文件树（只包含文件结构，不包含代码内容）
             file_tree = self._build_file_tree()
@@ -1124,10 +1244,11 @@ class DockerSandboxTester:
 
             architect_initial_state = {
                 "requirement": requirement,
-                "file_tree": file_tree
+                "file_tree": file_tree,
+                "project_path": str(self.backend_dir)  # 传递项目路径供工具使用
             }
 
-            architect_result = await architect.execute(
+            architect_result = await architect_agent.execute(
                 pipeline_id=99999,
                 stage_name="REQUIREMENT",
                 initial_state=architect_initial_state
@@ -1150,8 +1271,24 @@ class DockerSandboxTester:
                 feature_description = architect_output.get('feature_description', '计算两数之和')
                 affected_files = architect_output.get('affected_files', [])
 
+            # 【新架构】获取 ArchitectAgent 预读取的文件内容
+            injected_files = architect_result.get('injected_files', {})
+            if not injected_files:
+                # 尝试从 output 中获取
+                injected_files = architect_output.get('injected_files', {}) if isinstance(architect_output, dict) else {}
+
             print(f"   功能描述: {feature_description}")
             print(f"   受影响文件: {affected_files}")
+            if injected_files:
+                print(f"   预读取文件: {len(injected_files)} 个")
+
+            # 【新架构】file_service 已在 Step 0 初始化
+            # 确保 file_service 可用
+            if not file_service:
+                print(f"   ❌ FileService 不可用，无法继续")
+                raise Exception("FileService 未初始化")
+
+            print(f"   ✅ 使用 SandboxFileService 进行文件操作")
 
             self.total_input_tokens += architect_result.get('input_tokens', 0)
             self.total_output_tokens += architect_result.get('output_tokens', 0)
@@ -1209,13 +1346,13 @@ class DockerSandboxTester:
             self.total_input_tokens += designer_result.get('input_tokens', 0)
             self.total_output_tokens += designer_result.get('output_tokens', 0)
 
-            # 【新架构】CoderAgent 将通过工具主动获取需要的文件
+            # 【新架构】CoderAgent 将通过 injected_files 获取文件内容
             # 不再需要预加载所有目标文件，大幅降低 Token 消耗
             print("\n📂 获取测试文件参考...")
             # 从 affected_files 中提取文件路径用于查找相关测试
             affected_files = design_data.get('affected_files', [])
             test_files_ref = self.get_related_test_files(affected_files)
-            print(f"   💡 新架构：CoderAgent 将通过 glob/grep/read_file 工具主动获取文件")
+            print(f"   💡 新架构：CoderAgent 将通过 injected_files 获取 {len(injected_files)} 个文件内容")
 
             # ========== Step 3-7: 代码生成、测试生成、分层测试、ReviewAgent 决策（带 Auto-Fix 循环）==========
             max_retries = 3
@@ -1229,9 +1366,10 @@ class DockerSandboxTester:
                 print(f"🔄 Auto-Fix 循环: 第 {attempt + 1}/{max_retries} 次尝试")
                 print(f"{'='*70}")
 
-                # 生成代码（新架构：CoderAgent 通过工具主动获取文件）
+                # 生成代码（新架构：CoderAgent 通过 injected_files 获取文件内容）
+                # 【新架构】传入 file_service，代码将直接写入 Sandbox
                 code_files, test_files, success = await self._generate_code_and_tests(
-                    design_data, test_files_ref, feature_description, attempt
+                    design_data, test_files_ref, feature_description, attempt, injected_files, file_service
                 )
 
                 if not success:
@@ -1239,9 +1377,14 @@ class DockerSandboxTester:
                     attempt += 1
                     continue
 
-                # 准备工作目录
-                print(f"\n🛡️  准备工作目录...")
-                workspace_path = self.prepare_workspace(code_files, test_files)
+                # 【新架构】Sandbox 优先模式下，代码已直接写入 Sandbox，无需准备本地工作目录
+                if file_service:
+                    print(f"\n🐳 代码已直接写入 Docker Sandbox，跳过本地工作目录准备")
+                    workspace_path = None  # 不需要本地工作目录
+                else:
+                    # 本地模式：准备工作目录
+                    print(f"\n🛡️  准备工作目录...")
+                    workspace_path = self.prepare_workspace(code_files, test_files)
 
                 # 运行分层测试
                 print(f"\n🐳 在 Docker Sandbox 中运行分层测试...")
@@ -1265,7 +1408,8 @@ class DockerSandboxTester:
 
                     # 【利益隔离】Step 1: 独立验证步骤
                     # VerifyAgent 只负责"检"，没有任何文件写入或代码修改权限
-                    verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999)
+                    # 【新架构】传入 file_service，使用 Sandbox 模式
+                    verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999, file_service=file_service)
 
                     if verify_result.get("verdict") == "PASS":
                         print(f"   ✅ 验证通过，无需修复")
@@ -1275,7 +1419,8 @@ class DockerSandboxTester:
 
                     # 【利益隔离】Step 2: RepairerAgent 修复阶段
                     # RepairerAgent 只负责"修"，永远看不到测试结果
-                    fix_success = await self._apply_fixes(code_files, verify_result, workspace_path)
+                    # 【新架构】传入 file_service，使用 Sandbox 模式
+                    fix_success = await self._apply_fixes(code_files, verify_result, workspace_path, file_service)
 
                     if fix_success:
                         print(f"   🔄 修复已应用，将进行下一次验证...")
@@ -1291,7 +1436,8 @@ class DockerSandboxTester:
                         print(f"   Step 1: 独立验证（VerifyAgent）...")
 
                         # 【利益隔离】独立验证
-                        verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999)
+                        # 【新架构】传入 file_service，使用 Sandbox 模式
+                        verify_result = await self._verify_with_agent(workspace_path, code_files, pipeline_id=99999, file_service=file_service)
 
                         if verify_result.get("verdict") == "PASS":
                             print(f"   ✅ 验证通过，无需修复")
@@ -1303,7 +1449,8 @@ class DockerSandboxTester:
                         verify_result["regression_failure"] = True
                         verify_result["note"] = "新代码导致原有测试失败，请检查是否破坏了向后兼容性"
 
-                        fix_success = await self._apply_fixes(code_files, verify_result, workspace_path)
+                        # 【新架构】传入 file_service，使用 Sandbox 模式
+                        fix_success = await self._apply_fixes(code_files, verify_result, workspace_path, file_service)
 
                         if fix_success:
                             print(f"   🔄 修复已应用，将进行下一次验证...")
@@ -1359,7 +1506,16 @@ class DockerSandboxTester:
             )
 
         finally:
-            # 清理工作目录
+            # 【新架构】清理 Sandbox
+            print(f"\n🧹 清理 Docker Sandbox...")
+            try:
+                from app.service.sandbox_orchestrator import cleanup_sandbox_orchestrator
+                await cleanup_sandbox_orchestrator(99999)
+                print(f"   ✅ Sandbox 已停止")
+            except Exception as e:
+                print(f"   ⚠️  停止 Sandbox 时出错: {e}")
+
+            # 清理工作目录（本地模式时可能用到）
             if workspace_path and os.path.exists(workspace_path):
                 print(f"\n🧹 清理工作目录...")
                 shutil.rmtree(workspace_path, ignore_errors=True)
@@ -1371,10 +1527,6 @@ class DockerSandboxTester:
         print("🚀 端到端集成测试（真实 LLM + Docker Sandbox）")
         print("=" * 70)
         print()
-        print("⚠️  警告: 此测试将：")
-        print("   1. 真正调用 LLM API，产生费用")
-        print("   2. 启动 Docker 容器，需要 Docker 环境")
-        print()
 
         # 检查 API Key
         if not self.check_api_key():
@@ -1384,14 +1536,12 @@ class DockerSandboxTester:
         if not self.check_docker_available():
             print("❌ Docker 不可用，请安装 Docker")
             return False
-        print("✅ Docker 可用")
 
         # 检查镜像
         if not self.check_docker_image():
             print("❌ Docker 镜像 'omniflowai/sandbox:latest' 不存在")
             print("请先构建镜像: docker build -t omniflowai/sandbox:latest .")
             return False
-        print("✅ Docker 镜像已存在")
 
 
 

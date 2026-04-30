@@ -17,13 +17,13 @@ from sqlmodel import select
 from app.core.logging import info, op_logger
 from app.models.pipeline import (
     Pipeline, PipelineRead, PipelineStatus,
-    PipelineStage, StageName, PipelineStageRead
+    PipelineStage, StageName, StageStatus, PipelineStageRead
 )
 from app.service.workflow import WorkflowService
 from app.service.stage_handlers import (
     StageContext, StageHandlerRegistry,
     RequirementHandler, DesignHandler, CodingHandler,
-    TestingHandler, DeliveryHandler
+    TestingHandler, CodeReviewHandler, DeliveryHandler
 )
 
 
@@ -50,6 +50,7 @@ class PipelineService:
         self._registry.register(DesignHandler())
         self._registry.register(CodingHandler())
         self._registry.register(TestingHandler())
+        self._registry.register(CodeReviewHandler())
         self._registry.register(DeliveryHandler())
     
     @classmethod
@@ -75,7 +76,7 @@ class PipelineService:
         stage = PipelineStage(
             pipeline_id=pipeline.id,
             name=StageName.REQUIREMENT,
-            status=StageName.REQUIREMENT,  # Will be set to RUNNING by handler
+            status=StageStatus.PENDING,
             input_data={"requirement": requirement, "element_context": element_context}
         )
         session.add(stage)
@@ -304,39 +305,32 @@ class PipelineService:
         current_stage = pipeline.current_stage
         service = cls()
 
-        if current_stage == StageName.REQUIREMENT:
-            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
-            if not success:
-                return {"success": False, "error": error}
+        # 获取当前阶段的 Handler
+        handler = service._registry.get(current_stage)
+        if not handler:
+            return {"success": False, "error": f"No handler registered for stage: {current_stage.value}"}
 
-            # 使用 StageHandler 触发 DESIGN 阶段
-            result = await service._trigger_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.DESIGN,
-                session=session
-            )
+        # 执行阶段流转
+        success, next_stage, error = await WorkflowService.transition_to_next_stage(pipeline, session)
+        if not success:
+            return {"success": False, "error": error}
 
-            return {
-                "success": result["success"],
-                "data": {
-                    "pipeline_id": pipeline_id,
-                    "previous_stage": StageName.REQUIREMENT.value,
-                    "next_stage": StageName.DESIGN.value,
-                    "status": result["status"],
-                    "message": result["message"]
-                }
-            }
+        # 提交事务，确保阶段状态已更新
+        await session.commit()
 
-        elif current_stage == StageName.DESIGN:
-            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
-            if not success:
-                return {"success": False, "error": error}
+        # 创建 StageContext
+        context = StageContext(
+            pipeline_id=pipeline_id,
+            session=session,
+            input_data={}
+        )
 
-            # 提交事务，确保阶段状态已更新
-            await session.commit()
+        # 调用 Handler 的 on_approved 方法
+        result = await handler.on_approved(context, notes, feedback)
 
-            # 使用后台任务异步执行代码生成，避免 HTTP 超时
-            if background_tasks:
+        # 处理 DESIGN 阶段的特殊情况（需要后台任务）
+        if current_stage == StageName.DESIGN and background_tasks:
+            if result.output_data.get("requires_background_task"):
                 from app.api.v1.pipeline import run_coding_task
                 background_tasks.add_task(run_coding_task, pipeline_id)
 
@@ -347,101 +341,27 @@ class PipelineService:
                         "previous_stage": StageName.DESIGN.value,
                         "next_stage": StageName.CODING.value,
                         "status": PipelineStatus.RUNNING.value,
-                        "message": "代码生成任务已在后台启动，请通过日志监控进度",
+                        "message": result.message,
                         "async": True
                     }
                 }
-            else:
-                # 如果没有 background_tasks，同步执行（兼容旧调用）
-                coding_result = await cls._trigger_coding_phase(pipeline_id, session)
 
-                # 统一响应格式
-                if coding_result["success"]:
-                    testing_result = await cls._trigger_testing_phase(pipeline_id, session)
-                    return {
-                        "success": testing_result["success"],
-                        "data": {
-                            "pipeline_id": pipeline_id,
-                            "previous_stage": StageName.DESIGN.value,
-                            "next_stage": StageName.CODE_REVIEW.value,
-                            "status": testing_result.get("status", PipelineStatus.PAUSED.value),
-                            "message": testing_result.get("message", "Coding and unit testing completed"),
-                            "delivery": {
-                                "test_generated": testing_result.get("output_data", {}).get("testing_result", {}).get("test_generated", False),
-                                "test_run_success": testing_result.get("output_data", {}).get("testing_result", {}).get("test_run_success", False)
-                            }
-                        }
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "data": {
-                            "pipeline_id": pipeline_id,
-                            "previous_stage": StageName.DESIGN.value,
-                            "next_stage": StageName.CODING.value,
-                            "status": PipelineStatus.FAILED.value,
-                            "message": coding_result.get("message", "Code generation failed"),
-                            "delivery": None
-                        }
-                    }
-
-        elif current_stage == StageName.UNIT_TESTING:
-            # 单元测试阶段审批，进入 CODE_REVIEW
-            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
-            if not success:
-                return {"success": False, "error": error}
-
-            # 获取测试阶段的结果
-            from sqlmodel import select
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name == StageName.UNIT_TESTING
-            )
-            result = await session.execute(statement)
-            testing_stage = result.scalar_one_or_none()
-
-            testing_result = {}
-            if testing_stage and testing_stage.output_data:
-                testing_result = testing_stage.output_data.get("testing_result", {})
-
-            await session.commit()
-
-            return {
-                "success": True,
-                "data": {
-                    "pipeline_id": pipeline_id,
-                    "previous_stage": StageName.UNIT_TESTING.value,
-                    "next_stage": StageName.CODE_REVIEW.value,
-                    "status": PipelineStatus.PAUSED.value,
-                    "message": "Unit testing approved, proceeding to code review",
-                    "test_generated": testing_result.get("test_generated", False),
-                    "test_run_success": testing_result.get("test_run_success", False)
-                }
+        # 统一组装响应
+        return {
+            "success": result.success,
+            "data": {
+                "pipeline_id": pipeline_id,
+                "previous_stage": current_stage.value,
+                "next_stage": result.output_data.get("next_stage", next_stage.value if next_stage else None),
+                "status": result.status.value,
+                "message": result.message,
+                **({"git_branch": result.git_branch} if result.git_branch else {}),
+                **({"commit_hash": result.commit_hash} if result.commit_hash else {}),
+                **({"pr_url": result.pr_url} if result.pr_url else {}),
+                **({"test_generated": result.output_data.get("test_generated")} if "test_generated" in result.output_data else {}),
+                **({"test_run_success": result.output_data.get("test_run_success")} if "test_run_success" in result.output_data else {})
             }
-
-        elif current_stage == StageName.CODE_REVIEW:
-            success, _, error = await WorkflowService.transition_to_next_stage(pipeline, session)
-            if not success:
-                return {"success": False, "error": error}
-
-            delivery_result = await cls._trigger_delivery_phase(pipeline_id, session)
-
-            return {
-                "success": delivery_result["success"],
-                "data": {
-                    "pipeline_id": pipeline_id,
-                    "previous_stage": StageName.CODE_REVIEW.value,
-                    "next_stage": StageName.DELIVERY.value,
-                    "status": delivery_result.get("status", PipelineStatus.SUCCESS.value),
-                    "message": delivery_result.get("message", "Code delivered"),
-                    "git_branch": delivery_result.get("git_branch"),
-                    "commit_hash": delivery_result.get("commit_hash"),
-                    "pr_url": delivery_result.get("pr_url")
-                }
-            }
-
-        else:
-            return {"success": False, "error": f"Unknown current stage: {current_stage}"}
+        }
     
     @classmethod
     async def reject_pipeline(
@@ -450,118 +370,67 @@ class PipelineService:
     ) -> Dict[str, Any]:
         """驳回 Pipeline，退回当前阶段重新执行"""
         pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
-        
+
         if not pipeline:
             return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
-        
+
         can_reject, error_msg = await WorkflowService.validate_can_reject(pipeline)
         if not can_reject:
             return {"success": False, "error": error_msg}
-        
+
         current_stage = pipeline.current_stage
         service = cls()
-        
+
+        # 获取当前阶段的 Handler
+        handler = service._registry.get(current_stage)
+        if not handler:
+            return {"success": False, "error": f"No handler registered for stage: {current_stage.value}"}
+
         rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
-        
+
+        # 标记当前阶段需要重新执行
         await WorkflowService.mark_stage_for_rerun(
             pipeline_id=pipeline_id, stage_name=current_stage,
             rejection_feedback=rejection_feedback, session=session
         )
-        
+
         await WorkflowService.set_pipeline_running(pipeline, session)
-        
-        if current_stage == StageName.REQUIREMENT:
-            # 使用 StageHandler 重新触发 REQUIREMENT 阶段
-            result = await service._trigger_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.REQUIREMENT,
-                session=session,
-                input_data={"requirement": pipeline.description},
-                rejection_feedback=rejection_feedback
-            )
-            
-        elif current_stage == StageName.DESIGN:
-            # 使用 StageHandler 重新触发 DESIGN 阶段
-            result = await service._trigger_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.DESIGN,
-                session=session,
-                rejection_feedback=rejection_feedback
-            )
-            
-        elif current_stage == StageName.UNIT_TESTING:
-            # 单元测试阶段被驳回，回退到 CODING 重新生成代码和测试
-            await WorkflowService.mark_stage_for_rerun(
-                pipeline_id=pipeline_id, stage_name=StageName.CODING,
-                rejection_feedback=rejection_feedback, session=session
-            )
-            
-            # 重新触发 CODING 阶段（会自动进入 UNIT_TESTING）
-            coding_result = await cls._trigger_coding_phase(pipeline_id, session)
-            if coding_result["success"]:
-                testing_result = await cls._trigger_testing_phase(pipeline_id, session)
-                return {
-                    "success": testing_result["success"],
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "current_stage": StageName.UNIT_TESTING.value,
-                        "status": testing_result.get("status", PipelineStatus.PAUSED.value),
-                        "message": "Coding and unit testing re-executed",
-                        "test_generated": testing_result.get("output_data", {}).get("testing_result", {}).get("test_generated", False),
-                        "test_run_success": testing_result.get("output_data", {}).get("testing_result", {}).get("test_run_success", False)
-                    }
-                }
-            else:
-                return {
-                    "success": False,
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "status": PipelineStatus.FAILED.value,
-                        "message": coding_result.get("message", "Code generation failed")
-                    }
-                }
-                
-        elif current_stage == StageName.CODE_REVIEW:
-            # 代码审查阶段被驳回，回退到 CODING 重新生成
-            await WorkflowService.mark_stage_for_rerun(
-                pipeline_id=pipeline_id, stage_name=StageName.CODING,
-                rejection_feedback=rejection_feedback, session=session
-            )
-            
-            # 重新触发 CODING 阶段
-            coding_result = await cls._trigger_coding_phase(pipeline_id, session)
-            if coding_result["success"]:
-                testing_result = await cls._trigger_testing_phase(pipeline_id, session)
-                return {
-                    "success": testing_result["success"],
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "current_stage": StageName.UNIT_TESTING.value,
-                        "status": testing_result.get("status", PipelineStatus.PAUSED.value),
-                        "message": "Coding and unit testing re-executed after rejection",
-                        "test_generated": testing_result.get("output_data", {}).get("testing_result", {}).get("test_generated", False),
-                        "test_run_success": testing_result.get("output_data", {}).get("testing_result", {}).get("test_run_success", False)
-                    }
-                }
-            else:
-                return {
-                    "success": False,
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "status": PipelineStatus.FAILED.value,
-                        "message": coding_result.get("message", "Code generation failed")
-                    }
-                }
-        
+        await session.commit()
+
+        # 创建 StageContext
+        context = StageContext(
+            pipeline_id=pipeline_id,
+            session=session,
+            input_data={}
+        )
+
+        # 调用 Handler 的 on_rejected 方法
+        result = await handler.on_rejected(context, reason, suggested_changes)
+
+        # 统一组装响应
+        response_data = {
+            "pipeline_id": pipeline_id,
+            "status": result.status.value,
+            "message": result.message,
+            "feedback": rejection_feedback
+        }
+
+        # 添加可选字段
+        if "current_stage" in result.output_data:
+            response_data["current_stage"] = result.output_data["current_stage"]
+        elif "previous_stage" in result.output_data:
+            response_data["current_stage"] = result.output_data["previous_stage"]
+        else:
+            response_data["current_stage"] = current_stage.value if current_stage else None
+
+        if "test_generated" in result.output_data:
+            response_data["test_generated"] = result.output_data["test_generated"]
+        if "test_run_success" in result.output_data:
+            response_data["test_run_success"] = result.output_data["test_run_success"]
+
         return {
-            "success": True,
-            "data": {
-                "pipeline_id": pipeline_id,
-                "current_stage": current_stage.value if current_stage else None,
-                "status": PipelineStatus.RUNNING.value,
-                "message": f"Pipeline rejected, re-running {current_stage.value if current_stage else 'current'} stage",
-                "feedback": rejection_feedback
-            }
+            "success": result.success,
+            "data": response_data
         }
     
     # ==================== 后台任务方法 ====================

@@ -115,15 +115,18 @@ class ModelScopeProvider(LLMProvider):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
-        """实际调用 ModelScope API（内部方法，供重试执行器调用）"""
-        client = self._get_client()
+        """实际调用 ModelScope API（使用 LiteLLM 路由）"""
+        # 使用 LiteLLM 统一路由，加上 openai/ 前缀让 LiteLLM 正确识别
+        model_with_prefix = f"openai/{settings.llm_model}"
 
-        response = await client.chat.completions.create(
-            model=settings.llm_model,
+        response = await litellm.acompletion(
+            model=model_with_prefix,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
+            api_key=settings.llm_api_key,
+            api_base=settings.llm_api_base,
             temperature=temperature,
             max_tokens=max_tokens
         )
@@ -266,7 +269,8 @@ class OpenAIProvider(LLMProvider):
             api_key=settings.llm_api_key,
             api_base=settings.llm_api_base,
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            custom_llm_provider="openai"  # 强制使用 OpenAI 兼容方式
         )
 
         # 【详细日志】记录完整响应结构以诊断问题
@@ -443,3 +447,42 @@ def get_llm_provider_info() -> Dict[str, str]:
         "model": provider.model_name,
         "api_base": settings.llm_api_base
     }
+
+
+async def call_with_tools(
+    model: str,
+    messages: list,
+    tools: list,
+    api_key: str,
+    api_base: str,
+    temperature: float = 0.7,
+    max_tokens: Optional[int] = None,
+) -> Any:
+    """
+    专门用于工具调用的方法。
+    使用 LiteLLM 路由 + 手动调用，支持工具调用功能。
+
+    Args:
+        model: 模型名称（应包含 openai/ 前缀）
+        messages: 消息列表
+        tools: 工具定义列表
+        api_key: API 密钥
+        api_base: API 基础 URL
+        temperature: 温度参数
+        max_tokens: 最大 Token 数
+
+    Returns:
+        LiteLLM 响应对象
+    """
+    response = await litellm.acompletion(
+        model=model,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=temperature,
+        max_tokens=max_tokens,
+        api_key=api_key,
+        api_base=api_base,
+    )
+
+    return response

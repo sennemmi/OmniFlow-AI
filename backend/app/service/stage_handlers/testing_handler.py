@@ -7,7 +7,7 @@
 - 支持测试失败处理和自动重试
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import re
 
 from app.core.sse_log_buffer import push_log
@@ -451,3 +451,138 @@ class TestingHandler(StageHandler):
             message=f"Unit testing failed: {str(error)}",
             output_data={"error": str(error), "error_type": type(error).__name__}
         )
+
+    async def on_approved(
+        self,
+        context: StageContext,
+        notes: Optional[str] = None,
+        feedback: Optional[str] = None
+    ) -> StageResult:
+        """
+        UNIT_TESTING 阶段被批准后：进入 CODE_REVIEW 阶段
+        """
+        from sqlmodel import select
+        from app.models.pipeline import PipelineStage
+        
+        await push_log(
+            context.pipeline_id,
+            "info",
+            "单元测试已批准，进入代码审查阶段...",
+            stage="UNIT_TESTING"
+        )
+        
+        # 获取测试阶段的结果
+        statement = select(PipelineStage).where(
+            PipelineStage.pipeline_id == context.pipeline_id,
+            PipelineStage.name == StageName.UNIT_TESTING
+        )
+        result = await context.session.execute(statement)
+        testing_stage = result.scalar_one_or_none()
+        
+        testing_result = {}
+        if testing_stage and testing_stage.output_data:
+            testing_result = testing_stage.output_data.get("testing_result", {})
+        
+        # 创建 CODE_REVIEW 阶段
+        coding_output = testing_stage.output_data.get("coding_output", {}) if testing_stage else {}
+        target_files = testing_stage.output_data.get("target_files", {}) if testing_stage else {}
+        
+        await WorkflowService.create_stage(
+            pipeline_id=context.pipeline_id,
+            stage_name=StageName.CODE_REVIEW,
+            input_data={
+                "coding_output": coding_output,
+                "testing_result": testing_result,
+                "target_files": target_files
+            },
+            session=context.session
+        )
+        
+        # 更新 Pipeline 当前阶段
+        pipeline = await WorkflowService.get_pipeline_with_stages(
+            context.pipeline_id, context.session
+        )
+        if pipeline:
+            pipeline.current_stage = StageName.CODE_REVIEW
+            await WorkflowService.set_pipeline_paused(pipeline, context.session)
+        
+        await context.session.commit()
+        
+        return StageResult.success_result(
+            message="Unit testing approved, proceeding to code review",
+            output_data={
+                "previous_stage": StageName.UNIT_TESTING.value,
+                "next_stage": StageName.CODE_REVIEW.value,
+                "test_generated": testing_result.get("test_generated", False),
+                "test_run_success": testing_result.get("test_run_success", False)
+            },
+            status=PipelineStatus.PAUSED
+        )
+    
+    async def on_rejected(
+        self,
+        context: StageContext,
+        reason: str,
+        suggested_changes: Optional[str] = None
+    ) -> StageResult:
+        """
+        UNIT_TESTING 阶段被驳回后：回退到 CODING 重新生成代码和测试
+        """
+        from app.service.stage_handlers import CodingHandler
+        
+        await push_log(
+            context.pipeline_id,
+            "info",
+            f"单元测试被驳回，原因: {reason}，回退到代码生成阶段...",
+            stage="UNIT_TESTING"
+        )
+        
+        # 标记 CODING 阶段需要重新执行
+        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
+        
+        await WorkflowService.mark_stage_for_rerun(
+            pipeline_id=context.pipeline_id,
+            stage_name=StageName.CODING,
+            rejection_feedback=rejection_feedback,
+            session=context.session
+        )
+        
+        # 重新触发 CODING 阶段（会自动进入 UNIT_TESTING）
+        coding_handler = CodingHandler()
+        coding_context = StageContext(
+            pipeline_id=context.pipeline_id,
+            session=context.session,
+            input_data={},
+            rejection_feedback=rejection_feedback
+        )
+        
+        coding_result = await coding_handler.run(coding_context)
+        
+        if coding_result.success:
+            # CODING 成功后，执行 TESTING
+            testing_result = await self.run(StageContext(
+                pipeline_id=context.pipeline_id,
+                session=context.session,
+                input_data={}
+            ))
+            
+            return StageResult(
+                success=testing_result.success,
+                status=testing_result.status,
+                message="Coding and unit testing re-executed",
+                output_data={
+                    "previous_stage": StageName.UNIT_TESTING.value,
+                    "current_stage": StageName.UNIT_TESTING.value,
+                    "test_generated": testing_result.output_data.get("testing_result", {}).get("test_generated", False),
+                    "test_run_success": testing_result.output_data.get("testing_result", {}).get("test_run_success", False)
+                }
+            )
+        else:
+            return StageResult.failure_result(
+                message="Code generation failed after rejection",
+                output_data={
+                    "previous_stage": StageName.UNIT_TESTING.value,
+                    "current_stage": StageName.CODING.value,
+                    "error": coding_result.message
+                }
+            )
