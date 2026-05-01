@@ -12,9 +12,12 @@ Sandbox 编排器
 - 整个流程都在 Sandbox 中运行，无需本地↔Sandbox 文件同步
 - 节省本地机器开销
 - 环境一致性更好
+- 【安全】使用临时目录作为挂载点，避免直接修改宿主机项目目录
 """
 
 import logging
+import shutil
+import tempfile
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -31,6 +34,9 @@ class SandboxOrchestrator:
     
     在 Architect 阶段就拉起 Sandbox，并管理其生命周期。
     各个 Agent 都通过 SandboxFileService 操作 Sandbox 中的文件。
+    
+    【安全改进】使用临时目录作为挂载点，避免直接修改宿主机项目目录。
+    临时目录在测试开始前清理，测试结束后保留便于调试。
     """
     
     def __init__(self, pipeline_id: int):
@@ -38,6 +44,7 @@ class SandboxOrchestrator:
         self.sandbox_info: Optional[SandboxInfo] = None
         self.file_service: Optional[SandboxFileService] = None
         self._is_initialized = False
+        self.temp_dir: Optional[str] = None  # 临时目录路径
     
     async def initialize(
         self,
@@ -46,8 +53,10 @@ class SandboxOrchestrator:
         """
         初始化 Sandbox（在 Architect 阶段调用）
         
+        【安全改进】使用临时目录作为挂载点，避免直接修改宿主机项目目录。
+        
         Args:
-            project_path: 本地项目路径（用于复制到 Sandbox）
+            project_path: 本地项目路径（用于复制到临时目录，然后挂载到 Sandbox）
             
         Returns:
             Dict: 初始化结果
@@ -64,21 +73,62 @@ class SandboxOrchestrator:
                 stage="REQUIREMENT"
             )
             
-            # 1. 启动 Sandbox（注意：sandbox_manager.start 不接受 timeout 参数）
+            # 【安全改进】创建临时目录作为挂载点
+            self.temp_dir = tempfile.mkdtemp(prefix=f"omniflow-sandbox-{self.pipeline_id}-")
+            logger.info(f"[Pipeline {self.pipeline_id}] 创建临时目录: {self.temp_dir}")
+            
+            # 复制项目代码到临时目录
+            await push_log(
+                self.pipeline_id,
+                "info",
+                f"📁 复制项目代码到临时目录...",
+                stage="REQUIREMENT"
+            )
+            
+            # 使用 shutil.copytree 复制项目代码
+            try:
+                shutil.copytree(
+                    project_path,
+                    self.temp_dir,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        '.git', '__pycache__', '*.pyc', '.pytest_cache',
+                        'node_modules', '.venv', 'venv', '.env'
+                    )
+                )
+                logger.info(f"[Pipeline {self.pipeline_id}] 项目代码复制完成")
+            except Exception as copy_error:
+                logger.error(f"[Pipeline {self.pipeline_id}] 复制项目代码失败: {copy_error}")
+                # 清理临时目录
+                if self.temp_dir and Path(self.temp_dir).exists():
+                    shutil.rmtree(self.temp_dir, ignore_errors=True)
+                return {
+                    "success": False,
+                    "error": f"复制项目代码失败: {copy_error}"
+                }
+            
+            # 1. 启动 Sandbox（使用临时目录作为挂载点）
             self.sandbox_info = await sandbox_manager.start(
                 pipeline_id=self.pipeline_id,
-                project_path=project_path
+                project_path=self.temp_dir  # 【关键】使用临时目录而不是原始项目路径
             )
             
             logger.info(f"[Pipeline {self.pipeline_id}] Sandbox 启动成功", extra={
                 "container_id": self.sandbox_info.container_id,
-                "port": self.sandbox_info.port
+                "port": self.sandbox_info.port,
+                "temp_dir": self.temp_dir
             })
             
             await push_log(
                 self.pipeline_id,
                 "info",
                 f"✅ Sandbox 启动成功 (端口: {self.sandbox_info.port})",
+                stage="REQUIREMENT"
+            )
+            await push_log(
+                self.pipeline_id,
+                "info",
+                f"📁 临时目录: {self.temp_dir}",
                 stage="REQUIREMENT"
             )
             
@@ -97,11 +147,15 @@ class SandboxOrchestrator:
                 "success": True,
                 "sandbox_info": self.sandbox_info,
                 "file_service": self.file_service,
+                "temp_dir": self.temp_dir,
                 "message": "Sandbox 初始化成功"
             }
             
         except Exception as e:
             logger.error(f"[Pipeline {self.pipeline_id}] Sandbox 初始化失败: {e}")
+            # 清理临时目录
+            if self.temp_dir and Path(self.temp_dir).exists():
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
             await push_log(
                 self.pipeline_id,
                 "error",
@@ -201,6 +255,42 @@ class SandboxOrchestrator:
         """
         await self.cleanup()
         return await self.initialize(project_path)
+    
+    async def exec_command(self, cmd: str, timeout: int = 60) -> Dict[str, Any]:
+        """
+        在 Sandbox 中执行命令
+        
+        Args:
+            cmd: 要执行的命令
+            timeout: 超时时间（秒）
+            
+        Returns:
+            Dict: 包含 stdout, stderr, exit_code 的结果
+        """
+        if not self._is_initialized:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": "Sandbox 未初始化",
+                "exit_code": -1
+            }
+        
+        try:
+            result = await sandbox_manager.exec(self.pipeline_id, cmd, timeout)
+            return {
+                "success": result.exit_code == 0,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code
+            }
+        except Exception as e:
+            logger.error(f"[Pipeline {self.pipeline_id}] 执行命令失败: {e}")
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": str(e),
+                "exit_code": -1
+            }
 
 
 # 全局 Sandbox 编排器管理器（按 pipeline_id 存储）

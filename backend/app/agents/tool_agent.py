@@ -34,6 +34,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
     - 支持工具调用循环（ReAct 模式）
     - 自动处理 tool_calls 响应
     - 集成 Read Token 机制
+    - 支持 Sandbox 模式（通过 file_service 操作容器内文件）
     """
 
     # 最大工具调用次数，防止无限循环
@@ -42,11 +43,19 @@ class ToolUsingAgent(LangGraphAgent[T]):
     def __init__(self, agent_name: str = "ToolUsingAgent"):
         super().__init__(agent_name=agent_name)
         self._agent_tools: Optional[AgentTools] = None
+        self._file_service = None  # SandboxFileService 实例
+
+    def set_file_service(self, file_service):
+        """设置 SandboxFileService 实例（用于 Sandbox 模式）"""
+        self._file_service = file_service
+        # 如果已有 AgentTools 实例，需要重新创建
+        if self._agent_tools is not None:
+            self._agent_tools = None
 
     def _get_agent_tools(self, project_path: str) -> AgentTools:
         """获取或创建 AgentTools 实例"""
         if self._agent_tools is None or self._agent_tools.project_path != project_path:
-            self._agent_tools = get_agent_tools(project_path)
+            self._agent_tools = get_agent_tools(project_path, file_service=self._file_service)
         return self._agent_tools
 
     async def _call_llm_with_tools(
@@ -56,7 +65,9 @@ class ToolUsingAgent(LangGraphAgent[T]):
         project_path: str,
         pipeline_id: int = 0,
         temperature: float = 0.7,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        max_retries: int = 3,
+        response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         调用 LLM，支持工具调用循环（包含写入工具）
@@ -68,6 +79,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
             pipeline_id: Pipeline ID（用于日志推送）
             temperature: 温度参数
             max_tokens: 最大 Token 数（仅用于最终输出，工具调用使用较小值）
+            max_retries: 空内容重试次数
+            response_format: 响应格式，如 {"type": "json_object"}
 
         Returns:
             Dict: {content, input_tokens, output_tokens, tool_calls, tool_results}
@@ -87,6 +100,9 @@ class ToolUsingAgent(LangGraphAgent[T]):
         tool_call_count = 0
         tool_results = []  # 记录所有工具执行结果
 
+        # 【重试机制】空内容重试计数
+        empty_content_retries = 0
+
         while tool_call_count < self.MAX_TOOL_CALLS:
             try:
                 # 调用 LLM（带工具）
@@ -94,11 +110,13 @@ class ToolUsingAgent(LangGraphAgent[T]):
 
                 # 【关键】区分工具调用和最终输出的 max_tokens
                 # 工具调用阶段使用较小值（1000），最终输出阶段使用传入的值
-                is_final_output = tool_call_count > 0 and not any(
+                has_recent_tool_calls = any(
                     m.get("role") == "assistant" and m.get("tool_calls")
                     for m in messages[-3:]  # 检查最近3条消息是否有工具调用
                 )
-                
+                # 最终输出：没有最近工具调用，或者已经达到最大工具调用次数
+                is_final_output = not has_recent_tool_calls or tool_call_count >= self.MAX_TOOL_CALLS - 1
+
                 if is_final_output and max_tokens:
                     # 最终输出阶段，使用完整的 max_tokens
                     current_max_tokens = max_tokens
@@ -108,17 +126,25 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     current_max_tokens = 1000
                     logger.debug(f"[{self.agent_name}] 工具调用阶段，使用 max_tokens=1000")
 
-                response = await litellm.acompletion(
-                    model=settings.llm_model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",  # 允许模型选择是否使用工具
-                    temperature=temperature,
-                    max_tokens=current_max_tokens,
-                    api_key=settings.llm_api_key,
-                    api_base=settings.llm_api_base,
-                    custom_llm_provider="openai"  # 强制使用 OpenAI 兼容方式
-                )
+                # 构建调用参数
+                call_params = {
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",  # 允许模型选择是否使用工具
+                    "temperature": temperature,
+                    "max_tokens": current_max_tokens,
+                    "api_key": settings.llm_api_key,
+                    "api_base": settings.llm_api_base,
+                    "custom_llm_provider": "openai"  # 强制使用 OpenAI 兼容方式
+                }
+
+                # 【结构化输出】最终输出阶段，如果指定了 response_format，则使用结构化输出
+                if is_final_output and response_format:
+                    call_params["response_format"] = response_format
+                    logger.info(f"[{self.agent_name}] 最终输出阶段使用结构化输出: {response_format}")
+
+                response = await litellm.acompletion(**call_params)
 
                 # 记录 Token 使用
                 if response.usage:
@@ -236,6 +262,18 @@ class ToolUsingAgent(LangGraphAgent[T]):
                             logger.error(f"[{self.agent_name}] LLM 输出因长度限制被截断！")
                 else:
                     logger.warning(f"[{self.agent_name}] LLM 返回空内容")
+                    # 【重试机制】如果返回空内容且未达到最大重试次数，则重试
+                    if empty_content_retries < max_retries:
+                        empty_content_retries += 1
+                        logger.warning(f"[{self.agent_name}] 空内容重试 {empty_content_retries}/{max_retries}")
+                        # 添加提示消息，要求 LLM 输出有效内容
+                        messages.append({
+                            "role": "user",
+                            "content": "你刚才没有返回任何内容。请确保输出有效的 JSON 格式的回答，不要返回空内容。"
+                        })
+                        continue  # 继续循环，重新调用 LLM
+                    else:
+                        logger.error(f"[{self.agent_name}] 空内容重试次数已达上限 ({max_retries})，放弃重试")
                 
                 return {
                     "content": message.content,
@@ -284,23 +322,77 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 # 其他错误正常抛出
                 raise
 
-        # 达到最大工具调用次数
-        logger.warning(f"[{self.agent_name}] Max tool calls ({self.MAX_TOOL_CALLS}) reached")
-        return {
-            "content": "Error: Too many tool calls",
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "tool_calls": tool_call_count,
-            "tool_results": tool_results,
-            "error": "Max tool calls reached"
-        }
+        # 达到最大工具调用次数 - 不再直接返回错误，而是让 AI 直接输出内容
+        logger.warning(f"[{self.agent_name}] Max tool calls ({self.MAX_TOOL_CALLS}) reached, forcing final output")
+
+        # 添加提示消息，要求 AI 立即输出最终答案，不再使用工具
+        messages.append({
+            "role": "user",
+            "content": f"已达到最大工具调用次数（{self.MAX_TOOL_CALLS}次）。请基于已获取的信息立即输出最终答案，不要再使用任何工具。直接输出 JSON 格式的结果。"
+        })
+
+        # 继续调用 LLM，让 AI 直接输出内容
+        try:
+            import litellm
+
+            logger.info(f"[{self.agent_name}] 调用 LLM 输出最终答案（工具调用已达上限）")
+
+            # 构建调用参数
+            final_call_params = {
+                "model": settings.llm_model,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": max_tokens or 4096,  # 使用较大的 max_tokens 确保输出完整
+                "api_key": settings.llm_api_key,
+                "api_base": settings.llm_api_base,
+                "custom_llm_provider": "openai"
+            }
+            
+            # 【关键】如果指定了 response_format，在最终输出阶段使用它
+            if response_format:
+                final_call_params["response_format"] = response_format
+                logger.info(f"[{self.agent_name}] 强制输出阶段使用结构化输出: {response_format}")
+
+            response = await litellm.acompletion(**final_call_params)
+
+            # 记录 Token 使用
+            if response.usage:
+                total_input_tokens += response.usage.prompt_tokens or 0
+                total_output_tokens += response.usage.completion_tokens or 0
+
+            message = response.choices[0].message
+            content = message.content or ""
+
+            logger.info(f"[{self.agent_name}] 最终输出内容长度: {len(content)} 字符")
+
+            return {
+                "content": content,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "tool_calls": tool_call_count,
+                "tool_results": tool_results,
+                "note": f"工具调用达到上限({self.MAX_TOOL_CALLS})后强制输出"
+            }
+
+        except Exception as e:
+            logger.error(f"[{self.agent_name}] 强制输出时出错: {e}")
+            # 如果强制输出也失败，返回错误
+            return {
+                "content": "",
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "tool_calls": tool_call_count,
+                "tool_results": tool_results,
+                "error": f"Max tool calls reached and final output failed: {e}"
+            }
 
     async def execute(
         self,
         pipeline_id: int,
         stage_name: str,
         initial_state: Optional[Dict[str, Any]] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         执行 Agent（支持工具调用）
@@ -310,6 +402,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
             stage_name: 阶段名称
             initial_state: 初始状态（必须包含 project_path）
             max_tokens: 最大 Token 数（默认 None，表示不限制）
+            response_format: 响应格式，如 {"type": "json_object"}
 
         Returns:
             Dict: 执行结果
@@ -330,7 +423,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 user_prompt=user_prompt,
                 project_path=project_path,
                 pipeline_id=pipeline_id,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                response_format=response_format
             )
 
             # 提取本次工具调用中读取过的文件内容（用于传递给下游 Agent）
@@ -400,6 +494,10 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 # 检查是否是不完整的 JSON
                 if raw_output.strip().startswith('{') and not raw_output.strip().endswith('}'):
                     logger.error(f"[{self.agent_name}] raw_output 可能是不完整的 JSON（以 {{ 开头但不以 }} 结尾）")
+            else:
+                logger.warning(f"[{self.agent_name}] raw_output 为 None 或空字符串")
+                # 【DEBUG】打印 result 的完整内容
+                logger.info(f"[{self.agent_name}] result 完整内容: {json.dumps({k: str(v)[:200] for k, v in result.items()}, ensure_ascii=False)}")
             
             # 【修复】检查 content 是否为空
             if not raw_output:

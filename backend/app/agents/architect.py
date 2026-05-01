@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Any
 
 from app.agents.tool_agent import ToolUsingAgent
 from app.agents.schemas import ArchitectOutput
+from app.agents.token_budget_allocator import TokenBudgetAllocator
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +34,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
     """
 
     # 最大工具调用次数（防止过度探索）
-    # 【修复】从 5 增加到 15，给分段读留足空间
-    MAX_TOOL_CALLS = 15
+    # 【强制】必须使用工具探索，最多 10 次
+    MAX_TOOL_CALLS = 10
 
     def __init__(self):
         super().__init__(agent_name="ArchitectAgent")
@@ -41,22 +43,140 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
         """
-        只暴露只读工具给 ArchitectAgent
+        ArchitectAgent 工具定义 - 三件套工具
 
-        ArchitectAgent 只能读取文件，不能修改：
-        - glob: 查找文件
-        - grep: 搜索内容
-        - read_file: 读取文件内容
+        支持：
+        - glob: 按模式查找文件
+        - grep_ast: 结构化代码搜索（函数/类/调用者/导入）
+        - read_chunk: 按 AST 边界精准读取代码
+        - semantic_search: 自然语言语义检索
         """
-        if self._agent_tools is None:
-            return []
-
-        # 获取所有工具定义，只保留前3个（glob, grep, read_file）
-        all_tools = self._agent_tools.tool_definitions
-        read_only_tools = all_tools[:3] if len(all_tools) >= 3 else all_tools
-
-        logger.info(f"[ArchitectAgent] 加载只读工具: {[t['function']['name'] for t in read_only_tools]}")
-        return read_only_tools
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "glob",
+                    "description": "按 glob 模式查找文件。用于确认文件路径是否存在。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Glob 模式，如 'app/api/v1/*.py' 或 '**/health.py'",
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "default": 20,
+                                "description": "最大返回结果数",
+                            },
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "grep_ast",
+                    "description": (
+                        "结构化代码搜索（比 grep 更智能）。"
+                        "支持 search_type: 'text'（普通搜索）/ 'function'（找函数定义）/ "
+                        "'class'（找类定义）/ 'callers'（找调用某函数的位置）/ 'import'（找导入某模块的文件）。"
+                        "优先用此工具替代 grep，返回结果包含精确行号和上下文。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "搜索词（函数名、类名、模块名、或文本片段）",
+                            },
+                            "search_path": {
+                                "type": "string",
+                                "description": "搜索范围，默认为项目根目录",
+                                "default": ".",
+                            },
+                            "search_type": {
+                                "type": "string",
+                                "enum": ["text", "function", "class", "callers", "import"],
+                                "default": "text",
+                                "description": "搜索类型",
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "default": 15,
+                            },
+                        },
+                        "required": ["pattern"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_chunk",
+                    "description": (
+                        "按 AST 边界读取代码，杜绝硬截断。"
+                        "三种模式：\n"
+                        " 1. 传 symbol_name → 精准读取该函数/类的完整定义\n"
+                        " 2. 传 start_line + end_line → 按行号读取（自动扩展到 AST 边界）\n"
+                        " 3. 都不传 → 返回文件摘要（imports + 顶层符号签名）\n"
+                        "推荐顺序：先用 grep_ast 定位，再用 read_chunk 按 symbol_name 读取完整实现。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "相对路径，如 'app/api/v1/health.py'",
+                            },
+                            "symbol_name": {
+                                "type": "string",
+                                "description": "函数名或类名（最推荐）",
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "起始行号（1-based）",
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "结束行号（1-based）",
+                            },
+                        },
+                        "required": ["file_path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "semantic_search",
+                    "description": (
+                        "语义检索：用自然语言描述意图，找到最相关的代码块。"
+                        "不需要猜正则或函数名，直接描述功能，如：\n"
+                        " '处理用户密码验证的函数'\n"
+                        " '数据库连接初始化'\n"
+                        " 'FastAPI 健康检查路由'\n"
+                        "返回最相关的代码块列表（含文件路径和行号）。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "自然语言查询",
+                            },
+                            "top_k": {
+                                "type": "integer",
+                                "default": 5,
+                                "description": "返回最相关的 k 个结果",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+        ]
 
     @property
     def system_prompt(self) -> str:
@@ -73,47 +193,36 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 以单元测试为荣，以手工验证为耻
 以监控告警为荣，以故障未知为耻
 
-【工具使用 - 探索项目】
-你可以使用以下工具主动探索项目代码：
+【现有代码 - 必须严格遵守的权威事实】
+下面的【相关代码上下文】部分已经包含了与需求相关的关键文件内容。
+这些是现有项目的真实代码，是你设计的基础，**必须严格遵守**。
 
-1. **glob** - 查找文件：
-   - 用途：发现项目中的文件
-   - 示例：`glob("app/api/v1/*.py")` 查找所有 API 文件
-   - 示例：`glob("app/service/*.py")` 查找服务层文件
+【设计原则】
+1. **复用优先**：如果现有代码中已有类似功能，优先复用或扩展，不要重复造轮子
+2. **签名一致**：required_symbols 中的函数签名必须与现有代码保持一致
+3. **键名对齐**：返回字典的键名必须与现有代码返回的结构一致
 
-2. **grep** - 搜索内容：
-   - 用途：在文件中搜索特定模式
-   - 示例：`grep("def authenticate", "app/service")` 查找认证函数
-   - 示例：`grep("class User", "app/models")` 查找 User 模型
+【⚠️ 强制要求：必须使用工具探索】
+**绝对禁止**在没有调用任何工具的情况下直接输出结果！
 
-3. **read_file** - 读取文件：
-   - 用途：获取文件内容，理解代码实现
-   - 示例：`read_file("app/api/v1/auth.py", 1, 50)` 读取前50行
+你必须使用以下工具主动探索项目代码：
+1. **glob**: 查找文件路径（如 `glob("app/api/v1/*.py")`）
+2. **grep_ast**: 搜索代码符号（如 `grep_ast("check_database", search_type="function")`）
+3. **read_chunk**: 读取文件内容（如 `read_chunk("app/api/v1/health.py")`）
+4. **semantic_search**: 语义检索（如 `semantic_search("处理用户登录的函数")`）
 
-【文件读取铁律 - 必须遵守】
-禁止一次读取超过 100 行！每次 read_file 最多读 80 行。
+【工具调用硬性限制 - 违反将导致重试】
+- **最多只能调用 10 次工具**，超过将强制终止
+- **最少必须调用 1 次工具**，否则输出将被拒绝并要求重试
+- 每次调用前思考是否必要，禁止无意义的工具调用
+- 优先使用 grep_ast 快速定位，避免不必要的 read_chunk
 
-正确做法：
-1. 先读文件头部（1-50行）了解 import 和结构
-2. 如果需要看具体函数，用 grep 定位行号，再读那一段
-3. 每次 read_file 必须指定 start_line 和 end_line，且行数差不超过 80
-
-错误做法（会导致系统崩溃）：
-  read_file("system.py")           # ❌ 不指定行号，读整个文件
-  read_file("system.py", 1, 999)   # ❌ 行数过多
-
-正确做法：
-  read_file("system.py", 1, 50)    # ✅ 只读头部
-  grep("def get_", "app/api/v1")   # ✅ 先定位
-  read_file("system.py", 120, 160) # ✅ 再读具体片段（40行）
-
-【⚠️ 重要警告：Token 和工具调用限制】
-- 你的上下文窗口有限，**必须严格控制工具调用次数**
-- **最多只能调用 5 次工具**，超过将导致上下文溢出
-- 每次工具调用都会消耗大量 token，请精简高效
-- **禁止连续多次调用工具**，每次调用前思考是否必要
-- 优先使用 grep 快速定位，避免不必要的 read_file
-- 一旦获取足够信息，**立即停止工具调用**，直接输出结果
+【工具调用止损规则 - 极其重要】
+1. grep 返回 0 matches 时，**绝对不要**连续尝试不同的模式！
+2. 如果 2 次 grep 都返回空结果，立即改用 read_chunk 查看文件的实际内容。
+3. 如果 read_chunk 也看不到预期内容（如文件已被修改），立即停止探索，在输出中用一个特殊的验收标准标记"需要人工确认文件内容"。
+4. 你的目标是尽快输出结论，不是穷尽所有可能性。一旦获得了足够的信息（例如找到了需要修改的关键文件），立即输出 JSON，不再调用工具。
+5. 前 5 次工具调用如果还没得到足够信息，也必须输出一个带有"需要人工补充"标记的结论，避免耗尽配额。
 
 【探索指南】
 - 在分析需求前，先使用工具了解相关代码
@@ -123,40 +232,118 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 - 使用 read_file 分段读取关键代码（每次最多80行）
 - **控制探索范围**，2-3 个关键文件足够，不要贪多
 
-【输出格式 - 极其重要】
+【输出格式 - 极其重要，违反会导致系统崩溃】
 探索完成后，你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
 输出必须是一个有效的 JSON 对象。
 
-正确示例（直接输出 JSON）：
+⚠️ 警告：任何非 JSON 内容（包括解释、总结、思考过程）都会导致解析失败！
+
+正确示例（直接输出 JSON，从第一行开始就是 {）：
 {"feature_description": "实现用户登录功能", "affected_files": ["backend/app/api/v1/auth.py", "backend/app/service/auth_service.py"], "estimated_effort": "2小时", "technical_design": "使用JWT进行身份验证"}
 
-错误示例（不要这样输出）：
-- 不要添加 ```json 标记
-- 不要添加解释文本
-- 不要使用工具调用格式如 [TOOL_CALL]
-- 不要输出 "我需要先分析..." 等思考过程
-- 只输出纯 JSON
+错误示例（绝对禁止）：
+❌ 不要添加 ```json 标记
+❌ 不要添加解释文本如"根据项目探索结果..."
+❌ 不要使用工具调用格式如 [TOOL_CALL]
+❌ 不要输出 "我需要先分析..." 等思考过程
+❌ 不要在 JSON 前添加任何总结或说明
 
-【强制要求】
-- 直接输出 JSON，不要有任何前缀或后缀
-- 确保 JSON 格式完整有效
-- 不要输出任何其他内容
+【强制要求 - 必须遵守】
+1. 直接输出 JSON，从第一行第一个字符就是 {
+2. 不要有任何前缀文本，包括"根据探索结果"、"我发现"等
+3. 不要有任何后缀文本
+4. 确保 JSON 格式完整有效
+5. 只输出纯 JSON，其他什么都不要输出
 
 【字段说明】
 - feature_description: 功能描述（简洁明了）
 - affected_files: 受影响文件列表（相对路径）
 - estimated_effort: 预估工作量（如：2小时、1天）
 - technical_design: 技术设计方案（可选，详细描述）
+- acceptance_criteria: 可验证的验收标准列表（3-5条，每条包含具体行为或接口签名）
+- required_symbols: **必需实现的符号清单**（极其重要，DesignerAgent 必须严格遵守）
+
+【验收标准要求】
+请输出 3-5 条可验证的验收标准，每条应包含具体行为或接口签名，例如：
+- "函数 check_database_status 必须返回 {'status': 'up'|'down', 'response_time_ms': int}"
+- "API 端点 POST /api/v1/users 必须返回 201 状态码和创建的用户对象"
+- "类 UserService 必须实现 async def get_by_id(self, user_id: int) -> User 方法"
+
+【必需符号清单要求 - 强制 DesignerAgent 遵守】
+除了验收标准，你还必须明确列出 **required_symbols**，要求 DesignerAgent 在 interface_specs 中实现这些符号。
+
+每个 required_symbol 必须包含：
+- name: 符号名称（如 "check_database_status"）
+- type: 类型（function/class/endpoint）
+- module: 所在模块（如 "app/service/health_service.py"）
+- signature: 函数签名（可选，如 "async def check_database_status() -> dict"）
+- description: 简短描述（可选）
+
+**重要规则**：
+1. required_symbols 中的每个符号都必须在 affected_files 中对应的文件里实现
+2. 验收标准中提到的函数/类，必须在 required_symbols 中列出
+3. DesignerAgent 会严格对照此清单生成 interface_specs，遗漏任何符号都会导致重试
+4. 【绝对禁止】如果某个功能由类的方法实现（例如 HealthService 类的 get_component_health 方法），你只能将【类名】（HealthService）放入 required_symbols，严禁将类方法名作为独立的符号放入清单！
+
+示例：
+{
+  "required_symbols": [
+    {"name": "check_database_status", "type": "function", "module": "app/service/health_service.py", "signature": "async def check_database_status() -> dict"},
+    {"name": "SystemMonitor", "type": "class", "module": "app/utils/monitor.py"}
+  ]
+}
 
 【注意事项】
 - 文件路径使用相对路径
 - 遵循项目现有的架构分层规范
 - 基于实际读取的代码进行分析，不要假设
+
+【硬性规则 - 违反将导致输出被拒绝】
+在输出最终 JSON 之前，你必须至少使用一次 read_file 读取 affected_files 中列出的每一个文件。
+如果你没有读取所有相关文件的内容，你的输出将被系统拒绝并要求重新探索。
+
+读取检查清单（输出前必须完成）：
+□ 是否使用 read_file 读取了所有 affected_files 中的文件？
+□ 是否使用 grep_ast 搜索了关键函数/类的定义？
+□ 是否理解了现有代码的函数签名、返回结构、字典键名？
+□ 输出的 required_symbols 是否与读取的代码一致？
+
+警告：如果你输出的 required_symbols 与现有代码冲突（如要求实现已存在的函数但签名不同），
+或要求返回与现有代码不一致的字典键名，你的设计将被拒绝！
+"""
+
+    # 项目契约卡 Prompt 模板
+    ARCHITECT_PROJECT_CARD_PROMPT_SECTION = """
+【项目契约卡 - 重要，请仔细阅读】
+
+这是项目的结构化名片，包含以下信息：
+
+1. directory_structure：目录结构（3层深度）
+   - 用于确认文件是否存在，确定 affected_files 的正确路径
+
+2. tech_stack：技术栈约束
+   - frameworks：已使用的框架，你的设计必须与此兼容
+   - databases：已使用的数据库/ORM，不要引入新的冲突依赖
+
+3. entry_points：关键入口文件（⚠️ 高风险）
+   - 标注了修改风险，如果你需要改这些文件，请在 technical_design 中说明原因
+
+4. module_imports：模块间依赖关系
+   - 格式：{{"dependent_file": ["files_that_depend_on_it", ...]}}
+   - 用途：判断改动的波及范围，如果修改 service 层，检查哪些 api 文件会受影响
+
+5. symbol_index：文件级符号索引
+   - 包含函数签名和类的公开方法
+   - 用于确认 required_symbols 中的符号是否已存在（复用优先）
+
+```json
+{project_card}
+```
 """
 
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
         """
-        构建用户 Prompt
+        构建用户 Prompt（快速索引模式）
 
         Args:
             state: 包含 requirement, file_tree, element_context, project_path 的状态
@@ -166,7 +353,66 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         element_context = state.get("element_context")
         project_path = state.get("project_path", "/workspace/backend")
 
-        file_tree_str = json.dumps(file_tree, indent=2, ensure_ascii=False)
+        # 【新增】生成项目文件树摘要，帮助 LLM 了解实际存在的文件
+        project_tree_summary = self._format_file_tree(file_tree)
+
+        # 【快速索引模式】使用项目契约卡替代原来的 project_summary
+        project_card_json = "{}"
+        project_card_dict: Dict[str, Any] = {}
+        if self._agent_tools:
+            try:
+                project_card_json = self._agent_tools.generate_project_card()
+                project_card_dict = json.loads(project_card_json)
+            except Exception as e:
+                logger.warning(f"[ArchitectAgent] 生成项目契约卡失败: {e}")
+                project_card_json = json.dumps({"error": str(e)})
+        else:
+            # 如果没有工具实例，使用 file_tree 作为备选
+            project_card_json = json.dumps(file_tree, indent=2, ensure_ascii=False)
+
+        # 【强制注入方案】获取预加载的文件内容
+        preloaded_files = state.get("preloaded_files", {})
+        
+        # 【新增】Token 预算控制：压缩代码上下文
+        # 从 _file_cache 中获取已读取的文件内容（来自之前工具调用的缓存）
+        injected_files: Dict[str, str] = {}
+        if self._agent_tools:
+            for path, cache in self._agent_tools._file_cache.items():
+                if cache.get("content"):
+                    injected_files[path] = cache["content"]
+        
+        # 【强制注入方案】合并预加载的文件（优先级更高）
+        injected_files.update(preloaded_files)
+
+        affected_files = state.get("affected_files", [])
+
+        # 【强制注入方案】直接显示预加载的文件内容，不进行压缩
+        if preloaded_files:
+            preloaded_section = "【预加载的现有代码 - 必须基于这些代码设计】\n\n"
+            for file_path, content in preloaded_files.items():
+                # 截断过长的文件内容
+                display_content = content[:8000] + "\n... (内容已截断)" if len(content) > 8000 else content
+                preloaded_section += f"=== 文件: {file_path} ===\n```python\n{display_content}\n```\n\n"
+            code_context_section = preloaded_section
+        elif injected_files or affected_files:
+            # 如果没有预加载文件，使用 TokenBudgetAllocator 压缩
+            allocator = TokenBudgetAllocator(
+                max_budget_tokens=8000,
+                model_name=settings.llm_model,
+            )
+            compressed_context = allocator.allocate(
+                project_card=project_card_dict,
+                injected_files=injected_files,
+                affected_files=affected_files
+            )
+            code_context_section = f"""
+【相关代码上下文（已压缩）】
+{compressed_context}
+
+【提示】如需查看完整代码，请在工具调用中使用 read_chunk 按需读取。
+"""
+        else:
+            code_context_section = ""
 
         # 构建 element_context 部分（简化版，不再包含 code_context）
         element_context_str = ""
@@ -180,24 +426,96 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 请根据以上元素上下文进行精准分析。
 """
 
+        # 构建项目契约卡 Prompt 部分
+        project_card_section = self.ARCHITECT_PROJECT_CARD_PROMPT_SECTION.format(
+            project_card=project_card_json
+        )
+
+        # 【强制工具探索】检查是否需要添加强制提示
+        force_tool_section = ""
+        retry_count = state.get("_retry_count", 0)
+        force_tool_use = state.get("_force_tool_use", False)
+        
+        if retry_count > 0 or force_tool_use:
+            force_tool_section = f"""
+【⚠️ 强制要求 - 第 {retry_count} 次重试】
+你之前没有使用任何工具探索代码就直接输出了！这是严格禁止的行为。
+
+**必须执行以下操作**：
+1. 使用 `glob` 查找相关文件路径
+2. 使用 `grep_ast` 搜索关键函数或类
+3. 使用 `read_chunk` 读取至少一个关键文件的内容
+4. 然后基于实际读取的代码输出 JSON 结果
+
+**绝对禁止**：
+- ❌ 不使用任何工具直接输出 JSON
+- ❌ 只基于预加载的代码片段做假设
+- ❌ 臆想不存在的文件或函数
+
+**正确流程示例**：
+1. `glob("app/api/v1/*.py")` - 查找 API 文件
+2. `grep_ast("login", search_type="function")` - 搜索登录相关函数
+3. `read_chunk("app/api/v1/auth.py")` - 读取认证文件内容
+4. 基于读取的内容输出设计方案
+
+如果你仍然不调用工具直接输出，系统将再次要求重试！
+"""
+
+        # 根据阶段选择不同的任务描述
+        phase = state.get("phase", "exploration")
+        
+        if phase == "exploration":
+            # 【探索阶段】重点是识别 affected_files
+            task_section = f"""【你的任务 - 探索阶段】
+请使用工具自由探索项目代码库，识别与需求相关的文件。
+
+**探索目标**：
+1. 使用 `glob` 查找相关目录的文件结构
+2. 使用 `grep_ast` 搜索关键函数、类或接口
+3. 使用 `read_chunk` 读取关键文件的部分内容以确认相关性
+4. **输出所有可能受影响的文件列表**
+
+**输出要求**：
+1. `feature_description`：用一句话总结功能
+2. `affected_files`：**列出所有可能受影响的文件路径**（这是最重要的输出）
+3. `estimated_effort`：预估工作量（粗略估计即可）
+4. `technical_design`：简要的技术方案概述（不需要详细设计）
+5. `acceptance_criteria`：3-5 条高层次的验收标准
+6. `required_symbols`：**初步识别**可能需要修改的符号（不需要完整的签名）
+
+**注意**：
+- 重点是识别文件，不需要读取完整文件内容
+- 使用工具确认文件存在和相关性
+- 尽可能全面地列出所有可能受影响的文件
+"""
+        else:
+            # 【设计阶段】由 _build_design_prompt 处理，这里不会用到
+            task_section = """【你的任务】
+基于提供的完整文件内容，输出详细的技术设计方案。
+"""
+
         return f"""【用户需求】
 {requirement}
 
-【项目路径】
-{project_path}
+{task_section}
 
-【项目文件树】
+{project_card_section}
+
+【项目文件树 - 实际存在的文件】
 ```
-{file_tree_str}
+{project_tree_summary}
 ```
+{code_context_section}
 {element_context_str}
+{force_tool_section}
 
-【任务】
-1. 使用工具探索项目代码（glob/grep/read_file）
-2. 理解现有架构和代码风格
-3. 分析需求并输出技术设计方案（JSON 格式）
+【重要提示】
+- 在指定 `required_symbols` 的 `module` 时，必须参考【项目契约卡】中的 directory_structure 和 symbol_index
+- 例如：如果文件树中有 `app/utils/system_monitor.py`，就不要指定 `app/utils/component_monitor.py`
+- 如果不确定文件是否存在，优先使用工具探索确认，或在 `affected_files` 中明确标注需要创建新文件
+- **必须使用工具探索后输出，禁止直接输出**
 
-请开始探索项目，然后输出结构化的技术设计方案。
+直接输出 JSON，不要有任何前缀或后缀。
 """
 
     def parse_output(self, response: str) -> Dict[str, Any]:
@@ -229,13 +547,62 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         if not affected_files:
             return None
 
-        # 构建一个基础的 ArchitectOutput
+        # 构建一个基础的 ArchitectOutput（强化降级输出，确保验收标准不为空）
         return ArchitectOutput(
-            feature_description="基于工具探索自动生成的功能描述",
+            feature_description="【降级输出 - 需要人工确认】基于工具探索自动生成的功能描述",
             affected_files=affected_files,
-            estimated_effort="待评估",
-            technical_design="通过工具调用探索了项目代码，建议基于读取的文件进行实现"
+            estimated_effort="待评估（降级输出）",
+            technical_design="通过工具调用探索了项目代码，但由于上下文限制未能完成完整分析。建议人工补充详细需求。",
+            acceptance_criteria=[
+                "【需要人工补充 - 系统无法自动推导】请明确本次变更需要满足的具体验收条件",
+                "例如：API 端点必须返回特定的状态码和响应格式",
+                "例如：函数必须实现特定的输入输出签名"
+            ]
         )
+
+    def _format_file_tree(self, file_tree: Dict[str, Any], max_files: int = 50) -> str:
+        """
+        格式化文件树为可读字符串
+
+        Args:
+            file_tree: 文件树字典
+            max_files: 最大显示文件数
+
+        Returns:
+            str: 格式化后的文件树字符串
+        """
+        if not file_tree:
+            return "(文件树为空)"
+
+        lines = []
+        file_count = 0
+
+        def traverse_tree(tree: Dict[str, Any], prefix: str = ""):
+            nonlocal file_count
+            if file_count >= max_files:
+                return
+
+            # 排序：目录在前，文件在后
+            items = sorted(tree.items(), key=lambda x: (not isinstance(x[1], dict), x[0]))
+
+            for i, (name, value) in enumerate(items):
+                if file_count >= max_files:
+                    lines.append(f"{prefix}... (还有 {len(tree) - i} 个项未显示)")
+                    return
+
+                is_last = i == len(items) - 1
+                connector = "└── " if is_last else "├── "
+                lines.append(f"{prefix}{connector}{name}")
+
+                if isinstance(value, dict):
+                    # 是目录，递归遍历
+                    new_prefix = prefix + ("    " if is_last else "│   ")
+                    traverse_tree(value, new_prefix)
+                else:
+                    file_count += 1
+
+        traverse_tree(file_tree)
+        return "\n".join(lines)
 
     async def analyze(
         self,
@@ -248,8 +615,9 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         """
         分析需求并输出方案
 
-        【改造】使用 ToolUsingAgent 的 execute 方法，支持工具调用
-        【新增】执行完成后，将读取的文件内容存入返回结果，供下游 CoderAgent 使用
+        【两步式流程】
+        第一步：自由探索 - 让 Agent 使用工具探索项目，输出 affected_files
+        第二步：详细设计 - 读取 affected_files 的完整内容，生成详细设计方案
 
         Args:
             requirement: 用户需求描述
@@ -261,19 +629,109 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         Returns:
             Dict: 包含分析结果或错误信息，以及 injected_files（读取的文件内容）
         """
-        initial_state = {
+        from app.core.sse_log_buffer import push_log
+        
+        # ============================================================
+        # 【第一步：自由探索】让 Agent 自由探索项目，识别 affected_files
+        # ============================================================
+        logger.info(f"[ArchitectAgent] 第一步：自由探索项目...", extra={"pipeline_id": pipeline_id})
+        if pipeline_id:
+            await push_log(pipeline_id, "info", "🏗️ ArchitectAgent 第一步：自由探索项目代码...", stage="ARCHITECT")
+        
+        # 构建探索阶段的 state（不包含预加载文件，让 Agent 自由探索）
+        exploration_state = {
             "requirement": requirement,
             "file_tree": file_tree,
             "element_context": element_context,
-            "project_path": project_path
+            "project_path": project_path,
+            "phase": "exploration",  # 标记为探索阶段
+            "preloaded_files": {}  # 探索阶段不预加载，让 Agent 自己探索
         }
-
-        result = await self.execute(
-            pipeline_id=pipeline_id,
-            stage_name="ARCHITECT",
-            initial_state=initial_state,
-            max_tokens=8192  # 【修复】增加 token 限制，确保输出不会被截断
+        
+        # 执行探索阶段
+        exploration_result = await self._run_exploration_phase(
+            exploration_state=exploration_state,
+            pipeline_id=pipeline_id
         )
+        
+        if not exploration_result.get("success"):
+            logger.error(f"[ArchitectAgent] 探索阶段失败: {exploration_result.get('error')}")
+            return exploration_result
+        
+        # 获取探索阶段识别的 affected_files
+        affected_files = exploration_result.get("output", {}).get("affected_files", [])
+        if not affected_files:
+            logger.error(f"[ArchitectAgent] 探索阶段未识别到任何 affected_files")
+            return {
+                "success": False,
+                "error": "探索阶段未识别到任何受影响的文件",
+                "output": exploration_result.get("output")
+            }
+        
+        logger.info(f"[ArchitectAgent] 探索阶段完成，识别到 {len(affected_files)} 个 affected_files: {affected_files}")
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"🔍 识别到 {len(affected_files)} 个可能受影响的文件", stage="ARCHITECT")
+            for f in affected_files[:5]:
+                await push_log(pipeline_id, "info", f"   - {f}", stage="ARCHITECT")
+            if len(affected_files) > 5:
+                await push_log(pipeline_id, "info", f"   ... 等共 {len(affected_files)} 个文件", stage="ARCHITECT")
+        
+        # ============================================================
+        # 【第二步：详细设计】读取 affected_files 完整内容，生成详细方案
+        # ============================================================
+        logger.info(f"[ArchitectAgent] 第二步：读取文件并生成详细设计方案...", extra={"pipeline_id": pipeline_id})
+        if pipeline_id:
+            await push_log(pipeline_id, "info", "📋 ArchitectAgent 第二步：读取文件内容并生成详细设计方案...", stage="ARCHITECT")
+        
+        # 读取所有 affected_files 的完整内容
+        full_file_contents = await self._read_affected_files(
+            affected_files=affected_files,
+            project_path=project_path,
+            pipeline_id=pipeline_id
+        )
+        
+        if not full_file_contents:
+            logger.error(f"[ArchitectAgent] 无法读取任何 affected_files 的内容")
+            return {
+                "success": False,
+                "error": "无法读取 affected_files 的内容",
+                "affected_files": affected_files
+            }
+        
+        logger.info(f"[ArchitectAgent] 成功读取 {len(full_file_contents)} 个文件的完整内容")
+        if pipeline_id:
+            await push_log(pipeline_id, "info", f"📖 已读取 {len(full_file_contents)} 个文件的完整内容", stage="ARCHITECT")
+        
+        # 构建详细设计阶段的 state
+        design_state = {
+            "requirement": requirement,
+            "file_tree": file_tree,
+            "element_context": element_context,
+            "project_path": project_path,
+            "phase": "design",  # 标记为设计阶段
+            "exploration_result": exploration_result.get("output", {}),  # 探索阶段的结果
+            "full_file_contents": full_file_contents,  # 完整文件内容
+            "affected_files": affected_files
+        }
+        
+        # 执行详细设计阶段
+        design_result = await self._run_design_phase(
+            design_state=design_state,
+            pipeline_id=pipeline_id
+        )
+        
+        # 合并结果
+        if design_result.get("success"):
+            # 将 injected_files 添加到结果中
+            if design_result.get("output"):
+                design_result["output"]["injected_files"] = full_file_contents
+                design_result["injected_files"] = full_file_contents
+            
+            logger.info(f"[ArchitectAgent] 两步式分析完成，成功生成设计方案")
+            if pipeline_id:
+                await push_log(pipeline_id, "info", "✅ ArchitectAgent 完成，已生成详细设计方案", stage="ARCHITECT")
+        
+        return design_result
         
         # 【调试】记录 result 的详细信息
         logger.info(f"[ArchitectAgent] execute 返回结果: success={result.get('success')}, error={result.get('error')}")
@@ -294,6 +752,10 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         if result.get("success") and self._agent_tools:
             affected_files = result.get("output", {}).get("affected_files", [])
             injected_files = {}
+            
+            # 记录预加载的文件列表供后续验证使用
+            preloaded_files_list = list(preloaded_files.keys())
+            result["output"]["_preloaded_files"] = preloaded_files_list
 
             for file_path in affected_files:
                 # 【修复】统一路径格式，移除 backend/ 前缀
@@ -339,7 +801,541 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                 logger.warning(f"[ArchitectAgent] injected_files 为空！affected_files={affected_files}")
                 logger.warning(f"[ArchitectAgent] _file_cache 键: {list(self._agent_tools._file_cache.keys()) if self._agent_tools else 'None'}")
 
+        # 【新增】验证 required_symbols 中的文件是否存在于 affected_files 或 file_tree 中
+        if result.get("success") and result.get("output"):
+            output = result["output"]
+            required_symbols = output.get("required_symbols", [])
+            affected_files = output.get("affected_files", [])
+            
+            if required_symbols:
+                # 构建 affected_files 的集合（标准化路径）
+                affected_set = set()
+                for f in affected_files:
+                    clean = f.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                    affected_set.add(clean)
+                    affected_set.add(f"backend/{clean}")
+                
+                # 验证每个 required_symbol
+                validated_symbols = []
+                for symbol in required_symbols:
+                    module = symbol.get("module", "")
+                    if not module:
+                        continue
+                    
+                    # 标准化模块路径
+                    clean_module = module.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                    
+                    # 检查是否在 affected_files 中
+                    if clean_module in affected_set or f"backend/{clean_module}" in affected_set:
+                        validated_symbols.append(symbol)
+                    else:
+                        # 检查是否在 file_tree 中
+                        if self._check_file_in_tree(file_tree, clean_module):
+                            validated_symbols.append(symbol)
+                        else:
+                            # 【放宽】如果文件在预加载的代码中，也认为是有效的
+                            preloaded = result.get("output", {}).get("_preloaded_files", [])
+                            if clean_module in preloaded or f"backend/{clean_module}" in preloaded:
+                                validated_symbols.append(symbol)
+                                logger.info(f"[ArchitectAgent] required_symbol 文件在预加载列表中: {module}", extra={
+                                    "pipeline_id": pipeline_id,
+                                    "symbol": symbol.get("name")
+                                })
+                            else:
+                                logger.warning(f"[ArchitectAgent] required_symbol 中的文件不存在: {module}", extra={
+                                    "pipeline_id": pipeline_id,
+                                    "symbol": symbol.get("name"),
+                                    "module_path": module
+                                })
+                
+                # 更新 required_symbols 为验证后的列表
+                if len(validated_symbols) != len(required_symbols):
+                    logger.info(f"[ArchitectAgent] 过滤后的 required_symbols: {len(validated_symbols)}/{len(required_symbols)}")
+                    output["required_symbols"] = validated_symbols
+                    # 同时更新 result 中的 output
+                    result["output"] = output
+
         return result
+
+    async def _enforce_tool_exploration_quota(
+        self,
+        result: Dict[str, Any],
+        pipeline_id: int
+    ) -> None:
+        """
+        【改进1】工具调用探索配额后置检查
+        
+        验证 ArchitectAgent 输出的 affected_files 中的每个文件是否已被充分探索。
+        如果存在未读取的文件，在 result 中添加警告信息。
+        
+        【强制】必须至少调用 1 次工具，否则标记为失败。
+        """
+        output = result.get("output", {})
+        affected_files = output.get("affected_files", [])
+        tool_results = result.get("tool_results", [])
+        tool_call_count = result.get("tool_calls", 0)
+        
+        if tool_call_count == 0:
+            logger.error(
+                f"[ArchitectAgent] 未进行任何工具调用就直接输出！affected_files={affected_files}",
+                extra={"pipeline_id": pipeline_id}
+            )
+            # 【强制】标记为失败，要求重试
+            result["success"] = False
+            result["error"] = (
+                "ArchitectAgent 未使用任何工具探索代码。"
+                "根据项目规则，架构师必须使用工具探索项目代码后才能输出设计方案。"
+                "请重试或检查系统配置。"
+            )
+            output["_exploration_error"] = (
+                "严重错误：未使用任何工具探索代码。"
+                "必须使用 glob/grep_ast/read_chunk/semantic_search 等工具探索项目后，"
+                "基于实际代码输出设计方案。"
+            )
+            result["output"] = output
+            return
+        
+        # 检查 affected_files 中哪些未被读取
+        unread_files = []
+        read_files = set()
+        
+        if self._agent_tools:
+            for path in self._agent_tools._file_cache:
+                clean = path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                read_files.add(clean)
+                read_files.add(f"backend/{clean}")
+        
+        for f in affected_files:
+            clean = f.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            if clean not in read_files and f"backend/{clean}" not in read_files:
+                unread_files.append(f)
+        
+        if unread_files:
+            logger.warning(
+                f"[ArchitectAgent] affected_files 中有 {len(unread_files)} 个未被读取: {unread_files}",
+                extra={"pipeline_id": pipeline_id}
+            )
+            output["_exploration_warning"] = (
+                f"以下文件未被充分探索: {unread_files}。"
+                "这些文件的代码结构可能未被准确理解。"
+            )
+            result["output"] = output
+        else:
+            logger.info(
+                f"[ArchitectAgent] 所有 {len(affected_files)} 个 affected_files 均已充分探索",
+                extra={"pipeline_id": pipeline_id}
+            )
+
+    def _build_reuse_table(self, full_files_context: Dict[str, str]) -> str:
+        """
+        【改进2】从 full_files_context 构建现有函数复用表
+        
+        解析每个文件中的函数定义、签名和返回键名，生成可读的复用表。
+        """
+        import re
+        
+        if not full_files_context:
+            return ""
+        
+        lines = ["【现有函数复用表 - 设计时必须参考以下现有函数，优先复用而非创建新函数】\n"]
+        
+        for file_path, content in full_files_context.items():
+            lines.append(f"\n### 文件: {file_path}")
+            
+            # 提取所有函数定义
+            func_pattern = r"(?P<async>async\s+)?def\s+(?P<name>\w+)\s*\((?P<params>[^)]*)\)(?:\s*->\s*(?P<ret>[^:]+))?:\s*"
+            for m in re.finditer(func_pattern, content):
+                func_name = m.group("name")
+                is_async = "async " if m.group("async") else ""
+                params = m.group("params")
+                ret_type = m.group("ret").strip() if m.group("ret") else "Any"
+                
+                # 尝试提取函数返回字典的键名
+                return_keys = []
+                # 查找函数体内第一个 return { ... } 语句
+                func_start = m.end()
+                brace_depth = 0
+                in_return = False
+                return_content = []
+                
+                for i, ch in enumerate(content[func_start:], func_start):
+                    if ch == '\n' and i + 1 < len(content) and content[i+1] in ' \t':
+                        continue
+                    if not in_return and content[i:i+7].strip() == "return" and '{' in content[i:i+20]:
+                        in_return = True
+                        brace_start = content.index('{', i)
+                        brace_depth = 1
+                        for j, c in enumerate(content[brace_start + 1:], brace_start + 1):
+                            if c == '{':
+                                brace_depth += 1
+                            elif c == '}':
+                                brace_depth -= 1
+                                if brace_depth == 0:
+                                    return_content.append(content[brace_start:j + 1])
+                                    break
+                        break
+                
+                if return_content:
+                    # 解析返回字典的键名
+                    for rc in return_content:
+                        keys = re.findall(r"['\"](\w+)['\"]\s*:", rc)
+                        return_keys.extend(keys)
+                
+                lines.append(
+                    f"  - {is_async}def {func_name}({params}) -> {ret_type}"
+                )
+                if return_keys:
+                    lines.append(f"    返回键名: {', '.join(return_keys)}")
+        
+        return "\n".join(lines)
+
+    async def _preload_relevant_code(
+        self,
+        requirement: str,
+        file_tree: Dict[str, Any],
+        project_path: str,
+        pipeline_id: int,
+        max_files: int = 5
+    ) -> Dict[str, str]:
+        """
+        【强制注入方案】预检索与需求相关的代码
+        
+        根据需求关键词，自动检索相关文件并读取内容，注入到 Prompt 中。
+        这样 LLM 无需调用工具就能基于现有代码进行分析。
+        
+        Args:
+            requirement: 用户需求描述
+            file_tree: 项目文件树
+            project_path: 项目路径
+            pipeline_id: Pipeline ID
+            max_files: 最大预加载文件数
+            
+        Returns:
+            Dict[str, str]: 文件路径到内容的映射
+        """
+        import re
+        from app.service.sandbox_orchestrator import get_sandbox_orchestrator
+        
+        preloaded = {}
+        
+        # 1. 从需求中提取关键词（健康检查相关）
+        keywords = []
+        requirement_lower = requirement.lower()
+        
+        # 健康检查相关关键词映射
+        keyword_mapping = {
+            "health": ["health", "healthcheck", "health_check"],
+            "database": ["database", "db", "postgres", "mysql"],
+            "disk": ["disk", "storage", "硬盘", "磁盘"],
+            "memory": ["memory", "ram", "内存"],
+            "cpu": ["cpu", "processor", "处理器"],
+            "monitor": ["monitor", "监控", "状态"],
+        }
+        
+        for category, terms in keyword_mapping.items():
+            if any(term in requirement_lower for term in terms):
+                keywords.append(category)
+        
+        if not keywords:
+            keywords = ["api", "service"]  # 默认关键词
+        
+        logger.info(f"[ArchitectAgent] 预检索关键词: {keywords}", extra={"pipeline_id": pipeline_id})
+        
+        # 2. 根据关键词猜测相关文件路径
+        candidate_files = []
+        
+        # 常见的健康检查相关文件模式
+        file_patterns = {
+            "health": ["app/api/v1/health.py", "app/service/health_service.py", "app/utils/system_monitor.py"],
+            "database": ["app/core/database.py", "app/utils/db_utils.py"],
+            "disk": ["app/utils/system_monitor.py", "app/utils/disk_utils.py"],
+            "memory": ["app/utils/system_monitor.py", "app/utils/memory_utils.py"],
+            "monitor": ["app/utils/system_monitor.py", "app/service/monitoring.py"],
+        }
+        
+        for keyword in keywords:
+            if keyword in file_patterns:
+                candidate_files.extend(file_patterns[keyword])
+        
+        # 去重并检查文件是否存在
+        candidate_files = list(dict.fromkeys(candidate_files))  # 保持顺序去重
+        
+        # 3. 使用 SandboxFileService 读取文件内容
+        from app.service.sandbox_file_service import SandboxFileService
+        file_service = SandboxFileService(pipeline_id)
+        
+        for file_path in candidate_files[:max_files]:
+            try:
+                result = await file_service.read_file(file_path)
+                if result.exists and result.content:
+                    preloaded[file_path] = result.content
+                    logger.info(f"[ArchitectAgent] 预加载成功: {file_path} ({len(result.content)} 字符)", 
+                               extra={"pipeline_id": pipeline_id})
+            except Exception as e:
+                logger.warning(f"[ArchitectAgent] 预加载失败: {file_path} - {e}", 
+                              extra={"pipeline_id": pipeline_id})
+        
+        return preloaded
+
+    async def _run_exploration_phase(
+        self,
+        exploration_state: Dict[str, Any],
+        pipeline_id: int
+    ) -> Dict[str, Any]:
+        """
+        【第一步：自由探索阶段】
+        
+        让 Agent 自由使用工具探索项目代码，识别可能受影响的文件。
+        这个阶段的目标是输出 affected_files 列表。
+        
+        Args:
+            exploration_state: 探索阶段的初始状态
+            pipeline_id: Pipeline ID
+            
+        Returns:
+            Dict: 探索结果，包含 affected_files
+        """
+        from app.core.sse_log_buffer import push_log
+        
+        max_retries = 2
+        retry_count = 0
+        result = None
+        
+        while retry_count <= max_retries:
+            result = await self.execute(
+                pipeline_id=pipeline_id,
+                stage_name="ARCHITECT_EXPLORATION",
+                initial_state=exploration_state,
+                max_tokens=16384,
+                # 【关键】探索阶段不使用 response_format，让 LLM 自由调用工具
+                response_format=None
+            )
+            
+            # 检查是否调用了工具
+            tool_call_count = result.get("tool_calls", 0)
+            
+            if tool_call_count > 0:
+                logger.info(f"[ArchitectAgent] 探索阶段成功调用 {tool_call_count} 次工具")
+                break
+            
+            # 没有调用工具，需要重试
+            retry_count += 1
+            if retry_count <= max_retries:
+                logger.warning(
+                    f"[ArchitectAgent] 探索阶段未调用工具，第 {retry_count}/{max_retries} 次重试..."
+                )
+                if pipeline_id:
+                    await push_log(
+                        pipeline_id, 
+                        "warning", 
+                        f"探索阶段未使用工具，正在进行第 {retry_count}次重试...", 
+                        stage="ARCHITECT"
+                    )
+                
+                exploration_state["_retry_count"] = retry_count
+                exploration_state["_force_tool_use"] = True
+                if self._agent_tools:
+                    self._agent_tools._file_cache.clear()
+            else:
+                logger.error(f"[ArchitectAgent] 探索阶段重试 {max_retries} 次后仍未调用工具")
+                if pipeline_id:
+                    await push_log(
+                        pipeline_id, 
+                        "error", 
+                        f"探索阶段重试 {max_retries} 次后仍未使用工具", 
+                        stage="ARCHITECT"
+                    )
+        
+        # 后置检查：验证是否调用了工具
+        if result and result.get("success") and result.get("output"):
+            await self._enforce_tool_exploration_quota(result, pipeline_id)
+        
+        return result
+
+    async def _read_affected_files(
+        self,
+        affected_files: List[str],
+        project_path: str,
+        pipeline_id: int
+    ) -> Dict[str, str]:
+        """
+        读取所有 affected_files 的完整内容
+        
+        Args:
+            affected_files: 文件路径列表
+            project_path: 项目路径
+            pipeline_id: Pipeline ID
+            
+        Returns:
+            Dict[str, str]: 文件路径到内容的映射
+        """
+        from app.service.sandbox_file_service import SandboxFileService
+        
+        full_contents = {}
+        file_service = SandboxFileService(pipeline_id)
+        
+        for file_path in affected_files:
+            # 标准化路径
+            clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            
+            try:
+                result = await file_service.read_file(clean_path)
+                if result.exists and result.content:
+                    full_contents[clean_path] = result.content
+                    logger.info(f"[ArchitectAgent] 成功读取文件: {clean_path} ({len(result.content)} 字符)")
+                else:
+                    logger.warning(f"[ArchitectAgent] 无法读取文件: {clean_path}, error={result.error}")
+            except Exception as e:
+                logger.error(f"[ArchitectAgent] 读取文件失败: {clean_path} - {e}")
+        
+        return full_contents
+
+    async def _run_design_phase(
+        self,
+        design_state: Dict[str, Any],
+        pipeline_id: int
+    ) -> Dict[str, Any]:
+        """
+        【第二步：详细设计阶段】
+        
+        基于完整的文件内容，生成详细的技术设计方案。
+        这个阶段输出完整的设计方案，包括 interface_specs 等。
+        
+        Args:
+            design_state: 设计阶段的初始状态（包含 full_file_contents）
+            pipeline_id: Pipeline ID
+            
+        Returns:
+            Dict: 详细设计结果
+        """
+        from app.core.sse_log_buffer import push_log
+        
+        # 构建设计阶段的 user_prompt
+        design_prompt = self._build_design_prompt(design_state)
+        
+        # 使用父类的 _call_llm_with_tools 方法，但不传递工具
+        # 因为我们已经有完整的文件内容，不需要再调用工具
+        result = await self._call_llm_with_tools(
+            system_prompt=self.system_prompt,
+            user_prompt=design_prompt,
+            project_path=design_state.get("project_path", "/workspace/backend"),
+            pipeline_id=pipeline_id,
+            max_tokens=32768,
+            response_format={"type": "json_object"}
+        )
+        
+        # 解析和验证输出
+        if result.get("content"):
+            try:
+                parsed_output = self.parse_output(result["content"])
+                validated_output = self.validate_output(parsed_output)
+                
+                output_dict = validated_output.model_dump() if hasattr(validated_output, 'model_dump') else validated_output
+                
+                return {
+                    "success": True,
+                    "output": output_dict,
+                    "input_tokens": result.get("input_tokens", 0),
+                    "output_tokens": result.get("output_tokens", 0),
+                    "raw_output": result["content"]
+                }
+            except Exception as e:
+                logger.error(f"[ArchitectAgent] 设计阶段输出验证失败: {e}")
+                return {
+                    "success": False,
+                    "error": f"设计阶段输出验证失败: {e}",
+                    "raw_output": result.get("content", "")[:500]
+                }
+        else:
+            return {
+                "success": False,
+                "error": "设计阶段 LLM 返回空内容",
+                "raw_output": ""
+            }
+
+    def _build_design_prompt(self, design_state: Dict[str, Any]) -> str:
+        """
+        构建设计阶段的 Prompt
+        
+        Args:
+            design_state: 设计阶段状态
+            
+        Returns:
+            str: Prompt 字符串
+        """
+        requirement = design_state.get("requirement", "")
+        affected_files = design_state.get("affected_files", [])
+        full_file_contents = design_state.get("full_file_contents", {})
+        exploration_result = design_state.get("exploration_result", {})
+        
+        # 构建文件内容部分
+        files_section = []
+        for file_path, content in full_file_contents.items():
+            files_section.append(f"""
+=== 文件: {file_path} ===
+```python
+{content}
+```
+""")
+        files_str = "\n".join(files_section)
+        
+        # 构建探索阶段的结论
+        exploration_summary = f"""
+【探索阶段结论】
+- 功能描述: {exploration_result.get('feature_description', 'N/A')}
+- 预估工作量: {exploration_result.get('estimated_effort', 'N/A')}
+- 技术方案概要: {exploration_result.get('technical_design', 'N/A')[:500] if exploration_result.get('technical_design') else 'N/A'}
+"""
+        
+        return f"""【用户需求】
+{requirement}
+
+{exploration_summary}
+
+【受影响文件列表】
+{affected_files}
+
+【完整文件内容】
+{files_str}
+
+【你的任务】
+基于以上完整的文件内容，输出详细的技术设计方案。
+
+要求：
+1. `feature_description`: 用一句话总结功能（可以基于探索阶段的结论优化）
+2. `affected_files`: 受影响文件列表（与上面列表一致）
+3. `estimated_effort`: 预估工作量
+4. `technical_design`: 详细的技术方案（基于完整代码分析）
+5. `acceptance_criteria`: 3-5 条可验证的验收标准
+6. `required_symbols`: 必需实现的符号清单（基于代码分析）
+   - 每个符号必须包含: name, type, module, signature
+   - 只列出需要修改或新增的符号
+
+【输出格式】
+直接输出纯 JSON，不要有任何前缀或后缀。
+"""
+
+    def _check_file_in_tree(self, file_tree: Dict[str, Any], file_path: str) -> bool:
+        """
+        检查文件是否存在于文件树中
+
+        Args:
+            file_tree: 文件树字典
+            file_path: 文件路径（如 "app/utils/system_monitor.py"）
+
+        Returns:
+            bool: 是否存在
+        """
+        parts = file_path.replace("\\", "/").split("/")
+        current = file_tree
+        
+        for part in parts:
+            if not isinstance(current, dict) or part not in current:
+                return False
+            current = current[part]
+        
+        # 如果最后一个是字典，说明是目录；如果不是字典，说明是文件
+        return True
 
 
 # 单例实例

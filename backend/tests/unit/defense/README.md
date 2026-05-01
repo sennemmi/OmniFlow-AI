@@ -8,7 +8,7 @@
 |------|------|------|----------|
 | Layer 1 | 代码修改与沙箱防线 | 防止 AI 破坏物理文件 | 文件回滚、路径安全、导入清理、**并发安全** |
 | Layer 2 | 测试运行器与决策防线 | 防止"旧测试"被 AI 篡改 | 语法拦截、防御性保护、回归保护、**测试隔离** |
-| Layer 3 | 多 Agent 协作与状态机防线 | 防止系统死循环 | Pydantic 校验、重试限制、JSON 剥离、**Token限制** |
+| Layer 3 | 多 Agent 协作与状态机防线 | 防止系统死循环 | Pydantic 校验、重试限制、JSON 剥离、**Token限制**、**代码-测试契约** |
 | Layer 4 | 工作流与状态持久化防线 | 确保界面显示正确 | 状态流转限制、反馈传递、**事务完整性** |
 
 ## 测试文件列表
@@ -24,6 +24,7 @@
 ### Layer 3 - 多 Agent 协作与状态机防线
 - `test_layer3_multi_agent.py` - Agent 协作基础
 - `test_layer3_token_limit.py` - **Token 消耗限制**
+- `test_layer3_contract_enforcement.py` - **代码-测试契约强制**（新增）
 
 ### Layer 4 - 工作流与状态持久化防线
 - `test_layer4_workflow_state.py` - 工作流状态管理

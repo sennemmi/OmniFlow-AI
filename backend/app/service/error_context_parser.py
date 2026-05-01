@@ -189,7 +189,7 @@ class ErrorContextParser:
             ))
 
     def _parse_runtime_errors(self, logs: str, context: StructuredErrorContext) -> None:
-        """解析运行时错误（NameError, SyntaxError, AttributeError）"""
+        """解析运行时错误（NameError, SyntaxError, AttributeError, KeyError）"""
         # NameError
         name_error_pattern = re.compile(
             r"NameError: name ['\"](\w+)['\"] is not defined",
@@ -214,6 +214,51 @@ class ErrorContextParser:
                 summary=f"未定义变量: {name}",
                 detail=f"变量或函数 {name} 未定义",
                 fix_hint=f"检查是否需要导入 {name}，或在当前作用域定义它。"
+            ))
+
+        # 【新增】KeyError - 字典键不存在
+        key_error_pattern = re.compile(
+            r"KeyError: ['\"]?(\w+)['\"]?",
+            re.MULTILINE
+        )
+        for match in key_error_pattern.finditer(logs):
+            missing_key = match.group(1)
+
+            # 尝试找到文件路径和行号
+            file_match = re.search(
+                r"File \"([^\"]+)\".*line (\d+)",
+                logs[:match.start()],
+                re.MULTILINE | re.DOTALL
+            )
+            file_path = file_match.group(1) if file_match else None
+            line_no = int(file_match.group(2)) if file_match else None
+
+            # 尝试从上下文中找到实际存在的键名（用于给出修复建议）
+            # 查找类似 "dict has keys ['a', 'b', 'c']" 的模式
+            available_keys = []
+            keys_match = re.search(
+                r"dict has keys \[(.+?)\]",
+                logs[match.start():match.start()+500],
+                re.MULTILINE | re.DOTALL
+            )
+            if keys_match:
+                keys_str = keys_match.group(1)
+                available_keys = [k.strip().strip("'\"") for k in keys_str.split(",")]
+
+            # 构建修复建议
+            if available_keys:
+                fix_hint = f"将 '{missing_key}' 改为正确的键名。可用的键: {', '.join(available_keys)}"
+            else:
+                fix_hint = f"将 '{missing_key}' 改为正确的键名（如 'usage_percent'）。检查字典实际包含的键名。"
+
+            context.errors.append(ParsedError(
+                severity=ErrorSeverity.HIGH,
+                file_path=file_path,
+                line=line_no,
+                error_type="KeyError",
+                summary=f"字典键 '{missing_key}' 不存在",
+                detail=f"代码尝试访问不存在的键 '{missing_key}'。检查字典实际包含的键名。",
+                fix_hint=fix_hint
             ))
 
         # SyntaxError
@@ -264,49 +309,40 @@ class ErrorContextParser:
 
     def _parse_assertion_errors(self, logs: str, context: StructuredErrorContext) -> None:
         """解析测试断言错误"""
-        # FAILED 测试名 - 改进版本，尝试提取文件路径
-        failed_pattern = re.compile(
+        # 【改进】支持多种 FAILED 格式：
+        # 1. FAILED tests/test_file.py::test_func - 错误详情
+        # 2. FAILED tests/test_file.py::test_func (无详情)
+        # 3. FAILED tests/test_file.py::TestClass::test_method
+
+        # 模式1: 带详情的 FAILED 行
+        failed_pattern_with_detail = re.compile(
             r"FAILED\s+(\S+)\s+-\s+(.+)",
             re.MULTILINE
         )
-        for match in failed_pattern.finditer(logs):
+
+        # 模式2: 仅 FAILED 测试名（无详情）
+        failed_pattern_simple = re.compile(
+            r"^FAILED\s+(\S+)$",
+            re.MULTILINE
+        )
+
+        # 收集所有已处理的测试名，避免重复
+        processed_tests = set()
+
+        # 先处理带详情的
+        for match in failed_pattern_with_detail.finditer(logs):
             test_name = match.group(1)
             assertion_detail = match.group(2)
 
+            if test_name in processed_tests:
+                continue
+            processed_tests.add(test_name)
+
             # 尝试从测试名中提取文件路径
-            # 测试名格式: tests/test_file.py::test_function
-            file_path = None
-            if "::" in test_name:
-                file_part = test_name.split("::")[0]
-                # 转换为相对路径
-                if file_part.startswith("tests/"):
-                    file_path = file_part
-                else:
-                    file_path = f"tests/{file_part}"
+            file_path = self._extract_file_path_from_test_name(test_name)
 
-            # 尝试在日志中找到对应的源文件（被测代码）
-            source_file = None
-            source_line = None
-
-            # 从 generated_files 中推断源文件（非测试文件）
-            if context.generated_files:
-                for gf in context.generated_files:
-                    if gf.endswith(".py") and not gf.startswith("test_") and "tests/" not in gf:
-                        source_file = gf
-                        break
-
-            # 如果没有找到，尝试从 where 子句提取函数名
-            if not source_file and "where" in assertion_detail:
-                where_match = re.search(r"where\s+(\S+)\s*=", assertion_detail)
-                if where_match:
-                    func_call = where_match.group(1)
-                    func_name = func_call.split("(")[0] if "(" in func_call else func_call
-                    # 再次从 generated_files 中查找包含该函数的文件
-                    if context.generated_files:
-                        for gf in context.generated_files:
-                            if gf.endswith(".py") and not gf.startswith("test_"):
-                                source_file = gf
-                                break
+            # 尝试找到对应的源文件
+            source_file = self._find_source_file(context, assertion_detail)
 
             # 使用源文件路径（优先）或测试文件路径
             final_file_path = source_file if source_file else file_path
@@ -314,12 +350,64 @@ class ErrorContextParser:
             context.errors.append(ParsedError(
                 severity=ErrorSeverity.MEDIUM,
                 file_path=final_file_path,
-                line=source_line,
+                line=None,
                 error_type="AssertionError",
                 summary=f"测试失败: {test_name}",
                 detail=assertion_detail,
                 fix_hint=f"检查 {test_name} 对应的功能实现，确保满足断言条件。"
             ))
+
+        # 再处理无详情的（简单 FAILED 行）
+        for match in failed_pattern_simple.finditer(logs):
+            test_name = match.group(1)
+
+            if test_name in processed_tests:
+                continue
+            processed_tests.add(test_name)
+
+            file_path = self._extract_file_path_from_test_name(test_name)
+
+            context.errors.append(ParsedError(
+                severity=ErrorSeverity.MEDIUM,
+                file_path=file_path,
+                line=None,
+                error_type="AssertionError",
+                summary=f"测试失败: {test_name}",
+                detail="测试断言失败",
+                fix_hint=f"检查 {test_name} 对应的功能实现，确保满足断言条件。"
+            ))
+
+    def _extract_file_path_from_test_name(self, test_name: str) -> Optional[str]:
+        """从测试名中提取文件路径"""
+        if "::" not in test_name:
+            return None
+
+        file_part = test_name.split("::")[0]
+        # 转换为相对路径
+        if file_part.startswith("tests/"):
+            return file_part
+        else:
+            return f"tests/{file_part}"
+
+    def _find_source_file(self, context: StructuredErrorContext, assertion_detail: str) -> Optional[str]:
+        """从 generated_files 中查找源文件"""
+        # 从 generated_files 中推断源文件（非测试文件）
+        if context.generated_files:
+            for gf in context.generated_files:
+                if gf.endswith(".py") and not gf.startswith("test_") and "tests/" not in gf:
+                    return gf
+
+        # 如果没有找到，尝试从 where 子句提取函数名
+        if "where" in assertion_detail:
+            where_match = re.search(r"where\s+(\S+)\s*=", assertion_detail)
+            if where_match:
+                # 再次从 generated_files 中查找
+                if context.generated_files:
+                    for gf in context.generated_files:
+                        if gf.endswith(".py") and not gf.startswith("test_"):
+                            return gf
+
+        return None
 
         # AssertionError with details
         assertion_pattern = re.compile(

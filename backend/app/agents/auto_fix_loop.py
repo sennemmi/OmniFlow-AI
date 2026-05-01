@@ -7,8 +7,9 @@ Auto-Fix 循环模块
 import asyncio
 import json
 import logging
+import re
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from pathlib import Path
 
 from app.agents.coder import coder_agent
@@ -25,6 +26,34 @@ from app.core.event_bus import emit_log
 from app.core.sse_log_buffer import push_log
 from app.core.config import settings
 from app.core.resilience import ResilienceManager, RetryConfig, CircuitBreakerOpenError
+from app.core.contract_checker import check_contract_before_test, ContractViolationError
+
+
+def extract_missing_symbols(logs: str) -> List[str]:
+    """
+    从测试日志中提取缺失的符号名
+
+    解析 ImportError 和 ModuleNotFoundError，提取无法导入的符号名称
+    """
+    missing = []
+
+    # 匹配 ImportError: cannot import name 'xxx'
+    import_errors = re.findall(r"ImportError: cannot import name ['\"](\w+)['\"]", logs)
+    missing.extend(import_errors)
+
+    # 匹配 ModuleNotFoundError: No module named 'xxx'
+    module_errors = re.findall(r"ModuleNotFoundError: No module named ['\"]([\w.]+)['\"]", logs)
+    missing.extend(module_errors)
+
+    # 匹配 AttributeError: module 'xxx' has no attribute 'yyy'
+    attr_errors = re.findall(r"AttributeError: module ['\"][\w.]+['\"] has no attribute ['\"](\w+)['\"]", logs)
+    missing.extend(attr_errors)
+
+    # 匹配 NameError: name 'xxx' is not defined
+    name_errors = re.findall(r"NameError: name ['\"](\w+)['\"] is not defined", logs)
+    missing.extend(name_errors)
+
+    return list(set(missing))
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +298,59 @@ class AutoFixLoop:
                 stage="CODING"
             )
 
+            # 【前置契约检查】在运行测试前验证代码是否满足契约
+            await push_log(
+                pipeline_id, "info",
+                "🔍 执行前置契约检查...",
+                stage="CODING"
+            )
+
+            # 构建 code_files 字典（从 all_files 中提取内容）
+            code_files_dict = {}
+            for file_change in all_files:
+                file_path = file_change.get("file_path", "")
+                content = file_change.get("content", "")
+                if file_path and content:
+                    code_files_dict[file_path] = content
+
+            contract_check = check_contract_before_test(
+                design_output=design_output,
+                code_files=code_files_dict
+            )
+
+            if not contract_check.get("success", True):
+                violations = contract_check.get("violations", [])
+                check_type = contract_check.get("type", "unknown")
+
+                logger.error(f"[Pipeline {pipeline_id}] 契约检查失败: {check_type}")
+                await push_log(
+                    pipeline_id, "error",
+                    f"❌ 契约检查失败: 发现 {len(violations)} 个问题",
+                    stage="CODING"
+                )
+
+                for v in violations[:5]:
+                    await push_log(
+                        pipeline_id, "error",
+                        f"  - {v}",
+                        stage="CODING"
+                    )
+
+                # 构建错误上下文，让 CoderAgent 修复缺失的实现
+                current_error_context = (
+                    f"【契约检查失败】代码未满足接口契约要求:\n"
+                    f"{chr(10).join(violations[:10])}\n\n"
+                    f"请确保实现了所有 interface_specs 中声明的函数/类。"
+                )
+                attempt += 1
+                continue
+
+            await push_log(
+                pipeline_id, "success",
+                "✅ 契约检查通过",
+                stage="CODING"
+            )
+
             # 3. 【阶段二：独立验证步骤】使用 VerifyAgent 进行验证
             verify_result = await self._verify_fixes(pipeline_id, all_files)
 
@@ -296,7 +378,10 @@ class AutoFixLoop:
 
             elif verify_result["verdict"] == "FAIL":
                 # 【利益隔离】RepairerAgent 修复阶段
-                structured_errors = verify_result.get("structured_errors", {})
+                # 【简化】直接使用原始测试日志，不再进行复杂的结构化解析
+                raw_logs = verify_result.get("raw_logs", "")
+                failed_tests = verify_result.get("failed_tests", [])
+                missing_symbols = verify_result.get("missing_symbols", [])
 
                 await push_log(
                     pipeline_id, "warning",
@@ -304,58 +389,84 @@ class AutoFixLoop:
                     stage="CODING"
                 )
 
-                # 【利益隔离】构建结构化工单
-                failed_tests = verify_result.get("errors", [])
-                evidence = verify_result.get("evidence", {})
-                snippet = evidence.get("failed_output", "")[:1500]
-
                 # 【调试】打印详细错误信息
                 logger.info(f"[Pipeline {pipeline_id}] 【调试】验证失败详情:")
                 logger.info(f"[Pipeline {pipeline_id}] 【调试】 - failed_tests 数量: {len(failed_tests)}")
-                logger.info(f"[Pipeline {pipeline_id}] 【调试】 - structured_errors: {structured_errors}")
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】 - 原始日志长度: {len(raw_logs)} 字符")
                 logger.info(f"[Pipeline {pipeline_id}] 【调试】 - all_files: {[f.get('file_path', '') for f in all_files]}")
 
+                # 【简化】构建修复工单 - 直接发送原始报错信息
                 fix_order = {
                     "type": "fix_order",
                     "category": "code_bug",
                     "source": "VerificationAgent",
-                    "errors": structured_errors.get("errors", []),
-                    "failed_tests": failed_tests[:5],
-                    "error_snippet": snippet,
+                    "failed_tests": failed_tests,
+                    "error_logs": raw_logs[:3000],  # 发送原始报错日志（限制长度避免超限）
                     "generated_files": [f.get("file_path", "") for f in all_files],
-                    "fix_hint": "根据以上测试输出修复代码，务必使所有测试通过。"
+                    "missing_symbols": missing_symbols,
+                    "fix_hint": "根据测试失败日志修复代码，务必使所有测试通过。"
                 }
 
+                # 如果有缺失符号，添加到提示中
+                if missing_symbols:
+                    fix_order["fix_hint"] += f"\n【关键】以下符号缺失，必须实现: {', '.join(missing_symbols)}"
+
                 # 【调试】打印修复工单
-                logger.info(f"[Pipeline {pipeline_id}] 【调试】修复工单: {json.dumps(fix_order, indent=2, ensure_ascii=False)[:1000]}")
+                logger.info(f"[Pipeline {pipeline_id}] 【调试】修复工单已生成，包含 {len(failed_tests)} 个失败测试")
 
                 await push_log(
                     pipeline_id, "info",
-                    f"📋 修复工单已生成: {len(fix_order['errors'])} 个错误项",
+                    f"📋 修复工单已生成: {len(failed_tests)} 个失败测试",
                     stage="CODING"
                 )
 
-                # 【新架构】优先使用 file_service（Sandbox 模式），否则使用本地路径
-                if file_service:
-                    logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 进行修复")
-                    project_path = None  # Sandbox 模式下不需要本地路径
-                else:
-                    # 【修复】使用 workspace_path 而不是 settings.TARGET_PROJECT_PATH
-                    # 因为在 E2E 测试中，代码实际在临时工作目录中
-                    project_path = workspace_path
-                    logger.info(f"[Pipeline {pipeline_id}] 【调试】项目路径: {project_path}")
+                # 【新架构】收集所有相关文件的完整内容
+                # 从 all_files 中提取文件内容
+                target_files = {}
+                for file_info in all_files:
+                    file_path = file_info.get("file_path", "")
+                    content = file_info.get("content", "")
+                    if file_path and content:
+                        # 标准化路径
+                        clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                        target_files[clean_path] = content
+                        logger.info(f"[Pipeline {pipeline_id}] 【调试】准备传入 RepairerAgent: {clean_path} ({len(content)} 字符)")
+                
+                # 如果没有从 all_files 获取到内容，尝试从 file_service 读取
+                if not target_files and file_service:
+                    logger.info(f"[Pipeline {pipeline_id}] 从 Sandbox 读取文件内容用于修复")
+                    for file_info in all_files:
+                        file_path = file_info.get("file_path", "")
+                        if file_path:
+                            clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                            read_res = await file_service.read_file(clean_path)
+                            if read_res.exists and read_res.content:
+                                target_files[clean_path] = read_res.content
+                                logger.info(f"[Pipeline {pipeline_id}] 【调试】从 Sandbox 读取: {clean_path} ({len(read_res.content)} 字符)")
+                
+                if not target_files:
+                    logger.error(f"[Pipeline {pipeline_id}] 无法获取任何文件内容用于修复")
+                    await push_log(
+                        pipeline_id, "error",
+                        "❌ 无法获取文件内容，修复失败",
+                        stage="CODING"
+                    )
+                    attempt += 1
+                    continue
+                
+                logger.info(f"[Pipeline {pipeline_id}] 共传入 {len(target_files)} 个文件的完整内容给 RepairerAgent")
 
                 # 【利益隔离核心】调用 RepairerAgent 进行修复
                 repairer = RepairerAgent()
-                repair_result = await repairer.execute_with_reread(
+                repair_result = await repairer.execute_with_files(
                     pipeline_id=pipeline_id,
                     stage_name="CODING_REPAIR",
                     fix_order=fix_order,
-                    project_path=project_path,
-                    file_service=file_service,  # 【新架构】传入 SandboxFileService
+                    target_files=target_files,  # 【关键】直接传入完整文件内容
+                    file_service=file_service,  # 【新架构】传入 SandboxFileService 用于写入修复
                     initial_state={
                         "design_output": design_output,
-                        "error_context": structured_errors,
+                        "error_context": fix_order,  # 【简化】使用简化的 fix_order 作为错误上下文
                         "verification_report": {
                             "verdict": "FAIL",
                             "error_count": len(failed_tests),
@@ -643,6 +754,19 @@ class AutoFixLoop:
             generated_files=generated_files
         )
 
+        # 【新增】提取缺失符号信息
+        missing_symbols = extract_missing_symbols(logs)
+        if missing_symbols:
+            logger.warning(f"[Pipeline {pipeline_id}] 检测到缺失符号: {missing_symbols}")
+            await push_log(
+                pipeline_id,
+                "warning",
+                f"⚠️ 检测到缺失符号: {', '.join(missing_symbols)}",
+                stage="CODING"
+            )
+            # 将缺失符号信息添加到结构化错误中
+            structured_errors["missing_symbols"] = missing_symbols
+
         error_list = []
         for error in structured_errors.get("errors", []):
             file_path = error.get("file_path", "unknown")
@@ -659,12 +783,17 @@ class AutoFixLoop:
             errors=error_list[:5]
         )
 
+        # 【简化】直接从 test_result 获取 failed_tests
+        failed_tests = test_result.get("failed_tests", [])
+
         return {
             "verdict": "FAIL",
             "errors": error_list,
+            "failed_tests": failed_tests,  # 【新增】返回失败的测试名称列表
             "summary": test_result.get("summary", "测试失败"),
             "structured_errors": structured_errors,
-            "raw_logs": logs[:2000],
+            "missing_symbols": missing_symbols,  # 【新增】返回缺失符号列表
+            "raw_logs": logs[:3000],  # 【增加】原始日志长度
             "message": (
                 "Verification FAILED: 代码未通过测试。以下是失败的测试清单和关键日志。"
                 "请将本报告交还给修复系统，不要尝试修复。"
@@ -686,9 +815,11 @@ class AutoFixLoop:
         )
 
         async def _do_run_tests():
+            # 【优化】移除 -x 参数，让 pytest 跑完全部测试，一次性收集所有失败
+            # 【重要】不再使用 tail 截断日志，确保获取所有错误信息
             test_result_cmd = await sandbox_manager.exec_command(
                 pipeline_id=pipeline_id,
-                cmd="cd /workspace/backend && python -m pytest tests/ -v --tb=short --color=no -x 2>&1 | tail -100",
+                cmd="cd /workspace/backend && python -m pytest tests/ -v --tb=short --color=no 2>&1",
                 timeout=120
             )
             return test_result_cmd
@@ -752,7 +883,9 @@ class AutoFixLoop:
                 error_type = "test_collection_error"
             elif "FAILED" in test_logs or "failed" in test_logs.lower():
                 error_type = "test_failure"
-                failed_matches = re.findall(r'(\S+::\S+)\s+FAILED', test_logs)
+                # 【修复】修正正则表达式，匹配 pytest 的 FAILED 格式
+                # pytest 格式: FAILED tests/test_file.py::test_func
+                failed_matches = re.findall(r'FAILED\s+(\S+::\S+)', test_logs)
                 failed_tests = failed_matches
             elif "timeout" in test_logs.lower():
                 error_type = "timeout"

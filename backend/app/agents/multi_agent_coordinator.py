@@ -160,6 +160,7 @@ class MultiAgentCoordinator:
             skeleton_output=skeleton_output,
             code_output=code_result.get("code_output", {}),
             pipeline_id=pipeline_id,
+            design_output=design_output,  # 【契约增强】传递契约限制
         )
 
         # ── 合并结果 ────────────────────────────────────────────────────
@@ -323,6 +324,64 @@ class MultiAgentCoordinator:
                     pipeline_id,
                     "info",
                     f"✅ 所有文件成功写入 Docker Sandbox",
+                    stage="CODING"
+                )
+
+        # 【契约增强】前置契约检查：验证代码是否实现了所有 interface_specs 中的符号
+        interface_specs = design_output.get("interface_specs", [])
+        if interface_specs and file_service:
+            await push_log(
+                pipeline_id,
+                "info",
+                f"🔍 开始前置契约检查（{len(interface_specs)} 个符号）...",
+                stage="CODING"
+            )
+
+            # 构建 code_files 字典用于契约检查
+            code_files_dict = {}
+            for f in all_files:
+                fp = f.get("file_path", "")
+                content = f.get("content", "")
+                if fp and content:
+                    code_files_dict[fp] = content
+
+            # 调用契约检查
+            from app.core.contract_checker import verify_contract
+            missing_symbols = verify_contract(code_files_dict, interface_specs)
+
+            if missing_symbols:
+                logger.error(f"MultiAgentCoordinator: 契约检查失败，缺失符号: {missing_symbols}", extra={
+                    "pipeline_id": pipeline_id,
+                    "missing_symbols": missing_symbols
+                })
+                await push_log(
+                    pipeline_id,
+                    "error",
+                    f"❌ 契约检查失败: 缺少 {len(missing_symbols)} 个必需符号",
+                    stage="CODING"
+                )
+                for sym in missing_symbols:
+                    await push_log(pipeline_id, "error", f"   - {sym}", stage="CODING")
+
+                return {
+                    "success": False,
+                    "error": f"Contract violation: {missing_symbols}",
+                    "output": None,
+                    "input_tokens": code_result.get("input_tokens", 0),
+                    "output_tokens": code_result.get("output_tokens", 0),
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                    "contract_violation": True,
+                    "missing_symbols": missing_symbols
+                }
+            else:
+                logger.info(f"MultiAgentCoordinator: 契约检查通过", extra={
+                    "pipeline_id": pipeline_id,
+                    "symbol_count": len(interface_specs)
+                })
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    f"✅ 契约检查通过（{len(interface_specs)} 个符号已实现）",
                     stage="CODING"
                 )
 

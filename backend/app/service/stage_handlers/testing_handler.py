@@ -334,6 +334,49 @@ class TestingHandler(StageHandler):
                     create_if_missing=True
                 )
 
+                # 【契约增强】前置契约检查：验证代码是否实现了所有 interface_specs 中的符号
+                interface_specs = design_output.get("interface_specs", [])
+                if interface_specs:
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        f"🔍 开始前置契约检查（{len(interface_specs)} 个符号）...",
+                        stage="UNIT_TESTING"
+                    )
+
+                    # 构建 code_files 字典用于契约检查
+                    code_files_dict = {f["file_path"]: f["content"] for f in all_files if f.get("content")}
+
+                    # 调用契约检查
+                    from app.core.contract_checker import verify_contract
+                    missing_symbols = verify_contract(code_files_dict, interface_specs)
+
+                    if missing_symbols:
+                        await push_log(
+                            pipeline_id,
+                            "error",
+                            f"❌ 契约检查失败: 缺少 {len(missing_symbols)} 个必需符号",
+                            stage="UNIT_TESTING"
+                        )
+                        for sym in missing_symbols:
+                            await push_log(pipeline_id, "error", f"   - {sym}", stage="UNIT_TESTING")
+
+                        return StageResult.failure_result(
+                            message=f"Contract violation: {missing_symbols}",
+                            output_data={
+                                "contract_violation": True,
+                                "missing_symbols": missing_symbols,
+                                "interface_specs": interface_specs
+                            }
+                        )
+                    else:
+                        await push_log(
+                            pipeline_id,
+                            "info",
+                            f"✅ 契约检查通过（{len(interface_specs)} 个符号已实现）",
+                            stage="UNIT_TESTING"
+                        )
+
                 # 调用 TestAgent 生成测试（带重试机制）
                 await push_log(pipeline_id, "info", "TestAgent 开始生成测试代码...", stage="UNIT_TESTING")
 

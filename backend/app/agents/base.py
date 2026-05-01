@@ -71,6 +71,8 @@ class LangGraphAgent(ABC, Generic[T]):
     """
 
     MAX_RETRIES: int = 3
+    # 是否使用 JSON 格式化输出（结构化输出）
+    USE_JSON_FORMAT: bool = False
 
     def __init__(self, agent_name: str, llm_provider: Optional[LLMProvider] = None):
         """
@@ -169,23 +171,32 @@ class LangGraphAgent(ABC, Generic[T]):
     async def _process_node(self, state: BaseAgentState) -> BaseAgentState:
         """
         处理节点：调用 LLM 生成输出
-        
+
         Args:
             state: 当前状态
-            
+
         Returns:
             BaseAgentState: 更新后的状态（包含 Token 信息）
         """
         try:
             # 构建用户提示
             user_prompt = self.build_user_prompt(state)
-            
+
+            # 【结构化输出】如果启用 JSON 格式化，添加 response_format 参数
+            response_format = {"type": "json_object"} if self.USE_JSON_FORMAT else None
+            if response_format:
+                logger.info(f"[{self.agent_name}] 使用结构化输出 (JSON)")
+
             # 调用 LLM（现在返回字典包含 Token 信息）
-            response = await self._call_llm(self.system_prompt, user_prompt)
-            
+            response = await self._call_llm(
+                self.system_prompt,
+                user_prompt,
+                response_format=response_format
+            )
+
             # 尝试解析输出
             parsed_output = self.parse_output(response["content"])
-            
+
             return {
                 **state,
                 "output": parsed_output,
@@ -273,7 +284,8 @@ class LangGraphAgent(ABC, Generic[T]):
         user_prompt: str,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-        retry_count: int = 3
+        retry_count: int = 3,
+        response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         统一 LLM 调用方法（异步）
@@ -286,6 +298,7 @@ class LangGraphAgent(ABC, Generic[T]):
             temperature: 温度参数
             max_tokens: 最大 Token 数
             retry_count: 重试次数
+            response_format: 响应格式，如 {"type": "json_object"}
 
         Returns:
             Dict: {content, input_tokens, output_tokens}
@@ -308,7 +321,8 @@ class LangGraphAgent(ABC, Generic[T]):
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=temperature,
-                    max_tokens=max_tokens
+                    max_tokens=max_tokens,
+                    response_format=response_format
                 )
 
                 # 成功返回
@@ -352,6 +366,7 @@ class LangGraphAgent(ABC, Generic[T]):
         解析 LLM 返回的 JSON（工具方法）
         
         剥离 Markdown 代码块和前后文本，提取纯 JSON
+        支持修复截断的不完整 JSON
         
         Args:
             response: LLM 响应字符串
@@ -362,19 +377,94 @@ class LangGraphAgent(ABC, Generic[T]):
         Raises:
             JSONParseError: 解析失败
         """
-        try:
-            # 首先尝试提取 ```json ... ``` 或 ``` ... ``` 代码块中的内容
-            code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
-            match = re.search(code_block_pattern, response, re.DOTALL)
+        # 首先尝试提取 ```json ... ``` 或 ``` ... ``` 代码块中的内容
+        code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+        match = re.search(code_block_pattern, response, re.DOTALL)
+        if match:
+            json_str = match.group(1).strip()
+        else:
+            # 如果没有代码块，尝试查找 JSON 对象（以 { 开头，以 } 结尾）
+            json_pattern = r'\{[\s\S]*\}'
+            match = re.search(json_pattern, response)
             if match:
-                json_str = match.group(1).strip()
-                return json.loads(json_str)
-            
-            # 如果没有代码块，尝试直接解析整个响应（去除前后空白）
-            json_str = response.strip()
+                json_str = match.group(0).strip()
+            else:
+                # 最后尝试直接解析整个响应（去除前后空白）
+                json_str = response.strip()
+        
+        # 尝试解析 JSON
+        try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
+            # 【修复】尝试修复截断的 JSON
+            logger.warning(f"[{self.agent_name}] JSON 解析失败，尝试修复截断的 JSON: {e}")
+            fixed_json = self._try_fix_truncated_json(json_str)
+            if fixed_json:
+                try:
+                    result = json.loads(fixed_json)
+                    logger.info(f"[{self.agent_name}] 成功修复截断的 JSON")
+                    return result
+                except json.JSONDecodeError:
+                    pass  # 修复失败，继续抛出原始错误
+            
             raise JSONParseError(f"JSON 解析失败: {e}\n响应内容: {response[:500]}")
+    
+    def _try_fix_truncated_json(self, json_str: str) -> Optional[str]:
+        """
+        尝试修复截断的不完整 JSON
+        
+        策略：
+        1. 如果 JSON 以 { 开头但不以 } 结尾，尝试添加缺少的闭合符号
+        2. 如果字符串在引号内被截断，尝试关闭引号
+        
+        Args:
+            json_str: 可能截断的 JSON 字符串
+            
+        Returns:
+            Optional[str]: 修复后的 JSON 字符串，或 None 如果无法修复
+        """
+        if not json_str or not json_str.strip():
+            return None
+        
+        fixed = json_str.strip()
+        
+        # 统计各种符号的数量
+        open_braces = fixed.count('{') - fixed.count('}')
+        open_brackets = fixed.count('[') - fixed.count(']')
+        
+        # 检查是否在字符串内被截断（奇数个未闭合的引号）
+        # 简单统计不在转义序列中的引号
+        quote_count = 0
+        i = 0
+        while i < len(fixed):
+            if fixed[i] == '"' and (i == 0 or fixed[i-1] != '\\'):
+                quote_count += 1
+            i += 1
+        
+        # 如果在字符串内被截断，先关闭字符串
+        if quote_count % 2 == 1:
+            # 找到最后一个未闭合的引号位置
+            last_quote = fixed.rfind('"')
+            if last_quote > 0:
+                # 检查这个引号是否是键的开始（后面跟着 :）
+                after_quote = fixed[last_quote:].strip()
+                if ':' in after_quote[:10]:  # 如果在引号后不远处有冒号，可能是键
+                    # 这是一个键，需要补全 "key": "value" 结构
+                    fixed = fixed + '": ""'
+                else:
+                    # 这是一个值，只需要关闭引号
+                    fixed = fixed + '"'
+        
+        # 补全闭合的大括号和方括号
+        # 注意：需要先关闭内部的再关闭外部的
+        fixed = fixed + '}' * open_braces
+        fixed = fixed + ']' * open_brackets
+        
+        # 检查是否修复成功（至少要有匹配的括号）
+        if fixed.count('{') == fixed.count('}') and fixed.count('[') == fixed.count(']'):
+            return fixed
+        
+        return None
     
     async def execute(
         self,

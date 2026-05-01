@@ -15,7 +15,7 @@ langgraph==0.2.45
 langchain==0.3.7
 langchain-openai==0.2.6
 litellm==1.52.0
-openai==1.54.0
+openai
 
 # Utilities
 pydantic==2.9.2
@@ -36,3 +36,10 @@ pytest-asyncio==0.23.8
 # 注意：chromadb 和 sentence-transformers 需要 torch，在沙箱中按需安装
 # 如果需要 RAG 功能，可以在运行时单独安装
 ruff>=0.8.0
+instructor
+
+# Code parsing (for defense tests)
+tree-sitter==0.25.2
+tree-sitter-python==0.25.0
+tree_sitter_typescript==0.23.2
+tree_sitter_javascript==0.25.0

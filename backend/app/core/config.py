@@ -38,8 +38,9 @@ class Config(BaseSettings):
     # AI 模型配置
     # ============================================
 
-    # 模型选择开关
-    USE_MODELSCOPE: bool = True
+    # LLM Provider 选择
+    # 可选值: modelscope | openai | mimo
+    LLM_PROVIDER: str = "modelscope"
 
     # ModelScope (魔搭) 配置
     MODELSCOPE_API_KEY: Optional[str] = None
@@ -50,27 +51,43 @@ class Config(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_API_BASE: str = "https://api.openai.com/v1"
 
+    # MiMo (小米米墨) 配置
+    MIMO_API_KEY: Optional[str] = None
+    MIMO_API_BASE: str = "https://api.xiaomimimo.com/v1"
+    MIMO_DEFAULT_MODEL: str = "mimo-v2.5-pro"
+
     # ============================================
     # 计算属性
     # ============================================
 
     @property
     def llm_api_key(self) -> Optional[str]:
-        """根据 USE_MODELSCOPE 返回对应的 API Key"""
-        if self.USE_MODELSCOPE:
+        """根据 LLM_PROVIDER 返回对应的 API Key"""
+        provider = self.LLM_PROVIDER.lower()
+        if provider == "mimo":
+            return self.MIMO_API_KEY
+        elif provider == "openai":
+            return self.OPENAI_API_KEY
+        else:
             return self.MODELSCOPE_API_KEY
-        return self.OPENAI_API_KEY
 
     @property
     def llm_api_base(self) -> str:
-        """根据 USE_MODELSCOPE 返回对应的 API Base"""
-        if self.USE_MODELSCOPE:
+        """根据 LLM_PROVIDER 返回对应的 API Base"""
+        provider = self.LLM_PROVIDER.lower()
+        if provider == "mimo":
+            return self.MIMO_API_BASE
+        elif provider == "openai":
+            return self.OPENAI_API_BASE
+        else:
             return self.MODELSCOPE_API_BASE
-        return self.OPENAI_API_BASE
 
     @property
     def llm_model(self) -> str:
-        """返回使用的模型名称"""
+        """根据 LLM_PROVIDER 返回使用的模型名称"""
+        provider = self.LLM_PROVIDER.lower()
+        if provider == "mimo":
+            return self.MIMO_DEFAULT_MODEL
         return self.DEFAULT_MODEL
 
     # ============================================

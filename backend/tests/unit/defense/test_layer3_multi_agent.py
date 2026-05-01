@@ -169,7 +169,7 @@ class TestMaxRetriesLimitTerminatesLoop:
                     }
 
                     # 模拟 RepairerAgent 修复（但仍然失败）
-                    with patch('app.agents.repairer.RepairerAgent.execute_with_reread') as mock_repair:
+                    with patch('app.agents.repairer.RepairerAgent.execute_with_files') as mock_repair:
                         mock_repair.return_value = {
                             "success": True,
                             "output": {

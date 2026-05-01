@@ -406,13 +406,14 @@ class AgentCoordinatorService:
             # 推送开始日志
             await push_log(pipeline_id, "info", "开始技术设计...", stage="DESIGN")
 
-            # 调用 DesignerAgent
+            # 调用 DesignerAgent（使用 Instructor 结构化输出模式）
             agent_result = await designer_agent.design(
                 architect_output=architect_output_with_context,
                 file_tree=file_tree,
                 related_code_context=code_context.get("related_code_context"),
                 full_files_context=full_files_context,
-                pipeline_id=pipeline_id
+                pipeline_id=pipeline_id,
+                max_retries=3
             )
 
             await push_log(pipeline_id, "info", "技术设计完成，等待审批", stage="DESIGN")

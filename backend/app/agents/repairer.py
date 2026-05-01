@@ -1,10 +1,10 @@
 """
 RepairerAgent - 代码修复代理
-基于 ToolUsingAgent 实现，支持工具调用
+基于 LangGraphAgent 实现，不再使用工具调用
 
 职责：
 1. 接收结构化的修复工单
-2. 使用工具主动获取文件内容
+2. 直接基于提供的完整文件内容进行修复
 3. 严格执行精确修复，不得做任何多余的事
 4. 每个修复必须使用 search_block/replace_block 格式
 
@@ -19,19 +19,19 @@ import json
 import logging
 from typing import Dict, Any, Optional, List
 
-from app.agents.tool_agent import ToolUsingAgent
+from app.agents.base import LangGraphAgent
 from app.agents.schemas import CoderOutput
 from app.service.code_executor import CodeExecutorService
 
 logger = logging.getLogger(__name__)
 
 
-class RepairerAgent(ToolUsingAgent[CoderOutput]):
+class RepairerAgent(LangGraphAgent[CoderOutput]):
     """
     代码修复代理
 
-    接收结构化的修复工单，使用工具获取文件，严格执行精确修复。
-    继承 ToolUsingAgent，支持工具调用（glob/grep/read_file）。
+    接收结构化的修复工单和完整文件内容，直接执行精确修复。
+    继承 LangGraphAgent，不再使用工具调用。
     """
 
     def __init__(self):
@@ -44,11 +44,14 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 【核心铁律 - 利益隔离】
 1. 你只能修复工单中指出的具体错误，严禁添加任何新功能、重构无关代码、调整代码风格或简化测试逻辑。
 2. 每个修复必须使用 search_block 和 replace_block 格式，且 search_block 必须来自于你刚刚读取到的文件内容（严禁凭记忆编造）。
-3. 一次只能处理一个修复项，若工单有多个错误，需逐个生成修复块。
+3. 【全局视角】工单中可能有多个 errors，你必须统筹考虑所有错误，一次性生成所有修复块。
 4. 禁止引入新的第三方依赖，除非工单显式要求。
 5. 禁止删除或注释掉任何测试断言。
 6. 【绝对禁止】你没有任何测试工具的访问权限，严禁运行任何测试（pytest、unittest 等）。
-7. 【绝对禁止】你不得修改任何测试文件，只能修复被测代码。
+7. 【重要】你可以修改测试文件和被测试文件，根据错误根源决定修复目标。
+   - 如果被测代码逻辑错误 → 修复被测代码
+   - 如果测试文件本身有问题（如错误的 mock、错误的断言）→ 修复测试文件
+   - 如果两者都有问题 → 可以同时修复两者
 8. 你的职责仅是提交修复代码，验证工作由独立的 VerificationAgent 完成。
 
 【利益隔离说明】
@@ -60,12 +63,39 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 【错误解析】
 工单中会包含错误列表，每个错误有 file_path、line、summary、fix_hint 等字段。你必须基于 fix_hint 和代码上下文进行修正。
 
+【多错误统筹修复 - 关键改进】
+1. 【全局视角】不要逐个修复错误，而是先阅读所有错误，分析它们之间的关联关系。
+2. 【关联分析】多个错误可能由同一个根源引起：
+   - 如果多个错误都指向同一个函数返回值问题 → 一次性修复该函数
+   - 如果多个错误都是 KeyError 且键名相似 → 统一修正键名
+   - 如果多个测试都因为同一个 mock 问题失败 → 统一修复 mock
+3. 【批量修复】在 `files` 数组中为每个需要修改的文件提供一个修复块，即使这意味着要修改多个文件。
+4. 【避免连锁失败】修复时要考虑：修改 A 文件是否会影响到 B 文件的测试？如果是，确保你的修复能同时解决所有相关问题。
+
+【多文件修复能力】
+1. 你可以修改工单中列出的任何文件（generated_files 字段中的所有文件），而不仅仅是最初报错的那个。
+2. 如果工单指出某个函数返回了空结果或错误的键名，你需要追踪到该函数定义所在的文件并修复。
+
+【根源分析 - 极其重要】
+如果错误表现为某个文件返回了空结果或 KeyError，请执行根源分析：
+1. 错误可能是某个 API 端点返回空 → 追踪到该端点调用的 service 函数
+2. service 函数返回空 → 追踪到该函数内部的数据来源（如 system_monitor.py 中的检查函数）
+3. 找到真正的根源后，修复那个文件中的错误
+4. 不要只修复"调用方"的异常捕获，必须修复数据生产方的实际 bug
+
+例如：
+- 错误：health API 返回空的 components → 根源：system_monitor.py 中 check_disk 返回了不存在的字典键 'used_percent'（应为 'usage_percent'）
+- 修复目标：system_monitor.py，而不是 health.py
+
 【输出格式 - 极其重要】
 你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
 输出必须是一个有效的 JSON 对象，包含 files 数组。
 
 正确示例（直接输出 JSON）：
 {"files": [{"file_path": "backend/app/core/calculator.py", "change_type": "modify", "search_block": "def add(a, b):\n    return a - b", "replace_block": "def add(a, b):\n    return a + b", "description": "修复加法错误"}], "summary": "修复 calculator 加法错误"}
+
+多文件修复示例：
+{"files": [{"file_path": "backend/app/service/health.py", "change_type": "modify", "search_block": "return {'used_percent': 50}", "replace_block": "return {'usage_percent': 50}", "description": "修正键名 usage_percent"}, {"file_path": "backend/tests/test_health.py", "change_type": "modify", "search_block": "assert result['used'] == 50", "replace_block": "assert result['usage_percent'] == 50", "description": "同步更新测试断言"}], "summary": "统一修正 usage_percent 键名"}
 
 错误示例（不要这样输出）：
 - 不要添加 ```json 标记
@@ -77,6 +107,7 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 - 直接输出 JSON，不要有任何前缀或后缀
 - 确保 JSON 格式完整有效
 - 不要输出任何其他内容
+- 【重要】一次性修复所有错误，不要只修复一个就停止
 """
 
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
@@ -88,6 +119,14 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
         """
         fix_order = state.get("fix_order", {})
         target_files = state.get("target_files", {})
+
+        # 【DEBUG】记录输入状态
+        logger.info(f"[RepairerAgent] build_user_prompt 被调用")
+        logger.info(f"[RepairerAgent] fix_order 类型: {type(fix_order)}")
+        logger.info(f"[RepairerAgent] fix_order 内容: {json.dumps(fix_order, indent=2, ensure_ascii=False)[:500]}")
+        logger.info(f"[RepairerAgent] target_files 数量: {len(target_files)}")
+        for path in target_files.keys():
+            logger.info(f"[RepairerAgent] target_file: {path}")
 
         # 将权威目标文件（已重新读取）嵌入提示
         files_section = []
@@ -102,18 +141,40 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 
         files_str = "\n\n".join(files_section)
 
-        return f"""【修复工单（必须严格遵循）】
-{json.dumps(fix_order, indent=2, ensure_ascii=False)}
+        # 【简化】提取关键信息
+        failed_tests = fix_order.get("failed_tests", [])
+        error_logs = fix_order.get("error_logs", "")
+        missing_symbols = fix_order.get("missing_symbols", [])
+        fix_hint = fix_order.get("fix_hint", "")
 
-【目标文件（已最新内容，带行号）】
+        prompt = f"""【修复任务】
+以下测试运行失败，请分析错误日志并修复代码。
+
+【失败的测试】
+{chr(10).join(f"- {test}" for test in failed_tests) if failed_tests else "多个测试失败，详见错误日志"}
+
+【错误日志】
+```
+{error_logs}
+```
+
+【修复提示】
+{fix_hint}
+
+【目标文件（已有内容，带行号）】
 {files_str}
 
-请基于工单逐个修复错误。对于每个修复，提供精确的 search_block (从上方文件内容中复制) 和 replace_block。
-注意：
-1. search_block 必须与当前文件内容完全一致，包括缩进和空格
-2. 只修复工单中指出的错误，不要做其他修改
-3. 如果多个错误在同一文件，请分别提供修复块
+【修复要求】
+1. 仔细阅读错误日志，找出所有失败的原因
+2. 分析错误根源：API → Service → 数据源函数
+3. 提供精确的 search_block 和 replace_block 进行修复
+4. search_block 必须与当前文件内容完全一致，包括缩进和空格
+5. 一次性修复所有错误，不要只修复一个就停止
+6. 如果多个错误由同一个根源引起，修复根源即可
 """
+        # 【DEBUG】记录生成的 prompt 长度
+        logger.info(f"[RepairerAgent] 生成的 prompt 长度: {len(prompt)} 字符")
+        return prompt
 
     def parse_output(self, response: str) -> Dict[str, Any]:
         """解析 LLM 输出"""
@@ -138,205 +199,65 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 
         return CoderOutput(**output)
 
-    async def execute_with_reread(
+    async def execute_with_files(
         self,
         pipeline_id: int,
         stage_name: str,
         fix_order: Dict[str, Any],
+        target_files: Dict[str, str],
         project_path: Optional[str] = None,
         file_service: Optional[Any] = None,
         initial_state: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        执行修复（带强制重新读取）
+        执行修复（直接接收完整文件内容）
 
-        在调用 RepairerAgent 前，强制重新读取所有出错的文件，
-        确保 target_files 中的内容是磁盘上最新版本。
+        【改造】不再自己读取文件，而是直接接收 target_files 参数中的完整文件内容。
+        调用方需要确保提供所有相关文件的完整内容（包括 Coder 修改过的文件和 Tester 生成的文件）。
 
         Args:
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
             fix_order: 修复工单
-            project_path: 项目路径（本地模式使用）
-            file_service: SandboxFileService 实例（新架构，优先使用）
+            target_files: 完整文件内容字典 {file_path: content}
+            project_path: 项目路径（可选，用于日志记录）
+            file_service: SandboxFileService 实例（可选，用于写入修复）
             initial_state: 初始状态（可选）
 
         Returns:
             Dict[str, Any]: 执行结果
         """
-        logger.info(f"[Pipeline {pipeline_id}] RepairerAgent 开始执行（带强制重新读取）")
-
-        # 【新架构】优先使用 file_service（Sandbox 模式）
-        if file_service:
-            logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 读取文件")
-            return await self._execute_with_sandbox_service(
-                pipeline_id, stage_name, fix_order, file_service, initial_state
-            )
-
-        # 本地模式：使用 CodeExecutorService
-        if not project_path:
-            logger.error(f"[Pipeline {pipeline_id}] project_path 和 file_service 都未提供")
-            return {
-                "success": False,
-                "error": "project_path 或 file_service 必须提供一个"
-            }
-
-        # 1. 从 fix_order 中提取需要读取的文件
-        files_to_read = set()
-        for err in fix_order.get("errors", []):
-            file_path = err.get("file_path")
-            if file_path:
-                # 移除 backend/ 前缀
-                clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-                files_to_read.add(clean_path)
-
-        logger.info(f"[Pipeline {pipeline_id}] 需要重新读取 {len(files_to_read)} 个文件")
-
-        # 2. 强制重新读取所有文件
-        code_executor = CodeExecutorService(project_path)
-        target_files = {}
-        read_tokens = {}  # 记录 read_token 用于后续写入
-
-        for clean_path in files_to_read:
-            logger.info(f"[Pipeline {pipeline_id}] 正在读取文件: {clean_path}")
-            read_result = code_executor.read_file(clean_path)
-            logger.info(f"[Pipeline {pipeline_id}] 读取结果: exists={read_result.exists}, content_len={len(read_result.content) if read_result.content else 0}")
-            if read_result.exists and read_result.content is not None:
-                # 存储完整路径（带 backend/ 前缀）
-                full_path = f"backend/{clean_path}"
-                target_files[full_path] = read_result.content
-                read_tokens[full_path] = read_result.read_token
-                logger.info(f"[Pipeline {pipeline_id}] 成功读取: {full_path} ({len(read_result.content)} 字符)")
-            else:
-                logger.warning(f"[Pipeline {pipeline_id}] 无法读取文件: {clean_path}, exists={read_result.exists}, error={read_result.error}")
-                # 【调试】尝试列出目录内容
-                try:
-                    import os
-                    dir_path = os.path.dirname(os.path.join(project_path, clean_path))
-                    if os.path.exists(dir_path):
-                        files = os.listdir(dir_path)
-                        logger.info(f"[Pipeline {pipeline_id}] 目录 {dir_path} 内容: {files}")
-                    else:
-                        logger.warning(f"[Pipeline {pipeline_id}] 目录不存在: {dir_path}")
-                except Exception as e:
-                    logger.error(f"[Pipeline {pipeline_id}] 列出目录失败: {e}")
+        logger.info(f"[Pipeline {pipeline_id}] RepairerAgent 开始执行（直接接收文件内容）")
+        logger.info(f"[Pipeline {pipeline_id}] 接收到 {len(target_files)} 个文件的完整内容")
 
         if not target_files:
-            logger.error(f"[Pipeline {pipeline_id}] 没有成功读取任何文件")
+            logger.error(f"[Pipeline {pipeline_id}] 没有接收到任何文件内容")
             return {
                 "success": False,
-                "error": "无法读取任何目标文件",
+                "error": "没有接收到任何文件内容，请确保传入 target_files 参数",
                 "output": None
             }
 
-        logger.info(f"[Pipeline {pipeline_id}] 成功读取 {len(target_files)} 个文件")
+        for path, content in target_files.items():
+            logger.info(f"[Pipeline {pipeline_id}] 文件: {path} ({len(content)} 字符)")
 
-        # 3. 构建状态
+        # 构建状态
         state = initial_state or {}
         state.update({
             "fix_order": fix_order,
             "target_files": target_files,
-            "read_tokens": read_tokens  # 传递给后续写入步骤
-        })
-
-        # 4. 调用父类的 execute 方法
-        result = await self.execute(
-            pipeline_id=pipeline_id,
-            stage_name=stage_name,
-            initial_state=state
-        )
-
-        # 5. 将 read_tokens 附加到输出中（供后续写入使用）
-        if result.get("success") and result.get("output"):
-            output = result["output"]
-            if isinstance(output, dict) and "files" in output:
-                for file_obj in output["files"]:
-                    file_path = file_obj.get("file_path", "")
-                    if file_path in read_tokens:
-                        file_obj["read_token"] = read_tokens[file_path]
-
-        return result
-
-    async def _execute_with_sandbox_service(
-        self,
-        pipeline_id: int,
-        stage_name: str,
-        fix_order: Dict[str, Any],
-        file_service: Any,
-        initial_state: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        使用 SandboxFileService 执行修复
-
-        Args:
-            pipeline_id: Pipeline ID
-            stage_name: 阶段名称
-            fix_order: 修复工单
-            file_service: SandboxFileService 实例
-            initial_state: 初始状态
-
-        Returns:
-            Dict[str, Any]: 执行结果
-        """
-        logger.info(f"[Pipeline {pipeline_id}] 使用 SandboxFileService 执行修复")
-
-        # 1. 从 fix_order 中提取需要读取的文件
-        files_to_read = set()
-        for err in fix_order.get("errors", []):
-            file_path = err.get("file_path")
-            if file_path:
-                # 移除 backend/ 前缀
-                clean_path = file_path.replace("backend/", "").replace("backend\\", "")
-                files_to_read.add(clean_path)
-
-        logger.info(f"[Pipeline {pipeline_id}] 需要从 Sandbox 读取 {len(files_to_read)} 个文件")
-
-        # 2. 使用 SandboxFileService 读取文件
-        target_files = {}
-        read_tokens = {}
-
-        for clean_path in files_to_read:
-            logger.info(f"[Pipeline {pipeline_id}] 正在从 Sandbox 读取: {clean_path}")
-            read_result = await file_service.read_file(clean_path)
-            logger.info(f"[Pipeline {pipeline_id}] Sandbox 读取结果: exists={read_result.exists}")
-
-            if read_result.exists and read_result.content is not None:
-                # 存储完整路径（带 backend/ 前缀）
-                full_path = f"backend/{clean_path}"
-                target_files[full_path] = read_result.content
-                read_tokens[full_path] = read_result.read_token
-                logger.info(f"[Pipeline {pipeline_id}] 成功从 Sandbox 读取: {full_path} ({len(read_result.content)} 字符)")
-            else:
-                logger.warning(f"[Pipeline {pipeline_id}] 无法从 Sandbox 读取: {clean_path}, error={read_result.error}")
-
-        if not target_files:
-            logger.error(f"[Pipeline {pipeline_id}] 没有成功读取任何文件")
-            return {
-                "success": False,
-                "error": "无法读取任何目标文件",
-                "output": None
-            }
-
-        logger.info(f"[Pipeline {pipeline_id}] 成功从 Sandbox 读取 {len(target_files)} 个文件")
-
-        # 3. 构建状态
-        state = initial_state or {}
-        state.update({
-            "fix_order": fix_order,
-            "target_files": target_files,
-            "read_tokens": read_tokens,
             "file_service": file_service  # 传递给后续步骤用于写入
         })
 
-        # 4. 调用父类的 execute 方法
+        # 调用父类的 execute 方法（LangGraphAgent，不使用工具）
         result = await self.execute(
             pipeline_id=pipeline_id,
             stage_name=stage_name,
             initial_state=state
         )
 
-        # 5. 如果修复成功，将修改写回 Sandbox
-        if result.get("success") and result.get("output"):
+        # 如果提供了 file_service 且修复成功，将修改写回 Sandbox
+        if file_service and result.get("success") and result.get("output"):
             output = result["output"]
             if isinstance(output, dict) and "files" in output:
                 for file_obj in output["files"]:
@@ -365,7 +286,7 @@ class RepairerAgent(ToolUsingAgent[CoderOutput]):
 # 便捷函数
 async def repair_code(
     fix_order: Dict[str, Any],
-    project_path: Optional[str] = None,
+    target_files: Dict[str, str],
     file_service: Optional[Any] = None,
     pipeline_id: int = 0
 ) -> Dict[str, Any]:
@@ -374,18 +295,25 @@ async def repair_code(
 
     Args:
         fix_order: 修复工单
-        project_path: 项目路径（本地模式）
-        file_service: SandboxFileService 实例（新架构）
+        target_files: 完整文件内容字典（必须传入）
+        file_service: SandboxFileService 实例（可选，用于写入修复）
         pipeline_id: Pipeline ID
 
     Returns:
         Dict[str, Any]: 修复结果
     """
     agent = RepairerAgent()
-    return await agent.execute_with_reread(
+
+    if not target_files:
+        return {
+            "success": False,
+            "error": "必须提供 target_files 参数"
+        }
+
+    return await agent.execute_with_files(
         pipeline_id=pipeline_id,
         stage_name="REPAIR",
         fix_order=fix_order,
-        project_path=project_path,
+        target_files=target_files,
         file_service=file_service
     )

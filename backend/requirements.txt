@@ -15,6 +15,7 @@ langgraph==0.2.45
 langchain==0.3.7
 langchain-openai==0.2.6
 litellm==1.52.0
+instructor==1.7.0  # 结构化输出约束
 
 # Utilities
 pydantic==2.9.2
