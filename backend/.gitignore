@@ -1,0 +1,4 @@
+.omniflow_index/
+__pycache__/
+*.pyc
+.env

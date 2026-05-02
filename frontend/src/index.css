@@ -1,0 +1,625 @@
+@import "tailwindcss";
+
+/* ============================================
+   OmniFlowAI - 飞书风格设计系统 (Tailwind v4)
+   ============================================ */
+
+@theme {
+  /* ---------- 品牌色彩系统 ---------- */
+  /* 主色 */
+  --color-brand-primary: #3370FF;
+  --color-brand-primary-hover: #2860EE;
+  --color-brand-primary-light: #E8F0FF;
+  
+  /* 背景色 */
+  --color-bg-primary: #FFFFFF;
+  --color-bg-secondary: #F5F6F7;
+  --color-bg-tertiary: #EFF0F1;
+  
+  /* 文字色 */
+  --color-text-primary: #1F2329;
+  --color-text-secondary: #646A73;
+  --color-text-tertiary: #8F959E;
+  --color-text-white: #FFFFFF;
+  
+  /* 边框色 */
+  --color-border-default: #DEE0E3;
+  --color-border-light: #E8E9EB;
+  --color-border-card: #E0E4EA;
+  
+  /* Hero 深色渐变 */
+  --color-hero-dark-1: #1A1C21;
+  --color-hero-dark-2: #0D1533;
+  --color-hero-dark-3: #0A1E4A;
+  
+  /* 状态色 */
+  --color-status-success: #00B42A;
+  --color-status-warning: #FF7D00;
+  --color-status-error: #F53F3F;
+  --color-status-running: #3370FF;
+  --color-status-pending: #8F959E;
+  
+  /* ---------- 圆角系统 ---------- */
+  --radius-feishu: 6px;
+  --radius-feishu-sm: 4px;
+  --radius-feishu-md: 8px;
+  --radius-feishu-lg: 12px;
+  --radius-feishu-xl: 16px;
+  --radius-feishu-full: 9999px;
+  
+  /* ---------- 阴影系统 ---------- */
+  --shadow-feishu: 0 4px 12px rgba(31, 35, 41, 0.08);
+  --shadow-feishu-hover: 0 8px 24px rgba(31, 35, 41, 0.12);
+  --shadow-feishu-card: 0 2px 8px rgba(31, 35, 41, 0.06);
+  --shadow-feishu-button: 0 4px 12px rgba(51, 112, 255, 0.25);
+  
+  /* ---------- 字体系统 ---------- */
+  --font-sans: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-display: "DM Sans", "PingFang SC", sans-serif;
+  
+  /* ---------- 动画 ---------- */
+  --animate-fade-in-up: fade-in-up 400ms ease-out forwards;
+  --animate-pulse-flow: pulse-flow 1.5s ease-in-out infinite;
+  --animate-spin-slow: spin 3s linear infinite;
+}
+
+/* ============================================
+   基础样式层
+   ============================================ */
+@layer base {
+  * {
+    border-color: var(--color-border-default);
+  }
+  
+  html {
+    scroll-behavior: smooth;
+  }
+  
+  body {
+    background-color: var(--color-bg-secondary);
+    color: var(--color-text-primary);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  
+  /* 选中文字样式 */
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-brand-primary) 20%, transparent);
+    color: var(--color-text-primary);
+  }
+}
+
+/* ============================================
+   组件样式层
+   ============================================ */
+@layer components {
+  /* ---------- 按钮 ---------- */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.625rem 1.5rem;
+    background-color: var(--color-brand-primary);
+    color: var(--color-text-white);
+    font-weight: 500;
+    border-radius: var(--radius-feishu-md);
+    transition: all 250ms;
+  }
+  
+  .btn-primary:hover {
+    background-color: var(--color-brand-primary-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-feishu-button);
+  }
+  
+  .btn-primary:active {
+    transform: translateY(0);
+    box-shadow: none;
+  }
+  
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: translateY(0);
+  }
+  
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.625rem 1.5rem;
+    background-color: transparent;
+    border: 1px solid var(--color-brand-primary);
+    color: var(--color-brand-primary);
+    font-weight: 500;
+    border-radius: var(--radius-feishu-md);
+    transition: all 250ms;
+  }
+  
+  .btn-secondary:hover {
+    background-color: var(--color-brand-primary-light);
+    transform: translateY(-2px);
+  }
+  
+  .btn-secondary:active {
+    transform: translateY(0);
+  }
+  
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.5rem 1rem;
+    background-color: transparent;
+    color: var(--color-text-secondary);
+    font-weight: 500;
+    border-radius: var(--radius-feishu);
+    transition: all 250ms;
+  }
+  
+  .btn-ghost:hover {
+    background-color: var(--color-bg-tertiary);
+    color: var(--color-text-primary);
+  }
+  
+  /* ---------- 卡片 ---------- */
+  .card-feishu {
+    background-color: var(--color-bg-primary);
+    border: 1px solid var(--color-border-card);
+    border-radius: var(--radius-feishu-lg);
+    transition: all 250ms;
+    box-shadow: var(--shadow-feishu-card);
+  }
+  
+  .card-feishu:hover {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-feishu);
+  }
+  
+  .card-flat {
+    background-color: var(--color-bg-primary);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-feishu-md);
+    transition: all 250ms;
+  }
+  
+  .card-flat:hover {
+    border-color: color-mix(in srgb, var(--color-brand-primary) 30%, transparent);
+    box-shadow: var(--shadow-feishu-card);
+  }
+  
+  /* ---------- 输入框 ---------- */
+  .input-feishu {
+    width: 100%;
+    padding: 0.75rem 1rem;
+    background-color: var(--color-bg-primary);
+    border: 1px solid var(--color-border-default);
+    border-radius: var(--radius-feishu);
+    color: var(--color-text-primary);
+    transition: all 200ms;
+    box-shadow: var(--shadow-feishu-card);
+  }
+  
+  .input-feishu::placeholder {
+    color: var(--color-text-tertiary);
+  }
+  
+  .input-feishu:hover {
+    border-color: var(--color-border-light);
+  }
+  
+  .input-feishu:focus {
+    outline: none;
+    border-color: var(--color-brand-primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-brand-primary) 20%, transparent);
+  }
+  
+  /* ---------- 导航栏 ---------- */
+  .navbar-glass {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 4rem;
+    z-index: 50;
+    background-color: color-mix(in srgb, var(--color-bg-primary) 80%, transparent);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border-default) 50%, transparent);
+    transition: all 300ms;
+  }
+  
+  .navbar-scrolled {
+    box-shadow: var(--shadow-feishu-card);
+  }
+  
+  /* ---------- 侧边栏 ---------- */
+  .sidebar-feishu {
+    width: 16rem;
+    height: 100%;
+    background-color: var(--color-bg-primary);
+    border-right: 1px solid var(--color-border-default);
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    margin: 0 0.5rem;
+    border-radius: var(--radius-feishu);
+    color: var(--color-text-secondary);
+    transition: all 200ms;
+  }
+  
+  .sidebar-item:hover {
+    background-color: var(--color-bg-secondary);
+    color: var(--color-text-primary);
+  }
+  
+  .sidebar-item-active {
+    background-color: var(--color-brand-primary-light);
+    color: var(--color-brand-primary);
+    font-weight: 500;
+  }
+  
+  /* ---------- 图标容器 ---------- */
+  .icon-box {
+    width: 3rem;
+    height: 3rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--color-brand-primary-light);
+    border-radius: var(--radius-feishu-lg);
+    color: var(--color-brand-primary);
+  }
+  
+  /* ---------- 标签 ---------- */
+  .tag-feishu {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.125rem 0.625rem;
+    border-radius: var(--radius-feishu-sm);
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+  
+  .tag-running {
+    background-color: var(--color-brand-primary-light);
+    color: var(--color-brand-primary);
+  }
+  
+  .tag-success {
+    background-color: color-mix(in srgb, var(--color-status-success) 10%, transparent);
+    color: var(--color-status-success);
+  }
+  
+  .tag-error {
+    background-color: color-mix(in srgb, var(--color-status-error) 10%, transparent);
+    color: var(--color-status-error);
+  }
+  
+  .tag-pending {
+    background-color: var(--color-bg-tertiary);
+    color: var(--color-text-tertiary);
+  }
+  
+  /* ---------- 容器 ---------- */
+  .container-feishu {
+    max-width: 1200px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 2.5rem;
+    padding-right: 2.5rem;
+  }
+  
+  /* ---------- 区块 ---------- */
+  .section-feishu {
+    padding-top: 6rem;
+    padding-bottom: 6rem;
+  }
+  
+  .section-alt {
+    background-color: var(--color-bg-secondary);
+  }
+}
+
+/* ============================================
+   工具样式层
+   ============================================ */
+@layer utilities {
+  /* ---------- 文字渐变 ---------- */
+  .text-gradient-hero {
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    background-image: linear-gradient(135deg, #FFFFFF 0%, #A8B4FF 100%);
+  }
+  
+  .text-gradient-brand {
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    background-image: linear-gradient(135deg, #3370FF 0%, #00B4FF 100%);
+  }
+  
+  /* ---------- 背景渐变 ---------- */
+  .bg-gradient-hero {
+    background: linear-gradient(135deg, #1A1C21 0%, #0D1533 50%, #0A1E4A 100%);
+  }
+  
+  .bg-gradient-cta {
+    background: linear-gradient(135deg, #3370FF 0%, #2860EE 100%);
+  }
+  
+  /* ---------- 滚动动画 ---------- */
+  .animate-on-scroll {
+    opacity: 0;
+    transform: translateY(1.5rem);
+  }
+  
+  .animate-on-scroll.visible {
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity 400ms ease-out, transform 400ms ease-out;
+  }
+  
+  /* ---------- 流光动效 ---------- */
+  .flow-line {
+    position: relative;
+    overflow: hidden;
+  }
+  
+  .flow-line::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(51, 112, 255, 0.6), transparent);
+    animation: flow-animation 1.5s ease-in-out infinite;
+  }
+  
+  /* ---------- 隐藏滚动条 ---------- */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* ============================================
+   关键帧动画
+   ============================================ */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse-flow {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes flow-animation {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* ============================================
+   React Flow 自定义样式
+   ============================================ */
+.react-flow__edge-path {
+  stroke-width: 2;
+  stroke: var(--color-border-default);
+}
+
+.react-flow__edge.running .react-flow__edge-path {
+  stroke: var(--color-brand-primary);
+  stroke-dasharray: 8 4;
+  animation: flow-dash 1s linear infinite;
+}
+
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.react-flow__node {
+  border-radius: var(--radius-feishu-lg);
+  border: 1px solid var(--color-border-card);
+  background-color: var(--color-bg-primary);
+  box-shadow: var(--shadow-feishu-card);
+  transition: all 250ms;
+}
+
+.react-flow__node:hover {
+  box-shadow: var(--shadow-feishu);
+  transform: translateY(-2px);
+}
+
+.react-flow__handle {
+  width: 0.75rem;
+  height: 0.75rem;
+  background-color: var(--color-brand-primary);
+  border: 2px solid var(--color-bg-primary);
+}
+
+/* ============================================
+   Pipeline 节点执行中动画（重构版）
+   ============================================ */
+
+/* 1. 边框流光动画 - 优雅的呼吸效果 */
+.node-running-glow {
+  position: relative;
+  border-color: var(--color-brand-primary) !important;
+  box-shadow: 
+    0 0 0 1px var(--color-brand-primary),
+    0 0 20px color-mix(in srgb, var(--color-brand-primary) 30%, transparent),
+    0 0 40px color-mix(in srgb, var(--color-brand-primary) 15%, transparent) !important;
+  animation: node-glow-pulse 2s ease-in-out infinite;
+}
+
+@keyframes node-glow-pulse {
+  0%, 100% {
+    box-shadow: 
+      0 0 0 1px var(--color-brand-primary),
+      0 0 20px color-mix(in srgb, var(--color-brand-primary) 30%, transparent),
+      0 0 40px color-mix(in srgb, var(--color-brand-primary) 15%, transparent);
+  }
+  50% {
+    box-shadow: 
+      0 0 0 2px var(--color-brand-primary),
+      0 0 30px color-mix(in srgb, var(--color-brand-primary) 50%, transparent),
+      0 0 60px color-mix(in srgb, var(--color-brand-primary) 25%, transparent);
+  }
+}
+
+/* 2. 边框流动光效 - 沿边框旋转的光点 */
+.node-running-border-flow {
+  position: relative;
+  overflow: hidden;
+}
+
+.node-running-border-flow::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    var(--color-brand-primary) 60deg,
+    transparent 120deg,
+    transparent 240deg,
+    var(--color-brand-primary) 300deg,
+    transparent 360deg
+  );
+  -webkit-mask: 
+    linear-gradient(#fff 0 0) content-box, 
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: border-flow-rotate 2s linear infinite;
+  opacity: 0.8;
+}
+
+@keyframes border-flow-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 3. 状态指示器脉冲 - 右下角小圆点 */
+.node-status-indicator {
+  position: absolute;
+  bottom: -4px;
+  right: -4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: var(--color-brand-primary);
+  border: 2px solid var(--color-bg-primary);
+}
+
+.node-status-indicator.running {
+  animation: status-blink 1.5s ease-in-out infinite;
+}
+
+.node-status-indicator.pending {
+  background-color: var(--color-text-tertiary);
+}
+
+.node-status-indicator.completed {
+  background-color: var(--color-status-success);
+}
+
+.node-status-indicator.failed {
+  background-color: var(--color-status-error);
+}
+
+@keyframes status-blink {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.85);
+  }
+}
+
+/* 4. 图标微动效 - 执行中时的微妙波动 */
+.node-icon-running {
+  animation: icon-subtle-bounce 1.5s ease-in-out infinite;
+}
+
+@keyframes icon-subtle-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-2px);
+  }
+}
+
+/* 5. 进度条动画 - 底部流动条 */
+.node-progress-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background-color: var(--color-brand-primary-light);
+  border-radius: 0 0 var(--radius-feishu-lg) var(--radius-feishu-lg);
+  overflow: hidden;
+}
+
+.node-progress-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-brand-primary),
+    transparent
+  );
+  animation: progress-flow 1.5s ease-in-out infinite;
+}
+
+@keyframes progress-flow {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}
