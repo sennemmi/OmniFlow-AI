@@ -72,6 +72,32 @@ class PipelineManager {
   }
 
   /**
+   * 核心算法：在前端执行搜索替换
+   * 模拟后端的 SearchReplaceEngine
+   */
+  private applySearchReplace(original: string, search: string | undefined, replace: string | undefined): string | null {
+    if (!search || !replace) return null;
+
+    // 1. 尝试精确匹配
+    if (original.includes(search)) {
+      return original.replace(search, replace);
+    }
+
+    // 2. 尝试规范化换行符后匹配
+    const normOriginal = original.replace(/\r\n/g, '\n');
+    const normSearch = search.replace(/\r\n/g, '\n');
+    const normReplace = replace.replace(/\r\n/g, '\n');
+
+    if (normOriginal.includes(normSearch)) {
+      return normOriginal.replace(normSearch, normReplace);
+    }
+
+    // 3. 如果都匹配失败，回退到全量 (后端生成的 new_content)
+    console.warn('[OmniFlowAI] Search block 匹配失败，回退到全量内容');
+    return null;
+  }
+
+  /**
    * 轻量级快速修改 - 带 AI 效果预览
    */
   private async handleQuickModify(elementInfo: ElementInfo, feedback: string): Promise<void> {
@@ -117,12 +143,19 @@ class PipelineManager {
         throw new Error(result.error || 'AI 生成失败');
       }
 
-      const modifiedContent = result.data.new_content;
+      // 步骤3: 执行搜索替换
+      const { search_block, replace_block, new_content } = result.data;
+      let finalContent = this.applySearchReplace(originalContent, search_block, replace_block);
 
-      // 步骤3: 直接写入修改后的文件（触发 Vite HMR）
-      await api.writeFile(filePath, modifiedContent);
+      // 如果搜索替换成功，使用它；否则使用后端提供的全量内容
+      if (!finalContent) {
+        finalContent = new_content;
+      }
 
-      // 步骤4: 显示预览控制浮层
+      // 步骤4: 直接写入修改后的文件（触发 Vite HMR）
+      await api.writeFile(filePath, finalContent);
+
+      // 步骤5: 显示预览控制浮层
       bus.emit('ui:preview-controls:show', { filePath, originalContent });
       bus.emit('ui:toast', { message: '预览模式已开启 - Vite 热更新已应用变更', type: 'success' });
 

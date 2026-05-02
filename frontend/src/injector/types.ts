@@ -109,7 +109,9 @@ export interface FileContentResponse {
 export interface ModifyResponse {
   success: boolean;
   data?: {
-    new_content: string;
+    new_content: string; // 保留作为回退
+    search_block?: string;  // 待搜索的原始代码块
+    replace_block?: string; // 替换后的新代码块
     diff: string;
   };
   error?: string;

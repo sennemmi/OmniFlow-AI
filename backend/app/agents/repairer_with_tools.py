@@ -128,20 +128,96 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
 3. 基于新的错误日志继续修复
 4. 最多3轮，如果仍未通过会返回当前进度
 
+【修复范围】
+你可以修改以下两类文件：
+1. 被测代码（app/）：修复业务逻辑错误
+2. 测试代码（tests/ai_generated/）：修复测试本身的错误，例如：
+   - async 函数调用缺少 await
+   - 断言值与契约不符
+   - mock patch 路径错误
+
+【判断修哪边的规则】
+- `argument of type 'coroutine' is not iterable` → 测试代码缺少 await，改测试文件
+- `AttributeError: module has no attribute xxx` → mock patch 路径错误，改测试文件
+- `AssertionError: assert A == B` → 先看 interface_specs 契约
+  - 如果测试断言符合契约 → 改被测代码
+  - 如果测试断言违反契约 → 改测试文件
+- 测试文件导入错误 → 改测试文件
+- 被测代码导入错误 → 改被测代码
+
 【重要提示】
 - 每次只修复明确的问题
 - 保留完整的 search_block 和 replace_block
 - 如果多轮修复后仍有问题，如实报告
 - 不要编造测试结果
+- **测试代码和被测代码都可以修改，不要局限于只改被测代码**
 """
+
+    def _extract_error_summary(self, logs: str) -> str:
+        """从测试日志中提取错误摘要"""
+        import re
+
+        summary_parts = []
+
+        # 提取错误类型统计
+        error_patterns = {
+            "AssertionError": r"AssertionError:\s*(.+?)(?:\n|$)",
+            "ImportError": r"ImportError:\s*(.+?)(?:\n|$)",
+            "ModuleNotFoundError": r"ModuleNotFoundError:\s*(.+?)(?:\n|$)",
+            "TypeError": r"TypeError:\s*(.+?)(?:\n|$)",
+            "AttributeError": r"AttributeError:\s*(.+?)(?:\n|$)",
+            "NameError": r"NameError:\s*(.+?)(?:\n|$)",
+            "SyntaxError": r"SyntaxError:\s*(.+?)(?:\n|$)",
+        }
+
+        error_counts = {}
+        for error_type, pattern in error_patterns.items():
+            matches = re.findall(pattern, logs, re.MULTILINE)
+            if matches:
+                error_counts[error_type] = len(matches)
+
+        if error_counts:
+            summary_parts.append("错误类型统计:")
+            for error_type, count in error_counts.items():
+                summary_parts.append(f"  - {error_type}: {count} 个")
+
+        # 提取失败测试名称（前5个）
+        failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+        if failed_tests:
+            summary_parts.append(f"\n失败测试列表 (前5个):")
+            for i, test in enumerate(failed_tests[:5], 1):
+                summary_parts.append(f"  {i}. {test}")
+            if len(failed_tests) > 5:
+                summary_parts.append(f"  ... 还有 {len(failed_tests) - 5} 个失败测试")
+
+        # 提取具体的错误详情（每个错误类型的前1个示例）
+        summary_parts.append(f"\n错误详情示例:")
+        for error_type, pattern in error_patterns.items():
+            matches = re.findall(pattern, logs, re.MULTILINE)
+            if matches:
+                summary_parts.append(f"\n[{error_type}]:")
+                error_msg = matches[0].strip()[:150]
+                summary_parts.append(f"  {error_msg}...")
+
+        # 提取 short test summary info
+        summary_match = re.search(r'={10,}\s*short test summary info\s*={10,}(.*?)(?:={10,}|$)', logs, re.DOTALL)
+        if summary_match:
+            summary_parts.append(f"\n测试摘要:")
+            summary_lines = summary_match.group(1).strip().split('\n')
+            for line in summary_lines[:3]:  # 显示前3行
+                line = line.strip()
+                if line:
+                    summary_parts.append(f"  {line}")
+
+        return "\n".join(summary_parts)
 
     async def run_tests_tool(self, test_path: str = "backend/tests/ai_generated") -> Dict[str, Any]:
         """
         运行测试工具
-        
+
         Args:
             test_path: 测试路径，默认为新生成的测试目录
-            
+
         Returns:
             Dict: 测试结果
         """
@@ -152,11 +228,11 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                 "logs": "",
                 "failed_tests": []
             }
-        
+
         pipeline_id = self.state.pipeline_id
-        
+
         logger.info(f"[RepairerAgent] 运行测试: {test_path}")
-        
+
         try:
             # 在沙箱中运行测试
             exec_result = await sandbox_manager.exec(
@@ -164,31 +240,43 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                 f"cd /workspace && PYTHONPATH=/workspace/backend python -m pytest {test_path} -v --tb=short --color=no 2>&1",
                 timeout=120
             )
-            
+
             logs = exec_result.stdout + "\n" + exec_result.stderr
             success = exec_result.exit_code == 0
-            
+
             # 提取失败的测试
             import re
             failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
-            
+
+            # 提取错误摘要
+            error_summary = ""
+            if not success and failed_tests:
+                error_summary = self._extract_error_summary(logs)
+                # 打印到控制台
+                print(f"\n[RepairerAgent] 测试失败摘要:")
+                print("-" * 60)
+                print(error_summary)
+                print("-" * 60)
+
             logger.info(f"[RepairerAgent] 测试结果: success={success}, failed={len(failed_tests)}")
-            
+
             return {
                 "success": success,
                 "exit_code": exec_result.exit_code,
                 "logs": logs[:2000],  # 限制日志长度
                 "failed_tests": failed_tests,
-                "error": None if success else f"{len(failed_tests)} 个测试失败"
+                "error": None if success else f"{len(failed_tests)} 个测试失败",
+                "error_summary": error_summary  # 新增错误摘要
             }
-            
+
         except Exception as e:
             logger.error(f"[RepairerAgent] 运行测试失败: {e}")
             return {
                 "success": False,
                 "error": str(e),
                 "logs": str(e),
-                "failed_tests": []
+                "failed_tests": [],
+                "error_summary": ""
             }
 
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
@@ -305,63 +393,128 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
         )
         
         all_files_modified = []
-        
+
+        # 【修复3】记录上一轮写入的文件内容哈希，用于检测死循环
+        last_written_hashes = {}
+        stagnation_count = 0  # 停滞计数器
+
         for round_num in range(max_rounds):
             logger.info(f"[RepairerAgent] 开始第 {round_num + 1}/{max_rounds} 轮修复")
-            
+
+            # 【修复】每轮循环开始前，重新从沙箱读取所有目标文件的最新内容
+            # 避免 search_block 基于旧快照生成导致匹配失败
+            if round_num > 0 and file_service:
+                refreshed_count = 0
+                for file_path in list(target_files.keys()):
+                    try:
+                        read_res = await file_service.read_file(file_path)
+                        if read_res.exists and read_res.content:
+                            target_files[file_path] = read_res.content
+                            refreshed_count += 1
+                    except Exception as e:
+                        logger.warning(f"[RepairerAgent] 刷新文件失败 {file_path}: {e}")
+                if refreshed_count > 0:
+                    logger.info(f"[RepairerAgent] 已刷新 {refreshed_count} 个文件的最新内容")
+
             # 构建状态
             state = {
                 "fix_order": fix_order,
                 "target_files": target_files,
                 "repairer_state": self.state
             }
-            
+
+            # 【修复3】如果检测到停滞，注入提示信息
+            if stagnation_count >= 1:
+                print(f"\n[RepairerAgent] 检测到修改停滞，强制切换修复策略...")
+                fix_order["fix_hint"] = (
+                    "【重要】上一轮修改无效，文件内容未发生变化。\n"
+                    "请换一个方向：\n"
+                    "1. 如果之前改的是被测代码，这轮尝试修改测试文件\n"
+                    "2. 检查是否是 async/await 问题（测试缺 await）\n"
+                    "3. 检查断言值是否与 interface_specs 契约一致\n"
+                    "4. 尝试修改 mock 配置或 patch 路径"
+                )
+
             # 执行修复
             result = await self.execute(
                 pipeline_id=pipeline_id,
                 stage_name=stage_name,
                 initial_state=state
             )
-            
+
             if not result.get("success"):
                 logger.error(f"[RepairerAgent] 第 {round_num + 1} 轮修复失败")
                 return result
-            
+
             output = result.get("output", {})
             files_modified = output.get("files", [])
             all_files_modified.extend(files_modified)
-            
-            # 写入修复到沙箱
+
+            # 写入修复到沙箱，并检测文件内容是否变化
+            current_written_hashes = {}
+            files_actually_changed = False
+
             if file_service and files_modified:
                 for file_obj in files_modified:
                     file_path = file_obj.get("file_path", "")
                     search_block = file_obj.get("search_block", "")
                     replace_block = file_obj.get("replace_block", "")
-                    
+                    # 【修复】获取完整内容（用于降级策略）
+                    full_content = file_obj.get("content", "")
+
                     if search_block and replace_block:
                         clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
                         current_result = await file_service.read_file(clean_path)
-                        
+
                         if current_result.exists and current_result.content:
+                            # 计算文件内容哈希
+                            import hashlib
+                            old_hash = hashlib.md5(current_result.content.encode()).hexdigest()
                             new_content = current_result.content.replace(search_block, replace_block, 1)
-                            await file_service.write_file(clean_path, new_content)
-            
+                            new_hash = hashlib.md5(new_content.encode()).hexdigest()
+
+                            current_written_hashes[clean_path] = new_hash
+
+                            # 检查文件是否实际发生变化
+                            if old_hash != new_hash:
+                                files_actually_changed = True
+                                await file_service.write_file(clean_path, new_content)
+                                print(f"[RepairerAgent] 已修改: {clean_path}")
+                            else:
+                                print(f"[RepairerAgent] 警告: {clean_path} 内容未变化（search_block 可能不匹配）")
+                                # 【修复】降级策略：如果提供了完整内容，直接全量写入
+                                if full_content and full_content != current_result.content:
+                                    await file_service.write_file(clean_path, full_content)
+                                    files_actually_changed = True
+                                    print(f"[RepairerAgent] 降级写入完整内容: {clean_path}")
+                                elif full_content:
+                                    print(f"[RepairerAgent] 完整内容与当前内容相同，跳过写入")
+
+            # 【修复3】检测是否陷入死循环（文件内容未变化）
+            if not files_actually_changed and files_modified:
+                stagnation_count += 1
+                print(f"[RepairerAgent] 警告: 本轮修改未产生实际变化（停滞计数: {stagnation_count}）")
+            else:
+                stagnation_count = 0  # 重置停滞计数器
+
+            last_written_hashes = current_written_hashes
+
             # 检查是否需要运行测试
             need_test = output.get("need_test", True)
             if not need_test:
                 logger.info(f"[RepairerAgent] 第 {round_num + 1} 轮修复完成，跳过测试")
                 break
-            
+
             # 运行测试
             test_result = await self.run_tests_tool()
-            
+
             # 记录到对话历史
             self.state.add_round(
                 user_message=self.build_user_prompt(state),
                 assistant_response=json.dumps(output, ensure_ascii=False),
                 test_result=test_result
             )
-            
+
             # 检查测试结果
             if test_result.get("success"):
                 logger.info(f"[RepairerAgent] 第 {round_num + 1} 轮修复后测试通过！")
@@ -378,7 +531,7 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                 # 测试失败，准备下一轮
                 self.state.last_test_output = test_result.get("logs", "")
                 logger.warning(f"[RepairerAgent] 第 {round_num + 1} 轮修复后测试仍失败，准备下一轮...")
-                
+
                 # 更新 fix_order 为新的错误
                 fix_order = {
                     "type": "fix_order",
@@ -386,7 +539,8 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                     "source": "RepairerAgent",
                     "failed_tests": test_result.get("failed_tests", []),
                     "error_logs": test_result.get("logs", ""),
-                    "fix_hint": "上一轮修复未完全解决问题，请根据新的错误日志继续修复"
+                    "error_summary": test_result.get("error_summary", ""),
+                    "fix_hint": fix_order.get("fix_hint", "上一轮修复未完全解决问题，请根据新的错误日志继续修复")
                 }
         
         # 达到最大轮数仍未通过

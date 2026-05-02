@@ -268,14 +268,41 @@ export function usePipelineFlow(pipeline: Pipeline | null): UsePipelineFlowRetur
       ?? pipeline.stages?.[0];
   }, [pipeline]);
 
-  // 计算进度 - 使用实际阶段数
-  const totalStages = useMemo(() => pipeline?.stages?.length || 1, [pipeline]);
-  const completedStages = useMemo(() => {
-    return pipeline?.stages?.filter(s => s.status === 'success').length || 0;
+  // 计算进度 - 使用固定总阶段数（STAGE_ORDER 长度）
+  const { totalStages, completedStages, progress } = useMemo(() => {
+    // 固定总阶段数为 5 (即 STAGE_ORDER 的长度)
+    const total = STAGE_ORDER.length;
+
+    if (!pipeline || !pipeline.stages) {
+      return { totalStages: total, completedStages: 0, progress: 0 };
+    }
+
+    // 计算已经真正完成（Success）的【唯一】阶段数量
+    // 使用 Set 是为了防止同一个阶段因为驳回重跑产生多条成功记录导致进度超过 100%
+    const finishedStageNames = new Set(
+      pipeline.stages
+        .filter(
+          s => s.status.toLowerCase() === 'success'
+        )
+        .map(s => {
+          // 将后端阶段名映射到前端节点名，统一统计
+          if (s.name === 'CODING' || s.name === 'CODE_REVIEW') return 'CODER';
+          if (s.name === 'UNIT_TESTING') return 'TESTER';
+          return s.name;
+        })
+    );
+
+    const completed = finishedStageNames.size;
+
+    // 计算百分比，最高 100%
+    const percent = Math.min(Math.round((completed / total) * 100), 100);
+
+    return {
+      totalStages: total,
+      completedStages: completed,
+      progress: percent
+    };
   }, [pipeline]);
-  const progress = useMemo(() => {
-    return Math.round((completedStages / totalStages) * 100);
-  }, [completedStages, totalStages]);
 
   // 是否显示审批按钮
   const showApproveButton = useMemo(() => {

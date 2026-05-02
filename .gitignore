@@ -83,3 +83,5 @@ repomix-output.md
 
 backend/.omniflow_index/code_index.json
 .omniflow_index/code_index.json
+/.omniflow_index
+frontend/repomix-output*.md

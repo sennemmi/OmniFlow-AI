@@ -372,18 +372,18 @@ export function PipelineDetail() {
           <div className="w-px h-8 bg-slate-200" />
 
           {/* 进度 */}
-          <div className="flex items-center gap-3 flex-1 max-w-[280px]">
-            <div className="w-9 h-9 rounded-lg bg-blue-50 flex items-center justify-center">
-              <span className="text-xs font-bold text-blue-600">{progress}%</span>
+          <div className="flex flex-col gap-2 flex-1 max-w-[240px]">
+            <div className="flex items-center justify-between text-xs text-slate-500">
+              <span className="font-medium text-blue-600">{progress}%</span>
+              <span>总体进度</span>
             </div>
-            <div className="flex-1">
-              <p className="text-xs text-slate-500 mb-1">总体进度</p>
-              <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                <div 
-                  className="h-full bg-blue-500 rounded-full transition-all duration-500"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
+            {/* 进度条容器：增加高度和明显的背景色 */}
+            <div className="h-2 w-full bg-slate-200 rounded-full overflow-hidden">
+              {/* 进度填充层：确保 bg-blue-500 存在且 width 动态更新 */}
+              <div
+                className="h-full bg-blue-500 transition-all duration-500 ease-out"
+                style={{ width: `${Math.max(progress, 2)}%` }} // 即使是0%也给2%的视觉提示
+              />
             </div>
           </div>
 

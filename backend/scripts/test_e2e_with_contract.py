@@ -96,6 +96,147 @@ class ContractE2ETester:
             missing.update(re.findall(pattern, logs))
         return list(missing)
 
+    def _is_inside_function(self, target_node, tree) -> bool:
+        """判断节点是否在函数体内"""
+        import ast
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(node):
+                    if child is target_node:
+                        return True
+        return False
+
+    def _is_async_function(self, tree, func_name: str) -> bool:
+        """检测函数是否是 async def"""
+        import ast
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == func_name:
+                return True
+            # 也检查类中的 async 方法
+            if isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, ast.AsyncFunctionDef) and item.name == func_name:
+                        return True
+        return False
+
+    def extract_mock_targets(
+        self,
+        symbol_name: str,
+        module_path: str,
+        code_files: List[Dict],
+        external_libs: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        从真实生成的代码里提取 patch 路径，确保与实际 import 方式一致。
+
+        返回格式: [{"patch_target": "app.utils.system_monitor.virtual_memory", "is_async": False}, ...]
+
+        Args:
+            symbol_name: 符号名称（用于日志）
+            module_path: 模块路径（如 "app/utils/system_monitor.py"）
+            code_files: CoderAgent 生成的文件列表
+            external_libs: 需要关注的外部库列表
+
+        Returns:
+            List[Dict]: patch 目标列表
+        """
+        import ast
+
+        if external_libs is None:
+            external_libs = ["psutil", "sqlalchemy", "httpx", "aiohttp", "redis", "celery"]
+
+        # app 内部的关键依赖也要追踪（用于函数体内懒加载）
+        internal_lazy_imports = ["app.core.database", "app.core.config", "app.db"]
+
+        # 找到对应文件
+        module_dot = module_path.replace("backend/", "").replace("/", ".").replace(".py", "")
+        content = None
+        for f in code_files:
+            fp = f.get("file_path", "").replace("backend/", "")
+            if fp.replace("/", ".").replace(".py", "") == module_dot:
+                content = f.get("content", "")
+                break
+
+        if not content:
+            return []
+
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []
+
+        patch_targets = []
+        seen = set()
+
+        # ✅ 遍历所有节点，包括函数体内部
+        for node in ast.walk(tree):
+            # case 1: import psutil  →  patch: app.utils.system_monitor.psutil
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in external_libs:
+                        local_name = alias.asname or alias.name.split(".")[0]
+                        key = f"{module_dot}.{local_name}"
+                        if key not in seen:
+                            seen.add(key)
+                            patch_targets.append({
+                                "patch_target": key,
+                                "mock_return_value": None,
+                                "is_async": False,
+                                "description": f"import {alias.name}"
+                            })
+
+            # case 2: from ... import ... （包括函数体内懒加载）
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                top = mod.split(".")[0]
+                is_external = top in external_libs
+                is_internal_lazy = any(mod.startswith(p) for p in internal_lazy_imports)
+
+                if is_external or is_internal_lazy:
+                    for alias in node.names:
+                        local_name = alias.asname or alias.name
+
+                        # ✅ 判断是否为函数体内懒加载
+                        is_lazy = self._is_inside_function(node, tree)
+
+                        # ✅ 检测被导入的函数是否是 async
+                        # 对于内部懒加载，需要检查源模块的函数签名
+                        is_async_func = False
+                        if is_internal_lazy and local_name in ["get_session", "get_async_session", "async_session"]:
+                            # 常见的 async 函数名模式
+                            is_async_func = True
+
+                        if is_lazy and is_internal_lazy:
+                            # ✅ 懒加载：patch 源模块，不是使用模块
+                            # from app.core.database import get_session → patch "app.core.database.get_session"
+                            patch_target = f"{mod}.{local_name}"
+                            key = f"lazy:{patch_target}"
+                            if key not in seen:
+                                seen.add(key)
+                                patch_targets.append({
+                                    "patch_target": patch_target,
+                                    "mock_return_value": None,
+                                    "is_async": is_async_func,
+                                    "is_lazy_import": True,
+                                    "description": f"from {mod} import {alias.name} (函数体内懒加载，patch源模块)"
+                                })
+                        else:
+                            # 顶层 import：patch 使用模块
+                            patch_target = f"{module_dot}.{local_name}"
+                            key = patch_target
+                            if key not in seen:
+                                seen.add(key)
+                                patch_targets.append({
+                                    "patch_target": patch_target,
+                                    "mock_return_value": None,
+                                    "is_async": False,
+                                    "is_lazy_import": is_lazy,
+                                    "description": f"from {mod} import {alias.name}"
+                                })
+
+        return patch_targets
+
     def build_missing_specs_prompt(
         self,
         missing_syms: List[str],
@@ -964,6 +1105,147 @@ class ContractE2ETester:
 
         return result
 
+    async def run_preliminary_test(
+        self,
+        pipeline_id: int,
+        test_files: List[Dict],
+        file_service: SandboxFileService
+    ) -> Dict[str, Any]:
+        """
+        【预测试】在分层测试之前先快速运行新测试
+
+        Args:
+            pipeline_id: Pipeline ID
+            test_files: 测试文件列表
+            file_service: 文件服务
+
+        Returns:
+            Dict: 测试结果 {"success": bool, "logs": str, "failed_tests": List[str]}
+        """
+        from app.service.sandbox_manager import sandbox_manager
+
+        if not test_files:
+            return {"success": True, "logs": "", "failed_tests": [], "error": None}
+
+        print(f"\n   [预测试] 快速运行 {len(test_files)} 个新测试文件...")
+
+        # 构建测试路径
+        test_paths = []
+        for tf in test_files:
+            fp = tf.get("file_path", "")
+            if fp:
+                # 清理路径，确保格式正确
+                # 如果路径已经是 backend/tests/ai_generated/xxx，直接使用
+                if "tests/ai_generated" in fp:
+                    clean_path = fp  # 保持原样，包含 backend/ 前缀
+                else:
+                    # 否则，提取文件名并构造正确路径
+                    filename = fp.split("/")[-1]
+                    clean_path = f"backend/tests/ai_generated/{filename}"
+                test_paths.append(clean_path)
+
+        if not test_paths:
+            return {"success": True, "logs": "", "failed_tests": [], "error": None}
+
+        test_path_str = " ".join(test_paths)
+
+        try:
+            # 在沙箱中运行测试
+            exec_result = await sandbox_manager.exec(
+                pipeline_id,
+                f"cd /workspace && PYTHONPATH=/workspace/backend python -m pytest {test_path_str} -v --tb=short --color=no 2>&1",
+                timeout=120
+            )
+
+            logs = exec_result.stdout + "\n" + exec_result.stderr
+            success = exec_result.exit_code == 0
+
+            # 提取失败的测试
+            import re
+            failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+
+            status = "✅ 通过" if success else "❌ 失败"
+            print(f"   [预测试] 结果: {status}")
+            if not success:
+                print(f"   [预测试] 失败测试数: {len(failed_tests)}")
+                # 提取并显示更详细的错误信息
+                self._print_preliminary_error_summary(logs)
+
+            return {
+                "success": success,
+                "logs": logs,
+                "failed_tests": failed_tests,
+                "error": None if success else f"{len(failed_tests)} 个测试失败"
+            }
+
+        except Exception as e:
+            print(f"   [预测试] 异常: {e}")
+            return {
+                "success": False,
+                "logs": str(e),
+                "failed_tests": [],
+                "error": str(e)
+            }
+
+    def _print_preliminary_error_summary(self, logs: str):
+        """打印预测试错误摘要"""
+        import re
+
+        print(f"\n   [预测试] 错误信息摘要:")
+        print("   " + "-" * 60)
+
+        # 提取错误类型统计
+        error_patterns = {
+            "AssertionError": r"AssertionError:\s*(.+?)(?:\n|$)",
+            "ImportError": r"ImportError:\s*(.+?)(?:\n|$)",
+            "ModuleNotFoundError": r"ModuleNotFoundError:\s*(.+?)(?:\n|$)",
+            "TypeError": r"TypeError:\s*(.+?)(?:\n|$)",
+            "AttributeError": r"AttributeError:\s*(.+?)(?:\n|$)",
+            "NameError": r"NameError:\s*(.+?)(?:\n|$)",
+        }
+
+        error_counts = {}
+        for error_type, pattern in error_patterns.items():
+            matches = re.findall(pattern, logs, re.MULTILINE)
+            if matches:
+                error_counts[error_type] = len(matches)
+
+        if error_counts:
+            print(f"   错误类型统计:")
+            for error_type, count in error_counts.items():
+                print(f"     - {error_type}: {count} 个")
+
+        # 提取失败测试名称（前10个）
+        failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+        if failed_tests:
+            print(f"\n   失败测试列表 (前10个):")
+            for i, test in enumerate(failed_tests[:10], 1):
+                print(f"     {i}. {test}")
+            if len(failed_tests) > 10:
+                print(f"     ... 还有 {len(failed_tests) - 10} 个失败测试")
+
+        # 提取具体的错误详情（每个错误类型的前2个示例）
+        print(f"\n   错误详情示例:")
+        for error_type, pattern in error_patterns.items():
+            matches = re.findall(pattern, logs, re.MULTILINE)
+            if matches:
+                print(f"\n   [{error_type}]:")
+                for i, match in enumerate(matches[:2], 1):
+                    error_msg = match.strip()[:100]
+                    print(f"     {i}. {error_msg}...")
+
+        # 提取 short test summary info
+        summary_match = re.search(r'={10,}\s*short test summary info\s*={10,}(.*?)(?:={10,}|$)', logs, re.DOTALL)
+        if summary_match:
+            print(f"\n   测试摘要:")
+            summary_lines = summary_match.group(1).strip().split('\n')
+            for line in summary_lines[:5]:  # 显示前5行
+                line = line.strip()
+                if line:
+                    print(f"     {line}")
+
+        print("   " + "-" * 60)
+
     async def run(self) -> E2EContractResult:
         start = time.time()
         print("=" * 70)
@@ -1219,9 +1501,32 @@ class ContractE2ETester:
                 code_output = coder_result.get("output", {})
                 if isinstance(code_output, CoderOutput):
                     code_output_dict = code_output.model_dump()
+                    code_files = [f.model_dump() for f in code_output.files]
                 else:
                     code_output_dict = code_output
-                
+                    code_files = code_output.get("files", [])
+
+                # 【新增】从真实代码中提取 mock 目标，覆盖 DesignerAgent 的猜测值
+                interface_specs = design_output.get("interface_specs", [])
+                if interface_specs and code_files:
+                    print(f"   🔍 从代码中提取真实的 mock 依赖...")
+                    for spec in interface_specs:
+                        symbol_name = spec.get("symbol_name", "")
+                        module_path = spec.get("module", "")
+                        if module_path:
+                            real_mocks = self.extract_mock_targets(
+                                symbol_name=symbol_name,
+                                module_path=module_path,
+                                code_files=code_files,
+                                external_libs=["psutil", "sqlalchemy", "httpx", "aiohttp", "redis", "celery"]
+                            )
+                            if real_mocks:
+                                # 覆盖 DesignerAgent 的猜测值
+                                spec["mock_dependencies"] = real_mocks
+                                print(f"      ✅ {symbol_name}: 找到 {len(real_mocks)} 个 mock 目标")
+                                for mock in real_mocks:
+                                    print(f"         - {mock['patch_target']}")
+
                 test_result = await tester_agent.generate_tests(
                     design_output=design_output,
                     code_output=code_output_dict,
@@ -1230,11 +1535,11 @@ class ContractE2ETester:
             else:
                 print("   ⚠️ CoderAgent 失败，跳过 TesterAgent 测试生成")
                 test_result = {"success": False, "error": "CoderAgent 失败，跳过测试生成"}
-            code_output = coder_result.get("output", {})
-            if isinstance(code_output, CoderOutput):
-                code_files = [f.model_dump() for f in code_output.files]
-            else:
-                code_files = code_output.get("files", [])
+                code_output = coder_result.get("output", {})
+                if isinstance(code_output, CoderOutput):
+                    code_files = [f.model_dump() for f in code_output.files]
+                else:
+                    code_files = code_output.get("files", [])
             print(f"   CoderAgent 生成 {len(code_files)} 个文件")
 
             # 检查 TesterAgent 测试结果
@@ -1804,13 +2109,99 @@ CoderAgent 原本想替换的 replace_block:
             else:
                 print(f"   ✅ 测试文件语法检查通过")
 
-            # ========== Step 5: 【分层测试】运行测试 ==========
-            print("\n🐳 Step 5: 在 Sandbox 中运行分层测试...")
-            
+            # ========== Step 5: 【预测试 + 分层测试】运行测试 ==========
+            print("\n🐳 Step 5: 在 Sandbox 中运行测试...")
+
+            # 【新增】Step 5.1: 预测试 - 先快速运行新测试
+            print("\n   [Step 5.1] 预测试：快速验证新测试...")
+            preliminary_result = await self.run_preliminary_test(
+                pipeline_id=PIPELINE_ID,
+                test_files=test_files,
+                file_service=file_service
+            )
+
+            # 【新增】Step 5.2: 如果预测试失败，先进行修复
+            if not preliminary_result.get("success"):
+                print("\n   [Step 5.2] 预测试失败，启动 Repair 修复...")
+
+                # 收集所有生成的文件用于修复
+                all_files_for_repair = []
+                for f in code_files:
+                    all_files_for_repair.append({
+                        "file_path": f.get("file_path", ""),
+                        "content": f.get("content", "")
+                    })
+                for tf in test_files:
+                    all_files_for_repair.append({
+                        "file_path": tf.get("file_path", ""),
+                        "content": tf.get("content", "")
+                    })
+
+                # 调用 RepairerAgent 修复
+                fix_success, repair_result = await self._fix_with_repairer(
+                    logs=preliminary_result.get("logs", ""),
+                    failed_tests=preliminary_result.get("failed_tests", []),
+                    missing_symbols=[],
+                    file_service=file_service,
+                    all_generated_files=all_files_for_repair
+                )
+
+                if fix_success:
+                    print("   ✅ Repair 修复成功，重新运行预测试...")
+                    # 重新运行预测试
+                    preliminary_result = await self.run_preliminary_test(
+                        pipeline_id=PIPELINE_ID,
+                        test_files=test_files,
+                        file_service=file_service
+                    )
+
+                    if preliminary_result.get("success"):
+                        print("   ✅ 预测试通过，进入分层测试...")
+                    else:
+                        print("   ❌ 修复后预测试仍然失败，跳过分层测试")
+                        # 构造一个失败的分层测试结果
+                        layered_result = LayeredTestResult(
+                            all_passed=False,
+                            layers=[],
+                            failure_cause="code_bug",
+                            failed_tests=preliminary_result.get("failed_tests", [])
+                        )
+                        success = False
+                        duration = time.time() - start
+                        return E2EContractResult(
+                            success=False,
+                            code_generated=len(code_files) > 0,
+                            tests_generated=True,
+                            tests_passed=False,
+                            layered_result=layered_result,
+                            duration_seconds=duration
+                        )
+                else:
+                    print("   ❌ Repair 修复失败，跳过分层测试")
+                    # 构造一个失败的分层测试结果
+                    layered_result = LayeredTestResult(
+                        all_passed=False,
+                        layers=[],
+                        failure_cause="code_bug",
+                        failed_tests=preliminary_result.get("failed_tests", [])
+                    )
+                    success = False
+                    duration = time.time() - start
+                    return E2EContractResult(
+                        success=False,
+                        code_generated=len(code_files) > 0,
+                        tests_generated=True,
+                        tests_passed=False,
+                        layered_result=layered_result,
+                        duration_seconds=duration
+                    )
+            else:
+                print("   ✅ 预测试通过，进入分层测试...")
+
             # 【复用】使用分层测试执行测试
             # 收集所有生成的文件（代码文件 + 测试文件）
             all_generated_files = []
-            
+
             # 添加代码文件
             for f in code_files:
                 all_generated_files.append({
@@ -1818,7 +2209,7 @@ CoderAgent 原本想替换的 replace_block:
                     "content": f.get("content", ""),
                     "change_type": f.get("change_type", "modify")
                 })
-            
+
             # 添加测试文件
             for tf in test_files:
                 all_generated_files.append({
@@ -1826,15 +2217,15 @@ CoderAgent 原本想替换的 replace_block:
                     "content": tf.get("content", ""),
                     "change_type": "add"
                 })
-            
+
             print(f"   共 {len(all_generated_files)} 个生成文件参与分层测试")
-            
+
             layered_result = await self.run_tests_with_layered_runner(
                 pipeline_id=PIPELINE_ID,
                 generated_files=all_generated_files,
                 file_service=file_service
             )
-            
+
             print(f"\n   分层测试结果: {'✅ 全部通过' if layered_result.all_passed else '❌ 存在失败'}")
 
             # ========== Step 6: Auto-Fix + 智能错误路由 ==========
@@ -2233,6 +2624,14 @@ CoderAgent 原本想替换的 replace_block:
             })
 
         # 构建修复工单
+        # 【修复】从 all_generated_files 中提取所有文件路径，而不是硬编码
+        generated_file_paths = []
+        for file_info in all_generated_files:
+            fp = file_info.get("file_path", "")
+            if fp:
+                clean_fp = fp.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                generated_file_paths.append(clean_fp)
+
         fix_order = {
             "type": "fix_order",
             "category": "code_bug",
@@ -2241,12 +2640,12 @@ CoderAgent 原本想替换的 replace_block:
             "failed_tests": failed_tests,
             "error_logs": logs[:3000] if logs else "",
             "error_snippet": logs[:2000] if logs else "",
-            "generated_files": ["app/api/v1/health.py"],
-            "fix_hint": "重点：确保实现所有接口契约中声明的函数。"
+            "generated_files": generated_file_paths,  # 【修复】使用实际的文件列表
+            "fix_hint": "重点：确保实现所有接口契约中声明的函数。可以修改测试文件或被测代码，根据错误类型判断。"
         }
 
         # 收集所有相关文件的完整内容
-        # 包括：Coder 修改过的文件 + Tester 生成的测试文件
+        # 包括：Coder 修改过的文件 + Tester 生成的测试文件 + 所有被测文件
         target_files = {}
 
         # 从 all_generated_files 中提取文件内容
@@ -2259,26 +2658,30 @@ CoderAgent 原本想替换的 replace_block:
                 target_files[clean_path] = content
                 print(f"      📄 准备传入 RepairerAgent: {clean_path} ({len(content)} 字符)")
 
-        # 同时从沙箱读取当前文件内容（确保是最新的）
+        # 【修复2】从沙箱读取 CoderAgent 和 TesterAgent 影响过的所有文件
+        # 基于 all_generated_files 中的文件路径，读取它们在沙箱中的最新内容
         files_to_read = set()
+
+        # 从 all_generated_files 中提取所有文件路径（CoderAgent 和 TesterAgent 生成的文件）
+        for file_info in all_generated_files:
+            fp = file_info.get("file_path", "")
+            if fp:
+                clean_fp = fp.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                files_to_read.add(clean_fp)
+
+        # 从错误日志中提取涉及的文件
         for err in errors_list:
             fp = err.get("file_path", "")
             if fp:
                 clean_fp = fp.replace("backend/", "").replace("backend\\", "").lstrip("/")
                 files_to_read.add(clean_fp)
 
-        # 添加 generated_files 中的文件
-        for gf in fix_order.get("generated_files", []):
-            clean_gf = gf.replace("backend/", "").replace("backend\\", "").lstrip("/")
-            files_to_read.add(clean_gf)
-
-        # 读取这些文件的最新内容
+        # 读取这些文件的最新内容（覆盖 all_generated_files 中的旧内容）
         for clean_path in files_to_read:
-            if clean_path not in target_files:  # 避免覆盖 all_generated_files 中的内容
-                read_res = await file_service.read_file(clean_path)
-                if read_res.exists and read_res.content:
-                    target_files[clean_path] = read_res.content
-                    print(f"      📄 从沙箱读取: {clean_path} ({len(read_res.content)} 字符)")
+            read_res = await file_service.read_file(clean_path)
+            if read_res.exists and read_res.content:
+                target_files[clean_path] = read_res.content
+                print(f"      📄 从沙箱读取最新内容: {clean_path} ({len(read_res.content)} 字符)")
 
         if not target_files:
             print(f"   ❌ 没有收集到任何文件内容，无法调用 RepairerAgent")
