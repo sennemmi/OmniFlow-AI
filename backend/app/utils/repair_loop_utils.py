@@ -1,0 +1,461 @@
+"""
+修复循环工具
+
+提供各类自动修复循环的通用逻辑
+"""
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.agents.coder import coder_agent, CoderAgent, CoderOutput
+from app.agents.tester import tester_agent
+from app.service.sandbox_file_service import SandboxFileService
+
+logger = logging.getLogger(__name__)
+
+
+async def run_syntax_fix_loop(
+    syntax_errors: List[Dict],
+    files_to_check: List[Tuple[str, str]],
+    file_service: SandboxFileService,
+    design_output: Dict,
+    max_retries: int = 3
+) -> Dict[str, str]:
+    """
+    运行语法错误修复循环
+
+    Args:
+        syntax_errors: 语法错误列表
+        files_to_check: 待检查文件列表 [(file_path, content), ...]
+        file_service: 文件服务
+        design_output: 设计输出
+        max_retries: 最大重试次数
+
+    Returns:
+        修复后的文件字典 {file_path: content}
+    """
+    from app.service.code_validation_service import CodeValidationService
+    from app.utils.file_operation_utils import build_fix_instruction_with_context
+
+    fixed_files = {}
+    validation_service = CodeValidationService()
+
+    for attempt in range(max_retries):
+        logger.info(f"语法错误自动修复 第 {attempt + 1}/{max_retries} 次")
+
+        # 收集错误文件
+        error_files = {}
+        for err in syntax_errors:
+            fp = err.get("file", "")
+            if fp:
+                for check_fp, content in files_to_check:
+                    if check_fp == fp:
+                        error_files[fp] = content
+                        break
+
+        if not error_files:
+            logger.info("没有需要修复的语法错误文件")
+            return fixed_files
+
+        # 构建修复指令
+        force_full_file = attempt >= 1
+        fix_instruction = build_fix_instruction_with_context(
+            error_files, syntax_errors, force_full_file
+        )
+
+        # 构建定向设计输出
+        targeted_design = {
+            **{k: v for k, v in design_output.items() if k != "interface_specs"},
+            "interface_specs": [],
+            "affected_files": list(error_files.keys()),
+            "fix_mode": True,
+            "force_full_file": force_full_file,
+            "fix_instruction": fix_instruction,
+            "syntax_errors": syntax_errors
+        }
+
+        # 调用 CoderAgent
+        fix_result = await coder_agent.generate_code(
+            design_output=targeted_design,
+            pipeline_id=design_output.get("pipeline_id", 0),
+            injected_files=error_files,
+            error_context=fix_instruction
+        )
+
+        if not fix_result.get("success"):
+            logger.warning(f"CoderAgent 语法修复调用失败: {fix_result.get('error')}")
+            continue
+
+        # 处理修复结果
+        fix_output = fix_result.get("output", {})
+        fix_files = _extract_files_from_output(fix_output)
+
+        if not fix_files:
+            logger.warning("CoderAgent 未生成任何修复文件")
+            continue
+
+        # 应用修复
+        for fc in fix_files:
+            fp = fc.get("file_path", "").replace("backend/", "").replace("backend\\", "")
+            change_type = fc.get("change_type")
+            search_block = fc.get("search_block", "")
+            replace_block = fc.get("replace_block", "")
+            content = fc.get("content", "")
+
+            if force_full_file and change_type != "add":
+                continue
+
+            current_content = error_files.get(fp, "")
+
+            if change_type == "modify" and search_block and current_content:
+                new_content = current_content.replace(search_block, replace_block, 1)
+                check_result = await validation_service.check_syntax_with_py_compile(
+                    [{"file_path": fp, "change_type": "add", "content": new_content}],
+                    file_service
+                )
+                if not check_result:
+                    fixed_files[fp] = new_content
+                    _update_files_to_check(files_to_check, fp, new_content)
+            elif content:
+                check_result = await validation_service.check_syntax_with_py_compile(
+                    [{"file_path": fp, "change_type": "add", "content": content}],
+                    file_service
+                )
+                if not check_result:
+                    fixed_files[fp] = content
+                    _update_files_to_check(files_to_check, fp, content)
+
+        # 检查剩余错误
+        remaining_errors = await _check_remaining_syntax_errors(
+            syntax_errors, fixed_files, files_to_check, validation_service, file_service
+        )
+
+        if not remaining_errors:
+            logger.info("所有语法错误修复成功！")
+            return fixed_files
+
+        syntax_errors = remaining_errors
+
+    return fixed_files
+
+
+async def run_contract_fix_loop(
+    missing_syms: List[str],
+    interface_specs: List[Dict],
+    design_output: Dict,
+    file_service: SandboxFileService,
+    max_retries: int = 3
+) -> Tuple[bool, List[str], List[Dict]]:
+    """
+    运行契约修复循环
+
+    Args:
+        missing_syms: 缺失符号列表
+        interface_specs: 接口规范列表
+        design_output: 设计输出
+        file_service: 文件服务
+        max_retries: 最大重试次数
+
+    Returns:
+        (是否全部修复, 仍然缺失的符号, 补全的文件列表)
+    """
+    from app.service.e2e_test_service import E2ETestService
+    from app.utils.agent_instruction_utils import build_contract_fix_instruction
+
+    all_fix_files = []
+    current_missing = missing_syms
+    e2e_service = E2ETestService()
+
+    for attempt in range(max_retries):
+        missing_specs = e2e_service.build_missing_specs_prompt(current_missing, interface_specs)
+        if not missing_specs:
+            logger.warning(f"无法从 interface_specs 中解析缺失条目: {current_missing}")
+            break
+
+        logger.info(f"契约自动修复 第 {attempt + 1}/{max_retries} 次")
+
+        # 构建定向设计输出
+        targeted_design = {
+            **{k: v for k, v in design_output.items() if k != "interface_specs"},
+            "interface_specs": missing_specs,
+            "affected_files": list(set(
+                s.get("module", "").replace(".py", "")
+                for s in missing_specs
+            )),
+            "fix_mode": True,
+            "fix_instruction": build_contract_fix_instruction(missing_specs)
+        }
+
+        # 读取受影响文件
+        injected_files = {}
+        for spec in missing_specs:
+            module = spec.get("module", "")
+            if module:
+                clean = module.replace("backend/", "").replace("backend\\", "").replace("\\", "/")
+                if not clean.endswith(".py"):
+                    clean += ".py"
+                read_res = await file_service.read_file(clean)
+                if read_res.exists:
+                    injected_files[clean] = read_res.content
+
+        # 调用 CoderAgent
+        fix_result = await coder_agent.generate_code(
+            design_output=targeted_design,
+            pipeline_id=design_output.get("pipeline_id", 0),
+            injected_files=injected_files
+        )
+
+        if not fix_result.get("success"):
+            logger.warning(f"CoderAgent 修复调用失败: {fix_result.get('error')}")
+            continue
+
+        fix_files = _extract_files_from_output(fix_result.get("output", {}))
+
+        if not fix_files:
+            logger.warning("CoderAgent 未生成任何修复文件")
+            continue
+
+        # 写入修复文件
+        for fc in fix_files:
+            fp = fc.get("file_path", "").replace("backend/", "").replace("backend\\", "")
+            change_type = fc.get("change_type")
+            search_block = fc.get("search_block", "")
+            replace_block = fc.get("replace_block", "")
+            content = fc.get("content", "")
+
+            if change_type == "modify":
+                if search_block:
+                    read_r = await file_service.read_file(fp)
+                    if read_r.exists:
+                        new_content = read_r.content.replace(search_block, replace_block, 1)
+                        await file_service.write_file(fp, new_content)
+                elif content:
+                    await file_service.write_file(fp, content)
+            elif change_type == "add" and content:
+                await file_service.write_file(fp, content)
+
+        all_fix_files.extend(fix_files)
+
+        # 重新检查契约
+        current_missing = await e2e_service.verify_contract(
+            file_service, fix_files + all_fix_files, interface_specs
+        )
+
+        if not current_missing:
+            logger.info("契约自动修复成功！所有符号已实现")
+            return True, [], all_fix_files
+
+    return False, current_missing, all_fix_files
+
+
+async def run_test_import_fix_loop(
+    test_files: List[Dict],
+    import_errors: List[str],
+    file_service: SandboxFileService,
+    design_output: Dict,
+    code_output: Dict,
+    max_retries: int = 2
+) -> bool:
+    """
+    运行测试导入错误修复循环
+
+    Args:
+        test_files: 测试文件列表
+        import_errors: 导入错误列表
+        file_service: 文件服务
+        design_output: 设计输出
+        code_output: 代码输出
+        max_retries: 最大重试次数
+
+    Returns:
+        是否修复成功
+    """
+    from app.service.code_validation_service import CodeValidationService
+    from app.utils.agent_instruction_utils import build_test_import_fix_instruction
+    from app.utils.file_operation_utils import normalize_file_path
+
+    validation_service = CodeValidationService()
+
+    for attempt in range(max_retries):
+        logger.info(f"导入错误修复 第 {attempt + 1}/{max_retries} 次")
+
+        fix_instruction = build_test_import_fix_instruction(import_errors)
+
+        # 读取当前测试文件
+        injected_files = {}
+        for tf in test_files:
+            fp = normalize_file_path(tf.get("file_path", ""))
+            read_res = await file_service.read_file(fp)
+            if read_res.exists:
+                injected_files[fp] = read_res.content
+
+        # 调用 TesterAgent
+        fix_result = await tester_agent.generate_tests(
+            design_output={
+                **design_output,
+                "fix_mode": True,
+                "fix_instruction": fix_instruction,
+                "existing_test_files": test_files
+            },
+            code_output=code_output,
+            pipeline_id=design_output.get("pipeline_id", 0)
+        )
+
+        if not fix_result.get("success"):
+            logger.warning(f"TesterAgent 修复调用失败: {fix_result.get('error')}")
+            continue
+
+        fixed_test_files = fix_result.get("output", {}).get("test_files", [])
+
+        if not fixed_test_files:
+            logger.warning("TesterAgent 未生成修复后的测试文件")
+            continue
+
+        # 写入修复后的文件
+        for tf in fixed_test_files:
+            fp = tf.get("file_path", "")
+            content = tf.get("content", "")
+            if content:
+                await file_service.write_file(fp, content)
+
+        # 重新验证
+        remaining_errors = await validation_service.validate_test_imports(
+            fixed_test_files, file_service
+        )
+
+        if not remaining_errors:
+            logger.info("所有导入错误已修复")
+            return True
+
+        import_errors = remaining_errors
+        test_files = fixed_test_files
+
+    return False
+
+
+async def run_test_syntax_fix_loop(
+    test_files: List[Dict],
+    syntax_errors: List[Dict],
+    file_service: SandboxFileService,
+    design_output: Dict,
+    code_output: Dict,
+    max_retries: int = 2
+) -> List[Dict]:
+    """
+    运行测试语法错误修复循环
+
+    Args:
+        test_files: 测试文件列表
+        syntax_errors: 语法错误列表
+        file_service: 文件服务
+        design_output: 设计输出
+        code_output: 代码输出
+        max_retries: 最大重试次数
+
+    Returns:
+        修复后的测试文件列表
+    """
+    from app.service.code_validation_service import CodeValidationService
+    from app.utils.agent_instruction_utils import build_test_syntax_fix_instruction
+
+    validation_service = CodeValidationService()
+
+    for attempt in range(max_retries):
+        logger.info(f"测试语法错误修复 第 {attempt + 1}/{max_retries} 次")
+
+        fix_instruction = build_test_syntax_fix_instruction(syntax_errors)
+
+        fix_result = await tester_agent.generate_tests(
+            design_output={
+                **design_output,
+                "fix_mode": True,
+                "fix_instruction": fix_instruction,
+                "existing_test_files": test_files
+            },
+            code_output=code_output,
+            pipeline_id=design_output.get("pipeline_id", 0)
+        )
+
+        if not fix_result.get("success"):
+            logger.warning(f"TesterAgent 语法修复调用失败: {fix_result.get('error')}")
+            continue
+
+        fixed_test_files = fix_result.get("output", {}).get("test_files", [])
+
+        if not fixed_test_files:
+            logger.warning("TesterAgent 未生成修复后的测试文件")
+            continue
+
+        # 写入修复后的文件
+        for tf in fixed_test_files:
+            fp = tf.get("file_path", "")
+            content = tf.get("content", "")
+            if content:
+                await file_service.write_file(fp, content)
+
+        # 重新验证语法
+        remaining_errors = await validation_service.check_syntax_with_py_compile(
+            [{"file_path": tf.get("file_path", ""), "change_type": "add", "content": tf.get("content", "")}
+             for tf in fixed_test_files],
+            file_service
+        )
+
+        if not remaining_errors:
+            logger.info("所有测试语法错误已修复")
+            return fixed_test_files
+
+        syntax_errors = [err.to_dict() for err in remaining_errors]
+        test_files = fixed_test_files
+
+    return []
+
+
+def _extract_files_from_output(output: Any) -> List[Dict]:
+    """从 Agent 输出中提取文件列表"""
+    if isinstance(output, CoderOutput):
+        return [f.model_dump() for f in output.files]
+    elif isinstance(output, dict):
+        return output.get("files", [])
+    return []
+
+
+def _update_files_to_check(files_to_check: List[Tuple[str, str]], file_path: str, new_content: str):
+    """更新 files_to_check 中的文件内容"""
+    for i, (check_fp, _) in enumerate(files_to_check):
+        if check_fp == file_path:
+            files_to_check[i] = (file_path, new_content)
+            break
+
+
+async def _check_remaining_syntax_errors(
+    syntax_errors: List[Dict],
+    fixed_files: Dict[str, str],
+    files_to_check: List[Tuple[str, str]],
+    validation_service,
+    file_service: SandboxFileService
+) -> List[Dict]:
+    """检查剩余的语法错误"""
+    remaining = []
+    for err in syntax_errors:
+        fp = err.get("file", "")
+        check_content = fixed_files.get(fp, "")
+
+        if not check_content:
+            for check_fp, content in files_to_check:
+                if check_fp == fp:
+                    check_content = content
+                    break
+
+        if check_content:
+            check_result = await validation_service.check_syntax_with_py_compile(
+                [{"file_path": fp, "change_type": "add", "content": check_content}],
+                file_service
+            )
+            if check_result:
+                remaining.append({
+                    "file": fp,
+                    "error": check_result[0].error,
+                    "line": check_result[0].line
+                })
+
+    return remaining

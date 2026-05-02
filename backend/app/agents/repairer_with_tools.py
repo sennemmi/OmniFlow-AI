@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from app.agents.base import LangGraphAgent
 from app.agents.schemas import CoderOutput
 from app.service.sandbox_manager import sandbox_manager
+from app.utils.repair_utils import extract_pytest_failures
 
 logger = logging.getLogger(__name__)
 
@@ -154,62 +155,25 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
 """
 
     def _extract_error_summary(self, logs: str) -> str:
-        """从测试日志中提取错误摘要"""
+        """从测试日志中提取错误摘要（使用统一的提取方法）"""
+        # 使用统一的提取方法
+        error_content = extract_pytest_failures(logs, max_chars=5000)
+
+        # 提取失败测试数量
         import re
-
-        summary_parts = []
-
-        # 提取错误类型统计
-        error_patterns = {
-            "AssertionError": r"AssertionError:\s*(.+?)(?:\n|$)",
-            "ImportError": r"ImportError:\s*(.+?)(?:\n|$)",
-            "ModuleNotFoundError": r"ModuleNotFoundError:\s*(.+?)(?:\n|$)",
-            "TypeError": r"TypeError:\s*(.+?)(?:\n|$)",
-            "AttributeError": r"AttributeError:\s*(.+?)(?:\n|$)",
-            "NameError": r"NameError:\s*(.+?)(?:\n|$)",
-            "SyntaxError": r"SyntaxError:\s*(.+?)(?:\n|$)",
-        }
-
-        error_counts = {}
-        for error_type, pattern in error_patterns.items():
-            matches = re.findall(pattern, logs, re.MULTILINE)
-            if matches:
-                error_counts[error_type] = len(matches)
-
-        if error_counts:
-            summary_parts.append("错误类型统计:")
-            for error_type, count in error_counts.items():
-                summary_parts.append(f"  - {error_type}: {count} 个")
-
-        # 提取失败测试名称（前5个）
         failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
-        if failed_tests:
-            summary_parts.append(f"\n失败测试列表 (前5个):")
-            for i, test in enumerate(failed_tests[:5], 1):
-                summary_parts.append(f"  {i}. {test}")
-            if len(failed_tests) > 5:
-                summary_parts.append(f"  ... 还有 {len(failed_tests) - 5} 个失败测试")
+        failed_count = len(failed_tests)
 
-        # 提取具体的错误详情（每个错误类型的前1个示例）
-        summary_parts.append(f"\n错误详情示例:")
-        for error_type, pattern in error_patterns.items():
-            matches = re.findall(pattern, logs, re.MULTILINE)
-            if matches:
-                summary_parts.append(f"\n[{error_type}]:")
-                error_msg = matches[0].strip()[:150]
-                summary_parts.append(f"  {error_msg}...")
+        summary = f"失败测试数: {failed_count}\n"
+        summary += f"错误日志:\n"
+        summary += "-" * 60 + "\n"
+        summary += error_content + "\n"
+        summary += "-" * 60
 
-        # 提取 short test summary info
-        summary_match = re.search(r'={10,}\s*short test summary info\s*={10,}(.*?)(?:={10,}|$)', logs, re.DOTALL)
-        if summary_match:
-            summary_parts.append(f"\n测试摘要:")
-            summary_lines = summary_match.group(1).strip().split('\n')
-            for line in summary_lines[:3]:  # 显示前3行
-                line = line.strip()
-                if line:
-                    summary_parts.append(f"  {line}")
+        if len(logs) > 5000:
+            summary += f"\n(日志共 {len(logs)} 字符，显示关键部分)"
 
-        return "\n".join(summary_parts)
+        return summary
 
     async def run_tests_tool(self, test_path: str = "backend/tests/ai_generated") -> Dict[str, Any]:
         """
