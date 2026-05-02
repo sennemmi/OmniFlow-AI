@@ -73,6 +73,12 @@ def extract_defined_symbols(content: str, file_path: str = "<unknown>") -> Set[s
                     # ast.Name 使用 id 属性而非 name
                     if not target.id.startswith("_"):
                         defined.add(target.id)
+        # ===== 增加对带类型注解变量的支持 =====
+        elif isinstance(node, ast.AnnAssign):
+            # 如 calculator_router: APIRouter = APIRouter()
+            if isinstance(node.target, ast.Name):
+                if not node.target.id.startswith("_"):
+                    defined.add(node.target.id)
         # ========== 新增部分：处理重导出 ==========
         elif isinstance(node, ast.ImportFrom):
             # 处理 from X import Y 中的 Y（重导出符号）
@@ -154,7 +160,11 @@ def extract_defined_symbols_with_types(content: str, file_path: str = "<unknown>
             for target in node.targets:
                 if isinstance(target, ast.Name) and not target.id.startswith("_"):
                     symbols[target.id] = "variable"
-        
+        # ===== 增加对带类型注解变量的支持 =====
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and not node.target.id.startswith("_"):
+                symbols[node.target.id] = "variable"
+
         # 检测重导出
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
@@ -452,6 +462,106 @@ def verify_test_imports_detailed(
     return violations
 
 
+def _extract_return_keys_from_function(node) -> Set[str]:
+    """
+    从函数 AST 节点中提取返回字典的键名
+    
+    Args:
+        node: AST FunctionDef 或 AsyncFunctionDef 节点
+        
+    Returns:
+        返回字典的键名集合
+    """
+    keys = set()
+    
+    for child in ast.walk(node):
+        if isinstance(child, ast.Return) and child.value:
+            # 处理 return {"key": value, ...}
+            if isinstance(child.value, ast.Dict):
+                for key in child.value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        keys.add(key.value)
+                    elif isinstance(key, ast.Str):  # Python < 3.8
+                        keys.add(key.s)
+            # 处理 return dict(key=value, ...)
+            elif isinstance(child.value, ast.Call):
+                if isinstance(child.value.func, ast.Name) and child.value.func.id == 'dict':
+                    for keyword in child.value.keywords:
+                        keys.add(keyword.arg)
+    
+    return keys
+
+
+def verify_return_fields_consistency(
+    code_files: Dict[str, str],
+    interface_specs: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    【跨文件一致性检查】验证代码中的返回字段与契约是否一致
+    
+    检查函数实际返回的字典键名是否包含契约要求的所有 return_fields。
+    
+    Args:
+        code_files: 代码文件映射 {file_path: content}
+        interface_specs: 接口契约列表
+        
+    Returns:
+        不一致的错误列表
+    """
+    mismatches = []
+    
+    for spec in interface_specs:
+        symbol_name = spec.get("symbol_name", "")
+        return_fields = spec.get("return_fields", [])
+        
+        if not symbol_name or not return_fields:
+            continue
+        
+        # 提取契约要求的键名
+        required_keys = set()
+        for field in return_fields:
+            field_name = field.get("name", "") if isinstance(field, dict) else getattr(field, "name", "")
+            if field_name:
+                required_keys.add(field_name)
+        
+        if not required_keys:
+            continue
+        
+        # 在所有代码文件中查找该函数
+        found = False
+        for file_path, content in code_files.items():
+            try:
+                tree = ast.parse(content)
+                
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if node.name == symbol_name:
+                            found = True
+                            actual_keys = _extract_return_keys_from_function(node)
+                            
+                            if actual_keys:
+                                missing_keys = required_keys - actual_keys
+                                if missing_keys:
+                                    mismatches.append({
+                                        "symbol": symbol_name,
+                                        "file": file_path,
+                                        "error": "返回字段与契约不一致",
+                                        "missing_keys": list(missing_keys),
+                                        "required_keys": list(required_keys),
+                                        "actual_keys": list(actual_keys)
+                                    })
+                            break
+                
+                if found:
+                    break
+                    
+            except SyntaxError:
+                logger.warning(f"[ContractChecker] 无法解析文件进行返回字段检查: {file_path}")
+                continue
+    
+    return mismatches
+
+
 def check_contract_before_test(
     design_output: Dict[str, Any],
     code_files: Dict[str, str],
@@ -490,7 +600,30 @@ def check_contract_before_test(
             "type": "missing_implementation"
         }
 
-    # 2. 检查测试文件是否只导入了契约内的符号
+    # 2. 【新增】检查返回字段与契约的一致性（跨文件一致性检查）
+    return_field_mismatches = verify_return_fields_consistency(code_files, interface_specs)
+    if return_field_mismatches:
+        logger.error(f"契约违反: 发现 {len(return_field_mismatches)} 个返回字段不一致")
+        for mismatch in return_field_mismatches:
+            logger.error(
+                f"  - {mismatch['symbol']} in {mismatch['file']}: "
+                f"缺少键 {mismatch['missing_keys']}"
+            )
+        
+        violations = [
+            f"{m['symbol']} in {m['file']}: 缺少返回键 {m['missing_keys']} "
+            f"(契约要求: {m['required_keys']}, 实际: {m['actual_keys']})"
+            for m in return_field_mismatches
+        ]
+        
+        return {
+            "success": False,
+            "violations": violations,
+            "type": "return_field_mismatch",
+            "details": return_field_mismatches
+        }
+
+    # 3. 检查测试文件是否只导入了契约内的符号
     if test_files:
         test_violations = []
         for test_path, test_content in test_files.items():

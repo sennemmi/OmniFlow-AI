@@ -33,6 +33,7 @@ from app.api.v1.system import router as system_router
 from app.api.v1.workspace import router as workspace_router
 from app.api.v1.code_modify import router as code_modify_router
 from app.api.v1.code_modify_batch import router as code_modify_batch_router
+from app.api.v1.calculator import router as calculator_router
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.response import ResponseModel
@@ -187,11 +188,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 # 注册路由
 app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(pipeline_router, prefix="/api/v1", tags=["pipeline"])
-app.include_router(code_modify_router, prefix="/api/v1", tags=["code-modify"])
-app.include_router(code_modify_batch_router, prefix="/api/v1", tags=["code-modify-batch"])
-app.include_router(system_router, prefix="/api/v1", tags=["system"])
-app.include_router(workspace_router, prefix="/api/v1", tags=["workspace"])
-
+app.include_router(health_router, prefix="/api/v1", tags=["Health"])
+app.include_router(pipeline_router, prefix="/api/v1", tags=["Pipeline"])
+app.include_router(system_router, prefix="/api/v1", tags=["System"])
+app.include_router(workspace_router, prefix="/api/v1", tags=["Workspace"])
+app.include_router(code_modify_router, prefix="/api/v1", tags=["CodeModify"])
+app.include_router(code_modify_batch_router, prefix="/api/v1", tags=["CodeModifyBatch"])
+app.include_router(calculator_router, prefix="/api/v1", tags=["Calculator"])
 
 if __name__ == "__main__":
     import uvicorn

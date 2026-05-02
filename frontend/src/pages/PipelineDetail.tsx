@@ -31,6 +31,7 @@ import {
   ChevronDown,
   ChevronUp,
   Square,
+  RotateCcw,
 } from 'lucide-react';
 import { apiGet, apiPost } from '@utils/axios';
 import { usePipelineStore } from '@stores/pipelineStore';
@@ -65,6 +66,7 @@ export function PipelineDetail() {
   const { openApproveDrawer, setSelectedPipeline } = usePipelineStore();
   const [showThoughtLog, setShowThoughtLog] = useState(true);
   const [isTerminating, setIsTerminating] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
 
   // 验证并转换 Pipeline ID
   const pipelineId = rawId ? parseInt(rawId, 10) : NaN;
@@ -94,7 +96,7 @@ export function PipelineDetail() {
   // 终止 Pipeline
   const handleTerminate = useCallback(async () => {
     if (!pipeline || (pipeline.status !== 'running' && pipeline.status !== 'paused')) return;
-    
+
     const confirmed = window.confirm('确定要终止当前 Pipeline 吗？此操作不可撤销。');
     if (!confirmed) return;
 
@@ -110,6 +112,34 @@ export function PipelineDetail() {
       alert('终止失败: ' + (error as Error).message);
     } finally {
       setIsTerminating(false);
+    }
+  }, [pipeline, pipelineId, refetch]);
+
+  // 重试失败的 Pipeline
+  const handleRetry = useCallback(async () => {
+    if (!pipeline || pipeline.status !== 'failed') return;
+
+    const confirmed = window.confirm(
+      `确定要重试 Pipeline #${pipelineId} 吗？\n将从失败的阶段重新开始执行。`
+    );
+    if (!confirmed) return;
+
+    setIsRetrying(true);
+    try {
+      const response = await apiPost(`/pipeline/${pipelineId}/retry`, {});
+
+      if (response.success || response.data?.success) {
+        alert('重试已启动，Pipeline 将重新开始执行');
+        // 刷新状态
+        refetch();
+      } else {
+        alert('重试失败: ' + (response.error || response.message || '未知错误'));
+      }
+    } catch (error) {
+      console.error('重试 Pipeline 失败:', error);
+      alert('重试失败: ' + (error as Error).message);
+    } finally {
+      setIsRetrying(false);
     }
   }, [pipeline, pipelineId, refetch]);
 
@@ -245,6 +275,24 @@ export function PipelineDetail() {
             >
               <Eye className="w-4 h-4 flex-shrink-0" />
               <span className="text-sm font-medium truncate">查看并审批</span>
+            </button>
+          )}
+
+          {/* 重试按钮 - 当 failed 时显示 */}
+          {pipeline?.status === 'failed' && (
+            <button
+              onClick={handleRetry}
+              disabled={isRetrying}
+              className="flex items-center justify-center gap-2 w-[100px] h-10 bg-orange-50 text-orange-600 rounded-lg hover:bg-orange-100 transition-colors border border-orange-200 flex-shrink-0 disabled:opacity-50"
+            >
+              {isRetrying ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <RotateCcw className="w-4 h-4" />
+              )}
+              <span className="text-sm font-medium truncate">
+                {isRetrying ? '重试中' : '重试'}
+              </span>
             </button>
           )}
 

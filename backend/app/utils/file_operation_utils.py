@@ -261,17 +261,20 @@ def build_fix_instruction_with_context(
     """
     instruction = f"""你是一个代码修复专家。以下文件存在 Python 语法错误，你必须修复它。
 
-【强制规则】
+【强制规则 - 违反会导致修复失败】
 1. {'输出完整的文件内容（change_type="add"），禁止输出 search_block/replace_block' if force_full_file else '优先使用完整文件覆盖（change_type="add"），如果必须用 modify，确保 search_block 精确匹配'}
 2. 仅修复语法错误（删除多余括号、补齐缺失括号、修正缩进等）
 3. 不要修改任何业务逻辑、函数名、变量名
 4. 确保修复后的代码可以通过 python -m py_compile 检查
+5. 【极其重要】每个 Python 文件的最后一行必须是换行符（\n），否则会导致语法错误！
 
 【常见语法错误类型】
 - 多余括号：}} 或 ) 或 ] 重复
 - 缺失括号：{{ 或 ( 或 [ 不匹配
 - 缩进错误：混用空格和 Tab
 - 冒号缺失：if/for/while/def/class 语句后缺少 :
+- 缺少换行：文件末尾没有换行符（特别是 if __name__ == "__main__": 语句前）
+- 字符串未闭合：' 或 " 不匹配
 
 【错误详情】
 """
@@ -289,18 +292,64 @@ def build_fix_instruction_with_context(
             content = error_files[fp]
             lines = content.splitlines()
             if 0 < line_no <= len(lines):
-                context_start = max(0, line_no - 3)
-                context_end = min(len(lines), line_no + 2)
+                context_start = max(0, line_no - 5)
+                context_end = min(len(lines), line_no + 3)
                 instruction += f"  上下文:\n"
                 for i in range(context_start, context_end):
                     marker = ">>> " if i == line_no - 1 else "    "
-                    instruction += f"{marker}{i+1}: {lines[i]}\n"
+                    line_content = lines[i] if i < len(lines) else "<空行>"
+                    # 显示行尾空格和换行问题
+                    visible_content = line_content.replace(' ', '·')
+                    instruction += f"{marker}{i+1}: {visible_content}\n"
+                
+                # 【新增】针对特定错误的详细分析
+                if line_no > 0 and line_no <= len(lines):
+                    current_line = lines[line_no - 1]
+                    instruction += f"\n  【错误分析】\n"
+                    
+                    # 分析括号匹配
+                    open_brackets = current_line.count('(') + current_line.count('[') + current_line.count('{')
+                    close_brackets = current_line.count(')') + current_line.count(']') + current_line.count('}')
+                    if open_brackets != close_brackets:
+                        instruction += f"    ⚠️ 括号不匹配: 开括号 {open_brackets} 个, 闭括号 {close_brackets} 个\n"
+                    
+                    # 分析缩进
+                    if current_line.strip():
+                        leading_spaces = len(current_line) - len(current_line.lstrip())
+                        if leading_spaces % 4 != 0:
+                            instruction += f"    ⚠️ 缩进可能错误: {leading_spaces} 个空格（应为4的倍数）\n"
+                    
+                    # 检查行尾
+                    if current_line.rstrip() != current_line:
+                        instruction += f"    ⚠️ 行尾有多余空格\n"
+                    
+                    # 检查特定语法结构
+                    if 'if __name__' in current_line and not current_line.strip().endswith(':'):
+                        instruction += f"    ⚠️ if __name__ 语句缺少冒号\n"
+                    
+                    # 检查上一行（可能是缺少换行）
+                    if line_no > 1:
+                        prev_line = lines[line_no - 2]
+                        if prev_line.strip() and not prev_line.rstrip().endswith((':', '{', '[', '(', '\\', ')', ']', '}')):
+                            if current_line.strip().startswith(('if ', 'for ', 'while ', 'def ', 'class ', 'elif ', 'else:', 'except', 'finally:')):
+                                instruction += f"    ⚠️ 第 {line_no-1} 行和第 {line_no} 行之间可能缺少换行符\n"
 
     instruction += f"""
 【原始文件内容】
 """
     for fp, content in error_files.items():
-        instruction += f"\n=== {fp} ===\n{content}\n"
+        instruction += f"\n=== {fp} ===\n"
+        # 显示带行号的内容，并标记行尾
+        lines = content.splitlines()
+        for i, line in enumerate(lines, 1):
+            # 标记行尾空格
+            if line.rstrip() != line:
+                line = line.rstrip() + "␣␣␣"  # 标记多余空格
+            instruction += f"{i:4d}: {line}\n"
+        # 检查文件末尾是否有换行
+        if content and not content.endswith('\n'):
+            instruction += "⚠️ 文件末尾缺少换行符！\n"
+        instruction += "\n"
 
     if force_full_file:
         instruction += """
@@ -308,8 +357,25 @@ def build_fix_instruction_with_context(
 由于前几次修复失败，现在进入强制完整文件覆盖模式：
 1. 必须输出 change_type="add" 和完整的 content
 2. 不要输出 search_block 或 replace_block
-3. 仔细检查所有括号是否匹配（每有一个 {{ 必须有一个 }}）
-4. 这是最后一次机会，如果仍然失败，工作将被拒绝！
+3. 仔细检查所有括号是否匹配（每有一个 { 必须有一个 }）
+4. 【关键】确保文件内容以换行符（\n）结尾
+5. 这是最后一次机会，如果仍然失败，工作将被拒绝！
+
+【修复 checklist】
+□ 所有括号 {} () [] 都正确匹配
+□ 所有 if/for/while/def/class 语句后都有冒号
+□ 缩进使用4个空格，没有混用 Tab
+□ 字符串引号 ' 或 " 正确闭合
+□ 文件末尾有换行符
+□ 修复后的代码可以通过 python -m py_compile 检查
+"""
+    else:
+        instruction += """
+【修复 checklist】
+□ 准确定位语法错误位置
+□ 只修改语法错误，不改动业务逻辑
+□ 确保 search_block 精确匹配（如果使用 modify）
+□ 文件末尾有换行符
 """
 
     return instruction

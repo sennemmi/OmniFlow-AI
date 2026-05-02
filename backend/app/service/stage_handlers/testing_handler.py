@@ -1,10 +1,11 @@
 """
-单元测试阶段处理器
+单元测试阶段处理器（带 Auto-Fix 增强版）
 
 处理 UNIT_TESTING 阶段：
 - 调用 TestAgent 生成测试代码
 - 执行测试验证
-- 支持测试失败处理和自动重试
+- 支持测试失败时的 RepairerAgent 自动修复
+- 与 E2E 测试脚本保持一致
 """
 
 from typing import Any, Dict, List, Optional
@@ -18,21 +19,31 @@ from app.service.workspace import async_workspace_context
 
 
 class TestingHandler(StageHandler):
-    """单元测试阶段处理器"""
+    """单元测试阶段处理器（带 Auto-Fix 增强版）"""
 
     MAX_TEST_RETRIES = 2  # 测试生成和修复的最大重试次数
+    MAX_REPAIR_ROUNDS = 3  # RepairerAgent 最大修复轮数
 
     @property
     def stage_name(self) -> StageName:
         return StageName.UNIT_TESTING
 
-    def _analyze_test_failure(self, logs: str) -> Dict[str, Any]:
+    def _analyze_test_failure(self, logs: Optional[str]) -> Dict[str, Any]:
         """
         分析测试失败原因，判断是测试文件问题还是代码问题
-        
+
         Returns:
             Dict with 'is_test_file_error', 'error_type', 'error_detail'
         """
+        # 确保 logs 是字符串
+        if not logs:
+            return {
+                "is_test_file_error": False,
+                "error_type": "unknown",
+                "error_detail": "无日志输出",
+                "suggestion": "查看详细日志"
+            }
+
         # 测试文件语法错误
         if "SyntaxError" in logs:
             file_match = re.search(r'File "([^"]*test_[^"]+)"', logs)
@@ -43,7 +54,7 @@ class TestingHandler(StageHandler):
                     "error_detail": f"测试文件语法错误: {file_match.group(1)}",
                     "suggestion": "重新生成测试文件"
                 }
-        
+
         # 测试文件导入错误
         if "ImportError" in logs or "ModuleNotFoundError" in logs:
             file_match = re.search(r'File "([^"]*test_[^"]+)"', logs)
@@ -54,7 +65,7 @@ class TestingHandler(StageHandler):
                     "error_detail": f"测试文件导入错误: {file_match.group(1)}",
                     "suggestion": "修正测试文件的 import 语句"
                 }
-        
+
         # 测试收集错误
         if "collection error" in logs.lower() or "ImportError while loading" in logs:
             return {
@@ -63,7 +74,7 @@ class TestingHandler(StageHandler):
                 "error_detail": "测试收集失败",
                 "suggestion": "检查测试文件结构"
             }
-        
+
         # 普通测试失败（可能是代码问题或测试逻辑问题）
         if "FAILED" in logs or "AssertionError" in logs:
             return {
@@ -72,7 +83,7 @@ class TestingHandler(StageHandler):
                 "error_detail": "测试断言失败",
                 "suggestion": "检查代码实现或测试逻辑"
             }
-        
+
         return {
             "is_test_file_error": False,
             "error_type": "unknown",
@@ -92,13 +103,13 @@ class TestingHandler(StageHandler):
     ) -> Dict[str, Any]:
         """
         生成测试并支持自动重试修复
-        
+
         Returns:
             Dict with test generation result and test files
         """
         retry_count = 0
         last_error_context = None
-        
+
         while retry_count <= self.MAX_TEST_RETRIES:
             # 构建生成参数
             generate_params = {
@@ -107,7 +118,7 @@ class TestingHandler(StageHandler):
                 "target_files": target_files,
                 "pipeline_id": pipeline_id
             }
-            
+
             # 如果有错误上下文，添加到提示中
             if last_error_context:
                 await push_log(
@@ -120,9 +131,9 @@ class TestingHandler(StageHandler):
                 enhanced_design = dict(design_output)
                 enhanced_design["test_fix_context"] = last_error_context
                 generate_params["design_output"] = enhanced_design
-            
+
             test_result = await test_agent.generate_tests(**generate_params)
-            
+
             if not test_result["success"]:
                 retry_count += 1
                 if retry_count > self.MAX_TEST_RETRIES:
@@ -139,11 +150,11 @@ class TestingHandler(StageHandler):
                     stage="UNIT_TESTING"
                 )
                 continue
-            
+
             # 获取测试文件
             test_output = test_result["output"]
             test_files = test_output.get("test_files", [])
-            
+
             if not test_files:
                 return {
                     "success": True,
@@ -151,7 +162,7 @@ class TestingHandler(StageHandler):
                     "error": "No test files generated",
                     "retry_count": retry_count
                 }
-            
+
             # 写入测试文件
             for test_file in test_files:
                 file_path = test_file.get("file_path", "")
@@ -160,11 +171,11 @@ class TestingHandler(StageHandler):
                     if not file_path.startswith("tests/") and not file_path.startswith("backend/tests/"):
                         file_path = f"tests/{file_path}"
                     executor.apply_changes({file_path: content}, create_if_missing=True)
-            
+
             # 运行测试验证
             await push_log(pipeline_id, "info", "运行测试验证...", stage="UNIT_TESTING")
             test_run_result = await test_runner.run_tests(str(executor.workspace_dir))
-            
+
             if test_run_result["success"]:
                 await push_log(pipeline_id, "success", "✅ 所有测试通过！", stage="UNIT_TESTING")
                 return {
@@ -175,11 +186,11 @@ class TestingHandler(StageHandler):
                     "test_logs": test_run_result.get("logs", ""),
                     "retry_count": retry_count
                 }
-            
+
             # 测试失败，分析原因
-            logs = test_run_result.get("logs", "")
+            logs = test_run_result.get("logs") or ""  # 确保 logs 不会是 None
             failure_analysis = self._analyze_test_failure(logs)
-            
+
             if failure_analysis["is_test_file_error"] and retry_count < self.MAX_TEST_RETRIES:
                 # 测试文件问题，可以重试
                 retry_count += 1
@@ -219,7 +230,7 @@ class TestingHandler(StageHandler):
                     "retry_count": retry_count,
                     "failure_analysis": failure_analysis
                 }
-        
+
         # 达到最大重试次数
         return {
             "success": True,
@@ -228,6 +239,207 @@ class TestingHandler(StageHandler):
             "test_run_success": False,
             "test_error": "达到最大重试次数，测试文件仍有问题",
             "retry_count": retry_count
+        }
+
+    async def _run_auto_fix_with_repairer(
+        self,
+        pipeline_id: int,
+        test_files: List[Dict],
+        code_files: List[Dict],
+        test_logs: str,
+        design_output: Dict,
+        executor
+    ) -> Dict[str, Any]:
+        """
+        【增强】使用 RepairerAgent 自动修复代码 Bug
+
+        与 E2E 测试脚本保持一致：
+        - 提取关键文件
+        - 调用 RepairerAgentWithTools
+        - 多轮修复直到测试通过或达到最大轮数
+        """
+        from app.agents.repairer_with_tools import RepairerAgentWithTools
+        from app.utils.repair_utils import (
+            extract_critical_files_with_imports,
+            build_fix_order,
+            extract_pytest_failures,
+            extract_file_paths
+        )
+        from app.utils.file_operation_utils import normalize_file_path
+
+        await push_log(
+            pipeline_id,
+            "info",
+            f"🔧 启动 RepairerAgent 自动修复（最多 {self.MAX_REPAIR_ROUNDS} 轮）...",
+            stage="UNIT_TESTING"
+        )
+
+        # 合并所有生成的文件
+        all_generated_files = code_files + test_files
+        generated_file_paths = extract_file_paths(all_generated_files)
+
+        # 读取所有文件内容
+        file_contents = {}
+        for path in generated_file_paths:
+            # 从 executor 读取文件内容
+            try:
+                content = executor.read_file(path.replace("backend/", "").replace("backend\\", ""))
+                if content:
+                    file_contents[path] = content
+            except Exception:
+                # 如果读取失败，尝试从 code_files/test_files 获取
+                for f in all_generated_files:
+                    if f.get("file_path") == path:
+                        if f.get("content"):
+                            file_contents[path] = f["content"]
+                        break
+
+        # 提取失败测试列表
+        failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
+
+        # 提取关键错误信息
+        error_content = extract_pytest_failures(test_logs, max_chars=5000)
+
+        repair_round = 0
+        current_test_files = test_files
+        current_code_files = code_files
+
+        while repair_round < self.MAX_REPAIR_ROUNDS:
+            repair_round += 1
+
+            await push_log(
+                pipeline_id,
+                "info",
+                f"🔄 RepairerAgent 第 {repair_round}/{self.MAX_REPAIR_ROUNDS} 轮修复...",
+                stage="UNIT_TESTING"
+            )
+
+            # 提取关键文件（含 import 关联）
+            essential_paths = extract_critical_files_with_imports(
+                logs=test_logs,
+                all_generated_paths=generated_file_paths,
+                file_contents=file_contents
+            )
+
+            await push_log(
+                pipeline_id,
+                "info",
+                f"🎯 精选 {len(essential_paths)} 个核心文件进行修复",
+                stage="UNIT_TESTING"
+            )
+
+            # 构建修复工单
+            fix_order = build_fix_order(
+                failed_tests=failed_tests,
+                logs=test_logs,
+                generated_file_paths=essential_paths
+            )
+
+            # 收集目标文件内容
+            target_files = {}
+            for path in essential_paths:
+                if path in file_contents:
+                    target_files[path] = file_contents[path]
+
+            if not target_files:
+                await push_log(
+                    pipeline_id,
+                    "error",
+                    "❌ 无法获取文件内容，修复失败",
+                    stage="UNIT_TESTING"
+                )
+                break
+
+            # 调用 RepairerAgentWithTools
+            repairer = RepairerAgentWithTools()
+            repair_result = await repairer.execute_with_tools(
+                pipeline_id=pipeline_id,
+                stage_name="UNIT_TESTING_REPAIR",
+                fix_order=fix_order,
+                target_files=target_files,
+                max_rounds=3
+            )
+
+            if not repair_result.get("success"):
+                await push_log(
+                    pipeline_id,
+                    "error",
+                    f"❌ RepairerAgent 修复失败: {repair_result.get('error', '未知错误')}",
+                    stage="UNIT_TESTING"
+                )
+                break
+
+            # 修复成功，应用修改
+            repair_output = repair_result.get("output", {})
+            fixed_files = repair_output.get("files", [])
+
+            if not fixed_files:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    "⚠️ RepairerAgent 未生成修复文件",
+                    stage="UNIT_TESTING"
+                )
+                break
+
+            await push_log(
+                pipeline_id,
+                "info",
+                f"✅ RepairerAgent 生成 {len(fixed_files)} 个文件修复",
+                stage="UNIT_TESTING"
+            )
+
+            # 应用修复到工作区
+            for f in fixed_files:
+                fp = f.get("file_path", "")
+                content = f.get("content", "")
+                if fp and content:
+                    executor.apply_changes({fp: content}, create_if_missing=True)
+                    # 更新 file_contents
+                    file_contents[fp] = content
+
+            # 重新运行测试
+            from app.service.test_runner import TestRunnerService
+            new_test_result = await TestRunnerService.run_tests(str(executor.workspace_dir))
+
+            if new_test_result["success"]:
+                await push_log(
+                    pipeline_id,
+                    "success",
+                    f"✅ 修复后测试通过！（第 {repair_round} 轮）",
+                    stage="UNIT_TESTING"
+                )
+                return {
+                    "success": True,
+                    "repair_rounds": repair_round,
+                    "test_run_success": True,
+                    "fixed_files": fixed_files
+                }
+
+            # 测试仍失败，更新日志继续下一轮
+            test_logs = new_test_result.get("logs", "")
+            failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
+
+            await push_log(
+                pipeline_id,
+                "warning",
+                f"⚠️ 第 {repair_round} 轮修复后仍有测试失败，继续修复...",
+                stage="UNIT_TESTING"
+            )
+
+        # 达到最大修复轮数
+        await push_log(
+            pipeline_id,
+            "error",
+            f"🚨 达到最大修复轮数 ({self.MAX_REPAIR_ROUNDS})，测试仍未通过",
+            stage="UNIT_TESTING"
+        )
+
+        return {
+            "success": False,
+            "repair_rounds": repair_round,
+            "test_run_success": False,
+            "error": f"Auto-fix failed after {repair_round} rounds"
         }
 
     async def prepare(self, context: StageContext) -> StageContext:
@@ -246,7 +458,7 @@ class TestingHandler(StageHandler):
         if not coding_stage or not coding_stage.output_data:
             raise ValueError("No coding output found for UNIT_TESTING stage")
 
-        coding_output = coding_stage.output_data.get("multi_agent_output", {})
+        coding_output = coding_stage.output_data.get("coder_output", {})
         target_files = coding_stage.output_data.get("target_files", {})
 
         # 获取 DESIGN 阶段输出
@@ -290,7 +502,7 @@ class TestingHandler(StageHandler):
         return context
 
     async def execute(self, context: StageContext) -> StageResult:
-        """执行单元测试生成和验证"""
+        """执行单元测试生成和验证（带 Auto-Fix）"""
         pipeline_id = context.pipeline_id
         coding_output = context.input_data.get("coding_output", {})
         design_output = context.input_data.get("design_output", {})
@@ -304,6 +516,7 @@ class TestingHandler(StageHandler):
         from app.service.test_runner import TestRunnerService
 
         testing_result = None
+        repair_history = []
 
         try:
             async with async_workspace_context(pipeline_id) as ws:
@@ -400,6 +613,49 @@ class TestingHandler(StageHandler):
                         stage="UNIT_TESTING"
                     )
 
+                # 【增强】如果测试未通过且是代码问题，启动 RepairerAgent 修复
+                if testing_result.get("test_generated") and not testing_result.get("test_run_success"):
+                    failure_analysis = testing_result.get("failure_analysis", {})
+
+                    # 只有非测试文件错误才需要 RepairerAgent 修复
+                    if not failure_analysis.get("is_test_file_error", True):
+                        test_logs = testing_result.get("test_logs") or ""  # 确保不会是 None
+                        test_files = testing_result.get("test_files", [])
+
+                        repair_result = await self._run_auto_fix_with_repairer(
+                            pipeline_id=pipeline_id,
+                            test_files=test_files,
+                            code_files=all_files,
+                            test_logs=test_logs,
+                            design_output=design_output,
+                            executor=executor
+                        )
+
+                        repair_history.append({
+                            "rounds": repair_result.get("repair_rounds", 0),
+                            "success": repair_result.get("test_run_success", False),
+                            "fixed_files_count": len(repair_result.get("fixed_files", []))
+                        })
+
+                        if repair_result.get("test_run_success"):
+                            # 修复成功，更新测试结果
+                            testing_result["test_run_success"] = True
+                            testing_result["repair_success"] = True
+                            await push_log(
+                                pipeline_id,
+                                "success",
+                                "✅ 代码修复成功，测试通过！",
+                                stage="UNIT_TESTING"
+                            )
+                        else:
+                            testing_result["repair_success"] = False
+                            await push_log(
+                                pipeline_id,
+                                "warning",
+                                "⚠️ 自动修复未能解决所有问题，进入人工审查阶段",
+                                stage="UNIT_TESTING"
+                            )
+
         except Exception as e:
             await push_log(pipeline_id, "error", f"单元测试执行失败: {str(e)}", stage="UNIT_TESTING")
             testing_result = {
@@ -409,17 +665,23 @@ class TestingHandler(StageHandler):
             }
 
         # 构建结果
-        # 从 testing_result 中提取指标
         metrics = {
             "retry_count": testing_result.get("retry_count", 0),
+            "repair_rounds": sum(r.get("rounds", 0) for r in repair_history),
+            "repair_success": any(r.get("success", False) for r in repair_history)
         }
+
+        # 提取 test_files 用于前端展示
+        test_files = testing_result.get("test_files", []) if testing_result else []
 
         return StageResult.success_result(
             message="Unit testing completed",
             output_data={
                 "testing_result": testing_result,
+                "test_files": test_files,  # 添加 test_files 用于前端展示
                 "coding_output": coding_output,
-                "target_files": target_files
+                "target_files": target_files,
+                "repair_history": repair_history
             },
             status=PipelineStatus.PAUSED,  # 等待审批
             metrics=metrics
@@ -469,12 +731,25 @@ class TestingHandler(StageHandler):
             pipeline.current_stage = StageName.CODE_REVIEW
             await WorkflowService.set_pipeline_paused(pipeline, context.session)
 
-        await push_log(
-            context.pipeline_id,
-            "info",
-            "单元测试完成，进入代码审查阶段",
-            stage="CODE_REVIEW"
-        )
+        # 输出修复历史摘要
+        repair_history = result.output_data.get("repair_history", [])
+        if repair_history:
+            total_rounds = sum(r.get("rounds", 0) for r in repair_history)
+            repair_success = any(r.get("success", False) for r in repair_history)
+            status_icon = "✅" if repair_success else "⚠️"
+            await push_log(
+                context.pipeline_id,
+                "info",
+                f"{status_icon} 单元测试完成（RepairerAgent 修复 {total_rounds} 轮），进入代码审查阶段",
+                stage="CODE_REVIEW"
+            )
+        else:
+            await push_log(
+                context.pipeline_id,
+                "info",
+                "单元测试完成，进入代码审查阶段",
+                stage="CODE_REVIEW"
+            )
 
         await context.session.commit()
 
@@ -506,14 +781,14 @@ class TestingHandler(StageHandler):
         """
         from sqlmodel import select
         from app.models.pipeline import PipelineStage
-        
+
         await push_log(
             context.pipeline_id,
             "info",
             "单元测试已批准，进入代码审查阶段...",
             stage="UNIT_TESTING"
         )
-        
+
         # 获取测试阶段的结果
         statement = select(PipelineStage).where(
             PipelineStage.pipeline_id == context.pipeline_id,
@@ -521,15 +796,15 @@ class TestingHandler(StageHandler):
         )
         result = await context.session.execute(statement)
         testing_stage = result.scalar_one_or_none()
-        
+
         testing_result = {}
         if testing_stage and testing_stage.output_data:
             testing_result = testing_stage.output_data.get("testing_result", {})
-        
+
         # 创建 CODE_REVIEW 阶段
         coding_output = testing_stage.output_data.get("coding_output", {}) if testing_stage else {}
         target_files = testing_stage.output_data.get("target_files", {}) if testing_stage else {}
-        
+
         await WorkflowService.create_stage(
             pipeline_id=context.pipeline_id,
             stage_name=StageName.CODE_REVIEW,
@@ -540,7 +815,7 @@ class TestingHandler(StageHandler):
             },
             session=context.session
         )
-        
+
         # 更新 Pipeline 当前阶段
         pipeline = await WorkflowService.get_pipeline_with_stages(
             context.pipeline_id, context.session
@@ -548,9 +823,9 @@ class TestingHandler(StageHandler):
         if pipeline:
             pipeline.current_stage = StageName.CODE_REVIEW
             await WorkflowService.set_pipeline_paused(pipeline, context.session)
-        
+
         await context.session.commit()
-        
+
         return StageResult.success_result(
             message="Unit testing approved, proceeding to code review",
             output_data={
@@ -561,7 +836,7 @@ class TestingHandler(StageHandler):
             },
             status=PipelineStatus.PAUSED
         )
-    
+
     async def on_rejected(
         self,
         context: StageContext,
@@ -572,24 +847,24 @@ class TestingHandler(StageHandler):
         UNIT_TESTING 阶段被驳回后：回退到 CODING 重新生成代码和测试
         """
         from app.service.stage_handlers import CodingHandler
-        
+
         await push_log(
             context.pipeline_id,
             "info",
             f"单元测试被驳回，原因: {reason}，回退到代码生成阶段...",
             stage="UNIT_TESTING"
         )
-        
+
         # 标记 CODING 阶段需要重新执行
         rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
-        
+
         await WorkflowService.mark_stage_for_rerun(
             pipeline_id=context.pipeline_id,
             stage_name=StageName.CODING,
             rejection_feedback=rejection_feedback,
             session=context.session
         )
-        
+
         # 重新触发 CODING 阶段（会自动进入 UNIT_TESTING）
         coding_handler = CodingHandler()
         coding_context = StageContext(
@@ -598,9 +873,9 @@ class TestingHandler(StageHandler):
             input_data={},
             rejection_feedback=rejection_feedback
         )
-        
+
         coding_result = await coding_handler.run(coding_context)
-        
+
         if coding_result.success:
             # CODING 成功后，执行 TESTING
             testing_result = await self.run(StageContext(
@@ -608,7 +883,7 @@ class TestingHandler(StageHandler):
                 session=context.session,
                 input_data={}
             ))
-            
+
             return StageResult(
                 success=testing_result.success,
                 status=testing_result.status,

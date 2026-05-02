@@ -12,6 +12,7 @@ import { interaction } from './interaction';
 import { pipeline } from './pipeline';
 import { preview } from './preview';
 import { dom, utils, reactSourceMapper } from './core';
+import { SearchReplaceEngine, searchReplaceEngine } from './searchReplace';
 
 /**
  * OmniFlowAI Injector 主类
@@ -171,6 +172,7 @@ class OmniFlowInjector {
         dom,
         utils,
         bus,
+        searchReplaceEngine,
       },
     };
   }
@@ -205,4 +207,11 @@ export { pipeline, PipelineModule } from './pipeline';
 export { preview, PreviewModule } from './preview';
 export { dom, DOM, utils, Utils, reactSourceMapper, ReactSourceMapper } from './core';
 export { visualFeedback, VisualFeedback, panelManager, PanelManager } from './selection';
+export {
+  SearchReplaceEngine,
+  searchReplaceEngine,
+  applySearchReplace,
+  applyPatchesSafely,
+  applyLinePatch,
+} from './searchReplace';
 export type * from './types';

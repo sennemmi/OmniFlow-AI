@@ -20,6 +20,7 @@ from app.service.pr_generator import PRGeneratorService
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
 from app.service.workspace import workspace_context
+from app.service.sandbox_manager import sandbox_manager
 
 
 class DeliveryHandler(StageHandler):
@@ -200,6 +201,13 @@ class DeliveryHandler(StageHandler):
         from app.core.sse_log_buffer import remove_buffer
         remove_buffer(context.pipeline_id)
 
+        # 【关键修复】Pipeline 完成时停止 Sandbox
+        try:
+            await sandbox_manager.stop(context.pipeline_id)
+            await push_log(context.pipeline_id, "info", "Sandbox 已停止", stage="DELIVERY")
+        except Exception as e:
+            await push_log(context.pipeline_id, "warning", f"停止 Sandbox 时出错: {str(e)}", stage="DELIVERY")
+
         await context.session.commit()
 
     async def handle_error(
@@ -236,6 +244,12 @@ class DeliveryHandler(StageHandler):
         # 清理 SSE 日志缓冲区
         from app.core.sse_log_buffer import remove_buffer
         remove_buffer(context.pipeline_id)
+
+        # 【关键修复】Pipeline 失败时停止 Sandbox
+        try:
+            await sandbox_manager.stop(context.pipeline_id)
+        except Exception:
+            pass  # 忽略错误
 
         return StageResult.failure_result(
             message=f"Delivery failed: {str(error)}",

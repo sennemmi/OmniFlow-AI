@@ -297,8 +297,22 @@ class MultiAgentCoordinator:
                         # 读取原文件
                         read_result = await file_service.read_file(file_path)
                         if read_result.exists and read_result.content:
-                            # 应用替换
-                            new_content = read_result.content.replace(search_block, replace_block, 1)
+                            # 【修复】使用 search_replace_engine 进行替换，支持换行符归一化
+                            from app.service.search_replace_engine import search_replace_engine
+                            new_content = search_replace_engine.apply_search_replace(
+                                original=read_result.content,
+                                search_block=search_block,
+                                replace_block=replace_block
+                            )
+                            if new_content is None:
+                                logger.error(f"[MultiAgentCoordinator] 搜索替换失败: {file_path}")
+                                await push_log(
+                                    pipeline_id,
+                                    "error",
+                                    f"❌ 搜索替换失败: {file_path}",
+                                    stage="CODING"
+                                )
+                                continue
                             # 写入新内容
                             result = await file_service.write_file(file_path, new_content)
                             write_results.append(result)
@@ -674,7 +688,8 @@ class MultiAgentCoordinator:
                 if change_type == "add":
                     original = ""
                 else:
-                    original = read_result.content if read_result.exists else ""
+                    # 【修复】确保 original 不为 None
+                    original = read_result.content if read_result.exists and read_result.content is not None else ""
 
                 enriched["original_content"] = original
                 enriched["read_token"] = read_result.read_token

@@ -21,6 +21,8 @@ from app.agents.tool_agent import ToolUsingAgent
 from app.agents.schemas import ArchitectOutput
 from app.agents.token_budget_allocator import TokenBudgetAllocator
 from app.core.config import settings
+from app.utils.path_utils import normalize_relative_path
+from app.utils.prompt_builder import get_common_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +183,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
     @property
     def system_prompt(self) -> str:
         """系统 Prompt - 包含八荣八耻准则和工具使用引导"""
-        return """你是 OmniFlowAI 的架构师 Agent，负责分析需求并输出技术设计方案。
+        return f"""你是 OmniFlowAI 的架构师 Agent，负责分析需求并输出技术设计方案。
 
 【八荣八耻准则】
 以架构分层为荣，以循环依赖为耻
@@ -192,6 +194,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 以版本锁定为荣，以依赖混乱为耻
 以单元测试为荣，以手工验证为耻
 以监控告警为荣，以故障未知为耻
+
+{get_common_prompt()}
 
 【现有代码 - 必须严格遵守的权威事实】
 下面的【相关代码上下文】部分已经包含了与需求相关的关键文件内容。
@@ -232,28 +236,18 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 - 使用 read_file 分段读取关键代码（每次最多80行）
 - **控制探索范围**，2-3 个关键文件足够，不要贪多
 
-【输出格式 - 极其重要，违反会导致系统崩溃】
-探索完成后，你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
-输出必须是一个有效的 JSON 对象。
+【输出格式】
+探索完成后，输出 JSON 格式包含以下字段：
+- feature_description: 功能描述（简洁明了）
+- affected_files: 受影响文件列表（相对路径）
+- estimated_effort: 预估工作量（如：2小时、1天）
+- technical_design: 技术设计方案（可选，详细描述）
+- acceptance_criteria: 可验证的验收标准列表（3-5条，每条包含具体行为或接口签名）
+- required_symbols: **必需实现的符号清单**（极其重要，DesignerAgent 必须严格遵守）
 
-⚠️ 警告：任何非 JSON 内容（包括解释、总结、思考过程）都会导致解析失败！
-
-正确示例（直接输出 JSON，从第一行开始就是 {）：
-{"feature_description": "实现用户登录功能", "affected_files": ["backend/app/api/v1/auth.py", "backend/app/service/auth_service.py"], "estimated_effort": "2小时", "technical_design": "使用JWT进行身份验证"}
-
-错误示例（绝对禁止）：
-❌ 不要添加 ```json 标记
-❌ 不要添加解释文本如"根据项目探索结果..."
-❌ 不要使用工具调用格式如 [TOOL_CALL]
-❌ 不要输出 "我需要先分析..." 等思考过程
-❌ 不要在 JSON 前添加任何总结或说明
-
-【强制要求 - 必须遵守】
-1. 直接输出 JSON，从第一行第一个字符就是 {
-2. 不要有任何前缀文本，包括"根据探索结果"、"我发现"等
-3. 不要有任何后缀文本
-4. 确保 JSON 格式完整有效
-5. 只输出纯 JSON，其他什么都不要输出
+【验收标准要求】
+请输出 3-5 条可验证的验收标准，每条应包含具体行为或接口签名，例如：
+- "函数 check_database_status 必须返回 status 字段和 response_time_ms 字段"
 
 【字段说明】
 - feature_description: 功能描述（简洁明了）
@@ -265,9 +259,9 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 
 【验收标准要求】
 请输出 3-5 条可验证的验收标准，每条应包含具体行为或接口签名，例如：
-- "函数 check_database_status 必须返回 {'status': 'up'|'down', 'response_time_ms': int}"
+- "函数 check_database_status 必须返回 status 字段和 response_time_ms 字段"
 - "API 端点 POST /api/v1/users 必须返回 201 状态码和创建的用户对象"
-- "类 UserService 必须实现 async def get_by_id(self, user_id: int) -> User 方法"
+- "类 UserService 必须实现 async def get_by_id 方法"
 
 【必需符号清单要求 - 强制 DesignerAgent 遵守】
 除了验收标准，你还必须明确列出 **required_symbols**，要求 DesignerAgent 在 interface_specs 中实现这些符号。
@@ -278,20 +272,39 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 - module: 所在模块（如 "app/service/health_service.py"）
 - signature: 函数签名（可选，如 "async def check_database_status() -> dict"）
 - description: 简短描述（可选）
+- **return_fields_contract: 【新增】返回值字典必须包含的键名列表（极其重要！）**
+
+**【P0】return_fields_contract 强制要求**：
+对于返回 dict 的函数，你必须明确列出所有返回键名。这是机器可强制执行的契约，CoderAgent 将据此校验实现。
+
+示例：
+```json
+{{
+  "required_symbols": [
+    {{
+      "name": "check_database_status",
+      "type": "function",
+      "module": "app/service/health_service.py",
+      "signature": "async def check_database_status() -> dict",
+      "return_fields_contract": ["status", "response_time_ms"]
+    }},
+    {{
+      "name": "calculate_health_score",
+      "type": "function",
+      "module": "app/service/health_service.py",
+      "signature": "def calculate_health_score(components: dict) -> tuple[int, str]",
+      "return_fields_contract": []
+    }}
+  ]
+}}
+```
 
 **重要规则**：
 1. required_symbols 中的每个符号都必须在 affected_files 中对应的文件里实现
 2. 验收标准中提到的函数/类，必须在 required_symbols 中列出
-3. DesignerAgent 会严格对照此清单生成 interface_specs，遗漏任何符号都会导致重试
-4. 【绝对禁止】如果某个功能由类的方法实现（例如 HealthService 类的 get_component_health 方法），你只能将【类名】（HealthService）放入 required_symbols，严禁将类方法名作为独立的符号放入清单！
-
-示例：
-{
-  "required_symbols": [
-    {"name": "check_database_status", "type": "function", "module": "app/service/health_service.py", "signature": "async def check_database_status() -> dict"},
-    {"name": "SystemMonitor", "type": "class", "module": "app/utils/monitor.py"}
-  ]
-}
+3. **如果函数返回 dict，return_fields_contract 必须非空，列出所有键名**
+4. DesignerAgent 会严格对照此清单生成 interface_specs，遗漏任何符号或键名都会导致重试
+5. 【绝对禁止】如果某个功能由类的方法实现（例如 HealthService 类的 get_component_health 方法），你只能将【类名】（HealthService）放入 required_symbols，严禁将类方法名作为独立的符号放入清单！
 
 【注意事项】
 - 文件路径使用相对路径
@@ -719,99 +732,59 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             design_state=design_state,
             pipeline_id=pipeline_id
         )
-        
+
+        # 【关键修复】合并探索阶段的工具调用计数到设计阶段结果
+        exploration_tool_calls = exploration_result.get("tool_calls", 0)
+        design_tool_calls = design_result.get("tool_calls", 0)
+        total_tool_calls = exploration_tool_calls + design_tool_calls
+
         # 合并结果
         if design_result.get("success"):
             # 将 injected_files 添加到结果中
             if design_result.get("output"):
                 design_result["output"]["injected_files"] = full_file_contents
                 design_result["injected_files"] = full_file_contents
-            
-            logger.info(f"[ArchitectAgent] 两步式分析完成，成功生成设计方案")
+
+            # 【关键修复】保存总的工具调用计数
+            design_result["tool_calls"] = total_tool_calls
+            design_result["exploration_tool_calls"] = exploration_tool_calls
+            design_result["design_tool_calls"] = design_tool_calls
+
+            logger.info(f"[ArchitectAgent] 两步式分析完成，成功生成设计方案（共使用 {total_tool_calls} 次工具调用）")
             if pipeline_id:
-                await push_log(pipeline_id, "info", "✅ ArchitectAgent 完成，已生成详细设计方案", stage="ARCHITECT")
-        
-        return design_result
-        
-        # 【调试】记录 result 的详细信息
-        logger.info(f"[ArchitectAgent] execute 返回结果: success={result.get('success')}, error={result.get('error')}")
-        if result.get('output'):
-            output = result['output']
-            logger.info(f"[ArchitectAgent] output 键: {list(output.keys())}")
-            if 'feature_description' in output:
-                logger.info(f"[ArchitectAgent] feature_description: {output['feature_description'][:100]}...")
-            if 'affected_files' in output:
-                logger.info(f"[ArchitectAgent] affected_files: {output['affected_files']}")
-        if result.get('raw_output'):
-            raw = result['raw_output']
-            logger.info(f"[ArchitectAgent] raw_output 长度: {len(raw)} 字符")
-            logger.info(f"[ArchitectAgent] raw_output 前300字符: {repr(raw[:300])}")
-            logger.info(f"[ArchitectAgent] raw_output 后300字符: {repr(raw[-300:])}")
+                await push_log(pipeline_id, "info", f"✅ ArchitectAgent 完成，已生成详细设计方案（使用了 {total_tool_calls} 次工具调用）", stage="ARCHITECT")
+        else:
+            # 即使失败也保存工具调用计数（用于调试）
+            design_result["tool_calls"] = total_tool_calls
+            design_result["exploration_tool_calls"] = exploration_tool_calls
+            design_result["design_tool_calls"] = design_tool_calls
 
-        # 【核心改造】将读取的文件内容存入返回结果，供下游 CoderAgent 使用
-        if result.get("success") and self._agent_tools:
-            affected_files = result.get("output", {}).get("affected_files", [])
-            injected_files = {}
-            
-            # 记录预加载的文件列表供后续验证使用
-            preloaded_files_list = list(preloaded_files.keys())
-            result["output"]["_preloaded_files"] = preloaded_files_list
+        # 【关键】调用工具探索配额检查
+        await self._enforce_tool_exploration_quota(design_result, pipeline_id)
 
-            for file_path in affected_files:
-                # 【修复】统一路径格式，移除 backend/ 前缀
-                clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
-                
-                # 从文件缓存中获取内容（尝试多种路径格式）
-                cache = None
-                for path_key in [file_path, clean_path, f"backend/{clean_path}"]:
-                    cache = self._agent_tools._file_cache.get(path_key)
-                    if cache:
-                        break
-                
-                if cache and cache.get("content"):
-                    injected_files[clean_path] = cache["content"]
-                else:
-                    # 如果缓存中没有，尝试直接读取
-                    try:
-                        read_result = self._agent_tools.read_file(clean_path)
-                        read_data = json.loads(read_result)
-                        if read_data.get("exists"):
-                            # 从缓存中获取完整内容
-                            cache = self._agent_tools._file_cache.get(clean_path)
-                            if cache:
-                                injected_files[clean_path] = cache["content"]
-                    except Exception as e:
-                        logger.warning(f"[ArchitectAgent] 无法读取文件 {clean_path}: {e}")
-
-            if injected_files:
-                # 【关键】将 injected_files 添加到 output 中，这样会被保存到数据库的 output_data
-                if result.get("output"):
-                    result["output"]["injected_files"] = injected_files
-                result["injected_files"] = injected_files  # 保留在 result 顶层，便于直接访问
-                
-                # 【调试】记录详细的 injected_files 信息
-                logger.info(f"[ArchitectAgent] 已将 {len(injected_files)} 个文件内容注入到结果中", extra={
-                    "pipeline_id": pipeline_id,
-                    "injected_files_count": len(injected_files),
-                    "injected_files": list(injected_files.keys())
-                })
-                for path, content in injected_files.items():
-                    logger.info(f"[ArchitectAgent]   - {path}: {len(content)} 字符")
-            else:
-                logger.warning(f"[ArchitectAgent] injected_files 为空！affected_files={affected_files}")
-                logger.warning(f"[ArchitectAgent] _file_cache 键: {list(self._agent_tools._file_cache.keys()) if self._agent_tools else 'None'}")
-
-        # 【新增】验证 required_symbols 中的文件是否存在于 affected_files 或 file_tree 中
-        if result.get("success") and result.get("output"):
-            output = result["output"]
+        # 【关键】验证 required_symbols 中的文件是否存在于 affected_files 或 file_tree 中
+        if design_result.get("success") and design_result.get("output"):
+            output = design_result["output"]
             required_symbols = output.get("required_symbols", [])
             affected_files = output.get("affected_files", [])
             
             if required_symbols:
+                # 【简化】合并 P0-1 日志，只保留一条汇总日志
+                symbols_with_contract = [
+                    s for s in required_symbols 
+                    if s.get("return_fields_contract")
+                ]
+                if symbols_with_contract:
+                    contract_summary = {s.get("name"): s.get("return_fields_contract") for s in symbols_with_contract}
+                    logger.info(f"[ArchitectAgent] 发现 {len(symbols_with_contract)} 个带契约的符号", extra={
+                        "pipeline_id": pipeline_id,
+                        "contract_summary": contract_summary
+                    })
+                
                 # 构建 affected_files 的集合（标准化路径）
                 affected_set = set()
                 for f in affected_files:
-                    clean = f.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                    clean = normalize_relative_path(f)
                     affected_set.add(clean)
                     affected_set.add(f"backend/{clean}")
                 
@@ -822,8 +795,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     if not module:
                         continue
                     
-                    # 标准化模块路径
-                    clean_module = module.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                    # 【重构】使用 path_utils 标准化模块路径
+                    clean_module = normalize_relative_path(module)
                     
                     # 检查是否在 affected_files 中
                     if clean_module in affected_set or f"backend/{clean_module}" in affected_set:
@@ -834,7 +807,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                             validated_symbols.append(symbol)
                         else:
                             # 【放宽】如果文件在预加载的代码中，也认为是有效的
-                            preloaded = result.get("output", {}).get("_preloaded_files", [])
+                            preloaded = output.get("_preloaded_files", [])
                             if clean_module in preloaded or f"backend/{clean_module}" in preloaded:
                                 validated_symbols.append(symbol)
                                 logger.info(f"[ArchitectAgent] required_symbol 文件在预加载列表中: {module}", extra={
@@ -853,9 +826,9 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     logger.info(f"[ArchitectAgent] 过滤后的 required_symbols: {len(validated_symbols)}/{len(required_symbols)}")
                     output["required_symbols"] = validated_symbols
                     # 同时更新 result 中的 output
-                    result["output"] = output
+                    design_result["output"] = output
 
-        return result
+        return design_result
 
     async def _enforce_tool_exploration_quota(
         self,
@@ -901,12 +874,12 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         
         if self._agent_tools:
             for path in self._agent_tools._file_cache:
-                clean = path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+                clean = normalize_relative_path(path)
                 read_files.add(clean)
                 read_files.add(f"backend/{clean}")
-        
+
         for f in affected_files:
-            clean = f.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            clean = normalize_relative_path(f)
             if clean not in read_files and f"backend/{clean}" not in read_files:
                 unread_files.append(f)
         
@@ -1175,8 +1148,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         file_service = SandboxFileService(pipeline_id)
         
         for file_path in affected_files:
-            # 标准化路径
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            # 【重构】使用 path_utils 标准化路径
+            clean_path = normalize_relative_path(file_path)
             
             try:
                 result = await file_service.read_file(clean_path)
@@ -1237,6 +1210,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     "output": output_dict,
                     "input_tokens": result.get("input_tokens", 0),
                     "output_tokens": result.get("output_tokens", 0),
+                    "duration_ms": result.get("duration_ms", 0),
+                    "tool_calls": result.get("tool_calls", 0),
                     "raw_output": result["content"]
                 }
             except Exception as e:
@@ -1244,12 +1219,20 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                 return {
                     "success": False,
                     "error": f"设计阶段输出验证失败: {e}",
+                    "input_tokens": result.get("input_tokens", 0),
+                    "output_tokens": result.get("output_tokens", 0),
+                    "duration_ms": result.get("duration_ms", 0),
+                    "tool_calls": result.get("tool_calls", 0),
                     "raw_output": result.get("content", "")[:500]
                 }
         else:
             return {
                 "success": False,
                 "error": "设计阶段 LLM 返回空内容",
+                "input_tokens": result.get("input_tokens", 0),
+                "output_tokens": result.get("output_tokens", 0),
+                "duration_ms": result.get("duration_ms", 0),
+                "tool_calls": result.get("tool_calls", 0),
                 "raw_output": ""
             }
 

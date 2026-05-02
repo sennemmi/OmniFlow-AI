@@ -309,12 +309,6 @@ export function Console() {
                 status="正常"
                 statusColor="emerald"
               />
-              <SystemStatusItem
-                icon={Flame}
-                label="消息队列"
-                status="正常"
-                statusColor="emerald"
-              />
             </div>
 
             {/* CPU 使用率 */}

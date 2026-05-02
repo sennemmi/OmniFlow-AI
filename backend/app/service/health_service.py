@@ -29,7 +29,7 @@ class HealthService:
 
         for name, comp_data in components.items():
             health_score = comp_data.get("health_score", 0)
-            health_status = comp_data.get("health_status", ComponentStatus.UNHEALTHY)
+            health_status = comp_data.get("status", comp_data.get("health_status", ComponentStatus.UNHEALTHY))
 
             total_score += health_score
             component_count += 1

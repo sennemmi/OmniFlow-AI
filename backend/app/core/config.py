@@ -137,7 +137,14 @@ def get_workspace_path(subdir: str = "") -> Path:
     Returns:
         Path: 工作区绝对路径
     """
-    base_path = Path(settings.TARGET_PROJECT_PATH)
+    # 【修复】如果 TARGET_PROJECT_PATH 未设置，使用默认路径
+    if settings.TARGET_PROJECT_PATH:
+        base_path = Path(settings.TARGET_PROJECT_PATH)
+    else:
+        # 默认使用后端目录的父目录（项目根目录）
+        backend_dir = Path(__file__).parent.parent.parent
+        base_path = backend_dir.parent
+
     if subdir:
         return base_path / subdir
     return base_path

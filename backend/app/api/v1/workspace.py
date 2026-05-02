@@ -8,9 +8,11 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from app.core.config import get_workspace_path
+
 router = APIRouter(prefix="/workspace", tags=["workspace"])
 
-# 项目根目录
+# 项目根目录（向后兼容）
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent.parent
 
 
@@ -142,20 +144,46 @@ async def get_file_content(
 ):
     """
     获取文件内容
+
+    【修复】使用 get_workspace_path("frontend") 获取前端项目路径，
+    而不是使用 PROJECT_ROOT（后端项目路径）
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     try:
-        file_path = PROJECT_ROOT / path
+        # 【调试】记录接收到的参数
+        logger.info(f"[DEBUG] get_file_content 接收到的 path: {repr(path)}")
+
+        # 【关键修复】使用前端项目路径，而不是后端项目路径
+        frontend_root = get_workspace_path("frontend")
+        logger.info(f"[DEBUG] frontend_root: {frontend_root}")
+        logger.info(f"[DEBUG] frontend_root exists: {frontend_root.exists()}")
+        logger.info(f"[DEBUG] frontend_root is_dir: {frontend_root.is_dir()}")
+
+        file_path = frontend_root / path
+        logger.info(f"[DEBUG] file_path: {file_path}")
+        logger.info(f"[DEBUG] file_path.resolve(): {file_path.resolve()}")
+        logger.info(f"[DEBUG] frontend_root.resolve(): {frontend_root.resolve()}")
 
         # 安全检查
         try:
-            file_path.resolve().relative_to(PROJECT_ROOT.resolve())
-        except ValueError:
+            resolved_path = file_path.resolve()
+            resolved_root = frontend_root.resolve()
+            relative = resolved_path.relative_to(resolved_root)
+            logger.info(f"[DEBUG] 安全检查通过: {relative}")
+        except ValueError as e:
+            logger.error(f"[DEBUG] 安全检查失败: {e}")
+            logger.error(f"[DEBUG] resolved_path: {resolved_path}")
+            logger.error(f"[DEBUG] resolved_root: {resolved_root}")
             raise HTTPException(status_code=403, detail="Access denied")
 
         if not file_path.exists():
+            logger.error(f"[DEBUG] 文件不存在: {file_path}")
             raise HTTPException(status_code=404, detail="File not found")
 
         if file_path.is_dir():
+            logger.error(f"[DEBUG] 路径是目录: {file_path}")
             raise HTTPException(status_code=400, detail="Path is a directory")
 
         # 检查文件大小（限制 1MB）
@@ -183,6 +211,9 @@ async def get_file_content(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"[DEBUG] 异常: {e}")
+        import traceback
+        logger.error(f"[DEBUG] 堆栈: {traceback.format_exc()}")
         return FileContentResponse(success=False, data={}, error=str(e))
 
 

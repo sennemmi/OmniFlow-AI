@@ -23,8 +23,9 @@
     'injector/state.js',
     'injector/selection.js',
     'injector/handlers.js',
-    'injector/preview.js',  // 预览模块（必须在 pipeline.js 之前加载）
-    'injector/pipeline.js', // 依赖 preview.js
+    'injector/searchReplace.js', // 搜索替换引擎（必须在 preview.js 和 pipeline.js 之前加载）
+    'injector/preview.js',       // 预览模块（依赖 searchReplace.js）
+    'injector/pipeline.js',      // 依赖 searchReplace.js
     'injector/main.js',
   ];
 

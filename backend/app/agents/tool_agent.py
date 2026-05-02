@@ -52,10 +52,23 @@ class ToolUsingAgent(LangGraphAgent[T]):
         if self._agent_tools is not None:
             self._agent_tools = None
 
-    def _get_agent_tools(self, project_path: str) -> AgentTools:
+    def _get_agent_tools(self, project_path: str, pipeline_id: int = 0) -> AgentTools:
         """获取或创建 AgentTools 实例"""
-        if self._agent_tools is None or self._agent_tools.project_path != project_path:
-            self._agent_tools = get_agent_tools(project_path, file_service=self._file_service)
+        # 【权限控制】根据 Agent 名称确定角色
+        agent_role = None
+        if "repair" in self.agent_name.lower():
+            agent_role = "repairer"
+
+        if (self._agent_tools is None or
+            self._agent_tools.project_path != project_path or
+            self._agent_tools._pipeline_id != pipeline_id or
+            self._agent_tools._agent_role != agent_role):
+            self._agent_tools = get_agent_tools(
+                project_path,
+                file_service=self._file_service,
+                pipeline_id=pipeline_id,
+                agent_role=agent_role
+            )
         return self._agent_tools
 
     async def _call_llm_with_tools(
@@ -85,8 +98,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
         Returns:
             Dict: {content, input_tokens, output_tokens, tool_calls, tool_results}
         """
-        # 获取工具定义
-        agent_tools = self._get_agent_tools(project_path)
+        # 获取工具定义（传入 pipeline_id 以便 install_dependency 工具使用）
+        agent_tools = self._get_agent_tools(project_path, pipeline_id)
         tools = agent_tools.tool_definitions
 
         # 构建消息
@@ -179,6 +192,22 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     for tool_call in message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = json.loads(tool_call.function.arguments)
+
+                        # 【权限控制】检查工具是否在允许列表中
+                        available_tools = {t["function"]["name"] for t in tools}
+                        if tool_name not in available_tools:
+                            logger.warning(f"[{self.agent_name}] 工具 {tool_name} 不在可用列表中，跳过执行")
+                            result = json.dumps({
+                                "success": False,
+                                "error": f"工具 {tool_name} 不可用。可用工具: {', '.join(available_tools)}"
+                            })
+                            tool_results.append({
+                                "tool": tool_name,
+                                "arguments": tool_args,
+                                "result": {"success": False, "error": "工具不可用"},
+                                "success": False
+                            })
+                            continue
 
                         logger.info(f"[{self.agent_name}] Executing tool: {tool_name}({tool_args})")
 

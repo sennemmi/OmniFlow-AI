@@ -145,6 +145,14 @@ JSON 格式：
 - 测试数据库操作时使用 mock 或测试数据库
 -【新增】绝对禁止在测试文件中定义 anyio_backend fixture 或将其作为参数传入测试函数，本项目不需要 anyio。
 
+【Mock 异步函数铁律 - 绝对遵守】
+1. 如果你需要 Mock 一个异步函数（特别是会被 asyncio.gather 调用的函数），必须使用 `new_callable=AsyncMock` 或 `return_value` 为协程！否则会导致 `TypeError: unhashable type` 或 `object is not awaitable`。
+2. 【关键】如果你在代码中使用了 `AsyncMock`、`MagicMock` 或 `patch`，必须在文件顶部显式导入它们：
+   `from unittest.mock import AsyncMock, MagicMock, patch`
+
+【Patch 路径铁律】
+必须 patch 目标文件内部实际使用的名字。例如如果 a.py 中写了 `from b import func`，你要测试 a.py，就必须 `patch('a.func')`，绝不能 `patch('b.func')`！否则会报 AttributeError！
+
 【错误消息断言 - 使用模糊匹配】
 当测试错误消息时，**绝对禁止**使用精确字符串匹配（如 `assert result["error"] == "Service unavailable"`）。
 
@@ -297,6 +305,11 @@ async def test_file_upload():
             assert result["size"] == len(b'file content')
 ```
 
+【强制：Mock 行为准则】
+1. **严禁直接使用 `MagicMock` 模拟异步函数**。必须使用 `from unittest.mock import AsyncMock` 并显式指定 `new_callable=AsyncMock`。
+2. **模拟返回值时，结构必须完整**。如果被测函数期望返回一个字典，你的 Mock `return_value` 必须包含该字典所有必需的键，严禁返回空 Mock。
+3. **路径对齐：使用 `patch` 时，必须 patch 目标模块 import 进来的那个名字，而不是原始定义的名字。**
+
 【Mock 最佳实践】
 1. **只 mock 被测函数的直接依赖**，不要过度 mock
 2. **在测试函数级别使用 patch**，不要在模块级别
@@ -304,6 +317,7 @@ async def test_file_upload():
 4. **验证 mock 被调用的次数和参数**，确保代码逻辑正确
 5. **使用 pytest fixtures 复用 mock 配置**
 6. **不要 mock 被测函数本身**，只 mock 依赖
+7. **【Mock 铁律】Mock 函数时，请务必查看原函数的实现！如果原函数内部自带 try-except 并在失败时返回特定数据结构，你的 Mock 必须返回对应的数据结构，绝不能直接使用 side_effect=Exception 让异常抛出。**
 
 【注意事项】
 - 只输出 JSON，不要有其他解释性文字
@@ -642,6 +656,13 @@ async def test_file_upload():
         code_output = state.get("code_output", {})
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
 
+        # 【常驻基础设施上下文】注入地基代码
+        evergreen_context = state.get("evergreen_context", "")
+        evergreen_section = f"""
+{evergreen_context}
+
+""" if evergreen_context else ""
+
         # 【接口契约】生成允许导入的符号清单
         allowed_imports_section = self._build_allowed_imports_section(design_output)
 
@@ -664,7 +685,7 @@ async def test_file_upload():
 
         # ── 完整模式：直接生成完整测试 ──────────────────────────────────────────
         code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
-        return f"""{fix_section}【技术设计方案】
+        return f"""{fix_section}{evergreen_section}【技术设计方案】
 {design_str}
 
 【CoderAgent 生成的代码】
@@ -847,7 +868,10 @@ async def test_file_upload():
                                 return {
                                     "success": False,
                                     "error": f"重试 {max_retries} 次后仍然失败: {retry_result.get('error')}",
-                                    "output": retry_result.get("output")
+                                    "output": retry_result.get("output"),
+                                    "input_tokens": retry_result.get("input_tokens", 0),
+                                    "output_tokens": retry_result.get("output_tokens", 0),
+                                    "duration_ms": retry_result.get("duration_ms", 0)
                                 }
                     
                     # 重试次数用尽，返回最后一次的错误
@@ -855,7 +879,10 @@ async def test_file_upload():
                     return {
                         "success": False,
                         "error": f"重试 {max_retries} 次后，测试文件仍然包含契约外的导入: {import_errors}",
-                        "output": result.get("output")
+                        "output": result.get("output"),
+                        "input_tokens": result.get("input_tokens", 0),
+                        "output_tokens": result.get("output_tokens", 0),
+                        "duration_ms": result.get("duration_ms", 0)
                     }
             
             logger.info(f"TesterAgent 测试生成完成", extra={

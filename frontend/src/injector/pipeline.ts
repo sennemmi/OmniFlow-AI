@@ -8,6 +8,7 @@ import { bus } from './events';
 import { api } from './api';
 import { stateManager, appState } from './state';
 import { ui } from './ui';
+import { SearchReplaceEngine } from './searchReplace';
 import type { ElementInfo } from './types';
 
 /**
@@ -73,28 +74,19 @@ class PipelineManager {
 
   /**
    * 核心算法：在前端执行搜索替换
-   * 模拟后端的 SearchReplaceEngine
+   * 使用与后端一致的 SearchReplaceEngine
    */
-  private applySearchReplace(original: string, search: string | undefined, replace: string | undefined): string | null {
+  private applySearchReplace(
+    original: string,
+    search: string | undefined,
+    replace: string | undefined,
+    fallbackStart?: number,
+    fallbackEnd?: number
+  ): string | null {
     if (!search || !replace) return null;
 
-    // 1. 尝试精确匹配
-    if (original.includes(search)) {
-      return original.replace(search, replace);
-    }
-
-    // 2. 尝试规范化换行符后匹配
-    const normOriginal = original.replace(/\r\n/g, '\n');
-    const normSearch = search.replace(/\r\n/g, '\n');
-    const normReplace = replace.replace(/\r\n/g, '\n');
-
-    if (normOriginal.includes(normSearch)) {
-      return normOriginal.replace(normSearch, normReplace);
-    }
-
-    // 3. 如果都匹配失败，回退到全量 (后端生成的 new_content)
-    console.warn('[OmniFlowAI] Search block 匹配失败，回退到全量内容');
-    return null;
+    // 使用与后端完全一致的 SearchReplaceEngine
+    return SearchReplaceEngine.applySearchReplace(original, search, replace, fallbackStart, fallbackEnd);
   }
 
   /**
@@ -105,6 +97,27 @@ class PipelineManager {
 
     try {
       const filePath = elementInfo.sourceFile;
+
+      // 【修复】验证文件路径
+      if (!filePath || filePath.trim() === '') {
+        console.error('[OmniFlowAI] 非法文件路径:', filePath, 'elementInfo:', elementInfo);
+        const errorMsg = `
+❌ 无法获取元素的源文件信息
+
+可能的原因：
+1. 元素没有 data-source 或 data-source-id 属性
+2. React DevTools 没有安装或未启用
+3. 项目没有配置 source map
+4. 元素是动态生成的，没有对应的源文件
+
+建议解决方案：
+1. 确保 React DevTools 浏览器扩展已安装并启用
+2. 检查 vite.config.ts 中是否配置了 sourcemap: true
+3. 尝试选择其他元素
+4. 刷新页面后重试
+        `.trim();
+        throw new Error(errorMsg);
+      }
 
       // 步骤1: 获取原始文件内容
       const contentResponse = await api.getFileContent(filePath);
@@ -143,12 +156,23 @@ class PipelineManager {
         throw new Error(result.error || 'AI 生成失败');
       }
 
-      // 步骤3: 执行搜索替换
+      // 步骤3: 执行搜索替换（使用与后端一致的 SearchReplaceEngine）
       const { search_block, replace_block, new_content } = result.data;
-      let finalContent = this.applySearchReplace(originalContent, search_block, replace_block);
+      // 使用元素信息中的行号作为 fallback
+      const fallbackStart = elementInfo.sourceLine > 0 ? elementInfo.sourceLine : undefined;
+      const fallbackEnd = elementInfo.sourceLine > 0 ? elementInfo.sourceLine + (search_block?.split('\n').length || 1) - 1 : undefined;
+
+      let finalContent = this.applySearchReplace(
+        originalContent,
+        search_block,
+        replace_block,
+        fallbackStart,
+        fallbackEnd
+      );
 
       // 如果搜索替换成功，使用它；否则使用后端提供的全量内容
       if (!finalContent) {
+        console.warn('[OmniFlowAI] Search block 匹配失败，回退到全量内容');
         finalContent = new_content;
       }
 
@@ -191,6 +215,13 @@ class PipelineManager {
           element_text: info.text,
         };
       });
+
+      // 【修复】验证所有文件路径
+      const invalidFiles = files.filter(f => !f.file || f.file.trim() === '');
+      if (invalidFiles.length > 0) {
+        console.error('[OmniFlowAI] 部分元素缺少源文件信息:', invalidFiles);
+        throw new Error(`${invalidFiles.length} 个元素无法获取源文件信息。请确保所有元素都有正确的 data-source 属性或 React 源码映射。`);
+      }
 
       bus.emit('ui:progress:update', { status: '正在批量生成代码...', percent: 50 });
 

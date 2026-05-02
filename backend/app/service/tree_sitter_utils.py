@@ -16,12 +16,13 @@ import tree_sitter_javascript as tsjavascript
 logger = __import__("logging").getLogger(__name__)
 
 # 语言映射，根据文件后缀选择
+# 【修复】使用新版 tree-sitter API，直接传入语言对象
 LANG_MAP: Dict[str, Language] = {
-    ".py": Language(tspython.language()),
-    ".ts": Language(tstypescript.language_typescript()),
-    ".tsx": Language(tstypescript.language_tsx()),
-    ".js": Language(tsjavascript.language()),
-    ".jsx": Language(tsjavascript.language()),
+    ".py": tspython.language(),
+    ".ts": tstypescript.language_typescript(),
+    ".tsx": tstypescript.language_tsx(),
+    ".js": tsjavascript.language(),
+    ".jsx": tsjavascript.language(),
 }
 
 # 不同语言中代表函数/类定义的节点类型

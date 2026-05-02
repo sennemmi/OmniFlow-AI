@@ -66,6 +66,8 @@ from app.utils.repair_loop_utils import (
 from app.utils.repair_utils import (
     build_fix_order,
     collect_target_files_async,
+    extract_critical_files,
+    extract_critical_files_with_imports,
     extract_file_paths,
     extract_pytest_failures,
     print_fix_result,
@@ -73,7 +75,7 @@ from app.utils.repair_utils import (
 
 # ========================== 测试配置 ==========================
 PIPELINE_ID = 99999
-FEATURE_REQUEST = "在健康检查接口中增加系统组件状态监控（数据库、磁盘、内存），并给出整体健康度。"
+FEATURE_REQUEST = "实现一个求两数之和的接口"
 
 # 默认重试次数
 DEFAULT_MAX_RETRIES = 3
@@ -278,6 +280,9 @@ class ContractE2ETester:
                 raise RuntimeError(f"ArchitectAgent 失败: {arch_result.get('error')}")
             arch_output = arch_result["output"]
             print(f"   验收标准: {arch_output.get('acceptance_criteria', [])}")
+            # 【诊断】打印 required_symbols
+            required_symbols = arch_output.get('required_symbols', [])
+            print(f"   必需符号: {[s.get('name') for s in required_symbols]}")
             add_agent_tokens(arch_result, self)
 
             # ========== Step 2: 方案设计 ==========
@@ -294,6 +299,8 @@ class ContractE2ETester:
             design_output = design_result["output"]
             interface_specs = design_output.get("interface_specs", [])
             print(f"   接口契约 ({len(interface_specs)} 项)")
+            # 【诊断】打印 interface_specs 中的符号
+            print(f"   契约符号: {[s.get('symbol_name') for s in interface_specs]}")
             add_agent_tokens(design_result, self)
 
             # ========== Step 3: 代码生成 ==========
@@ -369,14 +376,31 @@ class ContractE2ETester:
 
             if syntax_errors:
                 print(f"   ❌ 发现 {len(syntax_errors)} 个语法错误，启动修复...")
+
+                # 从沙箱读取错误文件的内容
+                error_files_with_content = []
+                for err in syntax_errors:
+                    fp = err.file
+                    read_res = await file_service.read_file(fp)
+                    if read_res.exists:
+                        error_files_with_content.append((fp, read_res.content))
+                    else:
+                        error_files_with_content.append((fp, ""))
+
                 fixed_files = await run_syntax_fix_loop(
                     syntax_errors=[err.to_dict() for err in syntax_errors],
-                    files_to_check=[(err.file, "") for err in syntax_errors],
+                    files_to_check=error_files_with_content,
                     file_service=file_service,
                     design_output=build_design_output_with_pipeline(design_output, PIPELINE_ID),
                     max_retries=DEFAULT_MAX_RETRIES
                 )
-                if not fixed_files:
+
+                # 【修复】重新验证语法错误是否已修复，而不是仅检查 fixed_files
+                remaining_syntax_errors = await self.e2e_service.validate_code_syntax(code_files, file_service)
+                if remaining_syntax_errors:
+                    print(f"   ❌ 修复后仍有 {len(remaining_syntax_errors)} 个语法错误")
+                    for err in remaining_syntax_errors:
+                        print(f"      - {err.file}: {err.error}")
                     raise RuntimeError("语法错误自动修复失败")
 
             # ========== Step 6: 契约检查 ==========
@@ -564,25 +588,95 @@ class ContractE2ETester:
 
         # 构建修复工单
         generated_file_paths = extract_file_paths(all_generated_files)
+
+        # 【Traceback 路径 + Import 关联路径】组合策略
+        # 第1步：先读取所有生成文件的内容（用于后续 import 解析）
+        file_contents = {}
+        for path in generated_file_paths:
+            read_res = await file_service.read_file(path)
+            if read_res.exists:
+                file_contents[path] = read_res.content
+
+        # 第2步：使用组合策略提取关键文件
+        essential_paths = extract_critical_files_with_imports(
+            logs=logs,
+            all_generated_paths=generated_file_paths,
+            file_contents=file_contents
+        )
+        print(f"   🎯 组合策略：从 {len(generated_file_paths)} 个文件中精选 {len(essential_paths)} 个核心文件（含 import 关联）")
+
         fix_order = build_fix_order(
             failed_tests=failed_tests,
             logs=logs,
-            generated_file_paths=generated_file_paths,
+            generated_file_paths=essential_paths,  # 使用精简后的路径列表
             errors_list=errors_list
         )
 
-        # 收集所有相关文件的完整内容
-        target_files = await collect_target_files_async(
-            all_generated_files=all_generated_files,
-            file_service=file_service,
-            errors_list=errors_list
-        )
+        # 【方案二】利用 ProjectCard 注入核心契约文件的函数签名
+        try:
+            from app.agents.project_card_builder import ProjectCardBuilder
+
+            builder = ProjectCardBuilder(Path(str(self.backend_dir)))
+            signatures = builder._build_function_signature_library(max_files=20)
+
+            # 提取核心契约文件的签名
+            core_contracts = ["app/core/response.py", "app/core/database.py"]
+            contract_signatures = []
+            for core_file in core_contracts:
+                if core_file in signatures:
+                    func_sigs = signatures[core_file]
+                    sig_text = f"\n【{core_file} 函数签名】\n"
+                    for func in func_sigs[:5]:  # 每个文件最多5个函数
+                        sig_text += f"  - {func.get('signature', 'unknown')}\n"
+                    contract_signatures.append(sig_text)
+
+            if contract_signatures:
+                fix_order["fix_hint"] += "\n【参考：核心契约库函数签名】" + "".join(contract_signatures)
+                print(f"   📋 已注入核心契约文件函数签名到 fix_hint")
+        except Exception as e:
+            print(f"   ⚠️ 注入函数签名失败（非关键）: {e}")
+
+        # 第3步：收集关键文件的完整内容（包括 import 关联的文件）
+        target_files = {}
+        for path in essential_paths:
+            # 如果已经在 file_contents 中，直接使用
+            if path in file_contents:
+                target_files[path] = file_contents[path]
+            else:
+                # 否则从沙箱读取（如核心契约文件）
+                read_res = await file_service.read_file(path)
+                if read_res.exists:
+                    target_files[path] = read_res.content
+
+        # 【新增】第3.5步：主动探索测试文件的 import 依赖
+        # 解析测试文件，收集所有 from app.xxx import 的模块，确保 RepairerAgent 能看到被测代码
+        from app.utils.repair_utils import parse_all_app_imports, module_to_file_path
+
+        discovered_modules = set()
+        for file_info in all_generated_files:
+            file_path = file_info.get("file_path", "")
+            file_content = file_info.get("content", "")
+
+            # 只处理测试文件
+            if "test" in file_path.lower():
+                imported_modules = parse_all_app_imports(file_content)
+                for module in imported_modules:
+                    if module not in discovered_modules:
+                        discovered_modules.add(module)
+                        dep_file_path = module_to_file_path(module)
+
+                        # 如果该文件还未在 target_files 中，尝试读取
+                        if dep_file_path not in target_files:
+                            read_res = await file_service.read_file(dep_file_path)
+                            if read_res.exists and read_res.content:
+                                target_files[dep_file_path] = read_res.content
+                                print(f"   📦 从测试导入发现依赖: {dep_file_path}")
 
         if not target_files:
             print(f"   ❌ 没有收集到任何文件内容，无法调用 RepairerAgent")
             return False, {"success": False, "error": "没有文件内容"}
 
-        print(f"   📦 共传入 {len(target_files)} 个文件的完整内容给 RepairerAgentWithTools")
+        print(f"   📦 共传入 {len(target_files)} 个核心文件的完整内容给 RepairerAgentWithTools")
 
         repairer = RepairerAgentWithTools()
         repair_result = await repairer.execute_with_tools(

@@ -25,6 +25,8 @@ from app.service.stage_handlers import (
     RequirementHandler, DesignHandler, CodingHandler,
     TestingHandler, CodeReviewHandler, DeliveryHandler
 )
+from app.service.sandbox_manager import sandbox_manager
+from app.core.config import settings
 
 
 class PipelineService:
@@ -71,6 +73,21 @@ class PipelineService:
         await session.flush()
 
         info("Pipeline 记录创建成功", pipeline_id=pipeline.id, status="RUNNING")
+
+        # 【关键修复】Step 0: 立即启动 Docker Sandbox（与 test_e2e_with_contract_v2.py 统一）
+        try:
+            from pathlib import Path
+            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+            sandbox_info = await sandbox_manager.start(pipeline.id, project_path)
+            info("Docker Sandbox 启动成功", 
+                 pipeline_id=pipeline.id, 
+                 container_id=sandbox_info.container_id[:12],
+                 port=sandbox_info.port)
+        except Exception as e:
+            error_msg = f"Docker Sandbox 启动失败: {str(e)}"
+            info(error_msg, pipeline_id=pipeline.id)
+            # 不阻断流程，继续创建 Pipeline，但记录错误
+            # 后续阶段可以尝试重新启动 Sandbox
 
         # 2. 创建 REQUIREMENT 阶段
         stage = PipelineStage(
@@ -228,7 +245,8 @@ class PipelineService:
 
         result = await handler.run(context)
 
-        return {
+        # 构建返回结果，确保失败时包含 error 字段
+        response = {
             "success": result.success,
             "status": result.status.value,
             "message": result.message,
@@ -237,6 +255,12 @@ class PipelineService:
             "commit_hash": result.commit_hash,
             "pr_url": result.pr_url
         }
+
+        # 如果执行失败，添加 error 字段（用于 API 返回）
+        if not result.success:
+            response["error"] = result.message or f"Stage {stage_name.value} execution failed"
+
+        return response
     
     @classmethod
     async def _trigger_coding_phase(
@@ -469,6 +493,271 @@ class PipelineService:
                     # 强制告诉 SQLAlchemy 字典被修改了，必须落库保存！
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(stage, "output_data")
+            
+            # 【关键修复】Pipeline 失败时停止 Sandbox，避免资源泄漏
+            try:
+                await sandbox_manager.stop(pipeline_id)
+                info("Pipeline 失败，Sandbox 已停止", pipeline_id=pipeline_id)
+            except Exception as e:
+                info(f"停止 Sandbox 时出错（非关键）: {str(e)}", pipeline_id=pipeline_id)
+
+    @classmethod
+    async def retry_pipeline(
+        cls,
+        pipeline_id: int,
+        session: AsyncSession,
+        background_tasks: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        重试失败的 Pipeline
+
+        流程：
+        1. 检查 Pipeline 状态是否为 failed
+        2. 重置 Pipeline 状态为 running
+        3. 重置当前失败阶段为 pending
+        4. 重新启动 Sandbox（如果已停止）
+        5. 后台异步重新执行当前阶段
+        """
+        from fastapi import BackgroundTasks
+        from app.core.sse_log_buffer import push_log
+
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+
+        if not pipeline:
+            return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
+
+        # 检查状态
+        if pipeline.status.value != "failed":
+            return {
+                "success": False,
+                "error": f"只能重试失败的 Pipeline，当前状态: {pipeline.status.value}"
+            }
+
+        current_stage = pipeline.current_stage
+        if not current_stage:
+            return {"success": False, "error": "Pipeline 没有当前阶段，无法重试"}
+
+        await push_log(
+            pipeline_id,
+            "info",
+            f"🔄 正在重试 Pipeline，从 {current_stage.value} 阶段重新开始...",
+            stage=current_stage.value
+        )
+
+        # 1. 重置当前阶段状态为 pending
+        from sqlmodel import select
+        statement = select(PipelineStage).where(
+            PipelineStage.pipeline_id == pipeline_id,
+            PipelineStage.name == current_stage
+        )
+        result = await session.execute(statement)
+        stage = result.scalar_one_or_none()
+
+        if stage:
+            stage.status = StageStatus.PENDING
+            # 清除之前的错误信息，但保留其他数据
+            if stage.output_data and isinstance(stage.output_data, dict):
+                stage.output_data.pop("error", None)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"阶段 {current_stage.value} 已重置为 pending 状态",
+                stage=current_stage.value
+            )
+
+        # 2. 重置 Pipeline 状态为 running
+        await WorkflowService.set_pipeline_running(pipeline, session)
+        await push_log(
+            pipeline_id,
+            "info",
+            "Pipeline 状态已重置为 running",
+            stage=current_stage.value
+        )
+
+        await session.commit()
+
+        # 3. 重新启动 Sandbox（如果已停止）
+        try:
+            from pathlib import Path
+            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+            sandbox_info = await sandbox_manager.start(pipeline_id, project_path)
+            info("Sandbox 重新启动成功",
+                 pipeline_id=pipeline_id,
+                 container_id=sandbox_info.container_id[:12],
+                 port=sandbox_info.port)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"🐳 Sandbox 重新启动成功 (端口: {sandbox_info.port})",
+                stage=current_stage.value
+            )
+        except Exception as e:
+            # Sandbox 可能已经在运行，这不是致命错误
+            info(f"启动 Sandbox 时出错（可能已在运行）: {str(e)}", pipeline_id=pipeline_id)
+            await push_log(
+                pipeline_id,
+                "warning",
+                f"Sandbox 启动警告: {str(e)}",
+                stage=current_stage.value
+            )
+
+        # 4. 根据当前阶段触发相应的后台任务
+        if background_tasks and isinstance(background_tasks, BackgroundTasks):
+            if current_stage == StageName.CODING:
+                # 重试 CODING 阶段
+                background_tasks.add_task(run_coding_task, pipeline_id)
+                await push_log(
+                    pipeline_id,
+                    "info",
+                    "后台任务已启动：重新执行代码生成...",
+                    stage="CODING"
+                )
+            elif current_stage == StageName.REQUIREMENT:
+                # 重试 REQUIREMENT 阶段
+                requirement_stage = None
+                for s in pipeline.stages:
+                    if s.name == StageName.REQUIREMENT:
+                        requirement_stage = s
+                        break
+
+                if requirement_stage:
+                    requirement = requirement_stage.input_data.get("requirement", "")
+                    element_context = requirement_stage.input_data.get("element_context", {})
+                    background_tasks.add_task(
+                        run_architect_task,
+                        pipeline_id,
+                        requirement,
+                        element_context
+                    )
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        "后台任务已启动：重新执行需求分析...",
+                        stage="REQUIREMENT"
+                    )
+            else:
+                # 其他阶段使用 StageHandler 重新执行
+                handler = cls._get_handler_for_stage(current_stage)
+                if handler:
+                    background_tasks.add_task(
+                        cls._run_stage_background,
+                        pipeline_id,
+                        current_stage.value
+                    )
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        f"后台任务已启动：重新执行 {current_stage.value} 阶段...",
+                        stage=current_stage.value
+                    )
+
+        return {
+            "success": True,
+            "data": {
+                "previous_stage": current_stage.value if current_stage else None,
+                "current_stage": current_stage.value if current_stage else None,
+                "message": f"Pipeline 重试已启动，正在重新执行 {current_stage.value} 阶段"
+            }
+        }
+
+    @classmethod
+    async def terminate_pipeline(
+        cls,
+        pipeline_id: int,
+        reason: str,
+        session: AsyncSession
+    ) -> Dict[str, Any]:
+        """
+        终止 Pipeline
+
+        Args:
+            pipeline_id: Pipeline ID
+            reason: 终止原因
+            session: 数据库 session
+
+        Returns:
+            终止结果
+        """
+        from datetime import datetime
+        from app.core.sse_log_buffer import push_log
+
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+
+        if not pipeline:
+            return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
+
+        # 检查状态是否可以终止
+        if pipeline.status.value not in ["running", "paused"]:
+            return {
+                "success": False,
+                "error": f"无法终止状态为 {pipeline.status.value} 的 Pipeline"
+            }
+
+        await push_log(
+            pipeline_id,
+            "warning",
+            f"🛑 Pipeline 被手动终止，原因: {reason}",
+            stage=pipeline.current_stage.value if pipeline.current_stage else "UNKNOWN"
+        )
+
+        # 更新 Pipeline 状态为 failed
+        await WorkflowService.set_pipeline_failed(pipeline, session)
+
+        # 停止 Sandbox
+        try:
+            await sandbox_manager.stop(pipeline_id)
+            info("Sandbox 已停止", pipeline_id=pipeline_id)
+        except Exception as e:
+            info(f"停止 Sandbox 时出错（非关键）: {str(e)}", pipeline_id=pipeline_id)
+
+        # 清理 SSE 日志缓冲区
+        from app.core.sse_log_buffer import remove_buffer
+        remove_buffer(pipeline_id)
+
+        return {
+            "success": True,
+            "data": {
+                "pipeline_id": pipeline_id,
+                "status": "failed",
+                "message": f"Pipeline 已终止: {reason}",
+                "terminated_at": datetime.now().isoformat()
+            }
+        }
+
+    @classmethod
+    def _get_handler_for_stage(cls, stage_name: StageName) -> Optional[Any]:
+        """获取阶段对应的 Handler"""
+        handler_map = {
+            StageName.REQUIREMENT: RequirementHandler(),
+            StageName.DESIGN: DesignHandler(),
+            StageName.CODING: CodingHandler(),
+            StageName.UNIT_TESTING: TestingHandler(),
+            StageName.CODE_REVIEW: CodeReviewHandler(),
+            StageName.DELIVERY: DeliveryHandler(),
+        }
+        return handler_map.get(stage_name)
+
+    @classmethod
+    async def _run_stage_background(cls, pipeline_id: int, stage_name: str):
+        """后台运行指定阶段"""
+        from app.core.database import async_session_factory
+
+        async with async_session_factory() as session:
+            try:
+                stage_enum = StageName(stage_name)
+                handler = cls._get_handler_for_stage(stage_enum)
+
+                if handler:
+                    context = StageContext(
+                        pipeline_id=pipeline_id,
+                        session=session,
+                        input_data={}
+                    )
+                    await handler.run(context)
+                    await session.commit()
+            except Exception as e:
+                await session.rollback()
+                error(f"后台运行阶段 {stage_name} 失败", pipeline_id=pipeline_id, exc_info=True)
 
     # ==================== 查询方法 ====================
 

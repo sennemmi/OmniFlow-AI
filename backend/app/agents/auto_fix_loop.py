@@ -14,7 +14,7 @@ from pathlib import Path
 
 from app.agents.coder import coder_agent
 from app.agents.tester import test_agent
-from app.agents.repairer import RepairerAgent
+from app.agents.repairer_with_tools import RepairerAgentWithTools
 from app.service.sandbox_manager import sandbox_manager
 from app.service.code_executor import CodeExecutorService
 from app.service.file_write_handler import file_write_handler
@@ -298,6 +298,39 @@ class AutoFixLoop:
                 stage="CODING"
             )
 
+            # 【语法验证】在契约检查前验证代码语法（同步 E2E 测试脚本的 Step 5）
+            await push_log(
+                pipeline_id, "info",
+                "🔍 执行代码语法验证...",
+                stage="CODING"
+            )
+
+            syntax_errors = await self._validate_code_syntax(all_files, pipeline_id)
+            if syntax_errors:
+                await push_log(
+                    pipeline_id, "warning",
+                    f"⚠️ 发现 {len(syntax_errors)} 个语法错误，启动修复...",
+                    stage="CODING"
+                )
+
+                # 构建语法错误修复上下文
+                error_details = "\n".join([
+                    f"- {err.get('file', 'unknown')}: {err.get('error', 'unknown error')}"
+                    for err in syntax_errors[:5]
+                ])
+                current_error_context = (
+                    f"【语法错误】代码存在以下语法错误，请修复:\n{error_details}\n\n"
+                    f"请确保所有生成的代码都是合法的 Python 语法。"
+                )
+                attempt += 1
+                continue
+
+            await push_log(
+                pipeline_id, "success",
+                "✅ 语法验证通过",
+                stage="CODING"
+            )
+
             # 【前置契约检查】在运行测试前验证代码是否满足契约
             await push_log(
                 pipeline_id, "info",
@@ -454,25 +487,17 @@ class AutoFixLoop:
                     attempt += 1
                     continue
                 
-                logger.info(f"[Pipeline {pipeline_id}] 共传入 {len(target_files)} 个文件的完整内容给 RepairerAgent")
+                logger.info(f"[Pipeline {pipeline_id}] 共传入 {len(target_files)} 个文件的完整内容给 RepairerAgentWithTools")
 
-                # 【利益隔离核心】调用 RepairerAgent 进行修复
-                repairer = RepairerAgent()
-                repair_result = await repairer.execute_with_files(
+                # 【利益隔离核心】调用 RepairerAgentWithTools 进行修复（支持工具调用和多轮对话）
+                repairer = RepairerAgentWithTools()
+                repair_result = await repairer.execute_with_tools(
                     pipeline_id=pipeline_id,
                     stage_name="CODING_REPAIR",
                     fix_order=fix_order,
                     target_files=target_files,  # 【关键】直接传入完整文件内容
                     file_service=file_service,  # 【新架构】传入 SandboxFileService 用于写入修复
-                    initial_state={
-                        "design_output": design_output,
-                        "error_context": fix_order,  # 【简化】使用简化的 fix_order 作为错误上下文
-                        "verification_report": {
-                            "verdict": "FAIL",
-                            "error_count": len(failed_tests),
-                            "message": verify_result.get("message", "")
-                        }
-                    }
+                    max_rounds=3  # 最多3轮修复
                 )
 
                 if not repair_result.get("success"):
@@ -672,6 +697,8 @@ class AutoFixLoop:
 
         在工具驱动模式下，文件已通过 replace_lines 工具写入项目目录，
         此方法将文件同步到 sandbox 容器用于预览。
+        
+        【P3】对于没有 content 的文件，从宿主机项目目录读取最新内容再同步。
         """
         from app.core.config import settings
         from pathlib import Path
@@ -681,28 +708,120 @@ class AutoFixLoop:
             backend_dir = Path(__file__).parent.parent
             target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
 
+        logger.info(f"[Pipeline {pipeline_id}] 【P3】开始同步 {len(all_files)} 个文件到 sandbox")
+        
+        files_read_from_host = 0
+        files_with_content = 0
+        sync_success = 0
+        sync_failed = 0
+
         for file_change in all_files:
             file_path = file_change.get("file_path", "")
+            content = file_change.get("content", "")
+            
             if not file_path:
+                logger.warning(f"[Pipeline {pipeline_id}] 【P3】跳过没有 file_path 的文件变更")
                 continue
 
-            # 读取项目目录中的文件内容
-            relative_path = file_path.replace("backend/", "").replace("backend\\", "")
-            full_path = target_path / relative_path
+            # 【P3】如果没有 content，从宿主机项目目录读取
+            if not content:
+                relative_path = file_path.replace("backend/", "").replace("backend\\", "")
+                full_path = target_path / relative_path
+                
+                try:
+                    if full_path.exists():
+                        content = full_path.read_text(encoding='utf-8')
+                        files_read_from_host += 1
+                        logger.info(f"[Pipeline {pipeline_id}] 【P3】从宿主机读取文件内容: {full_path} ({len(content)} 字符)")
+                    else:
+                        logger.warning(f"[Pipeline {pipeline_id}] 【P3】文件不存在，跳过同步: {full_path}")
+                        continue
+                except Exception as e:
+                    logger.error(f"[Pipeline {pipeline_id}] 【P3】读取文件失败 {file_path}: {e}")
+                    sync_failed += 1
+                    continue
+            else:
+                files_with_content += 1
+            
+            # 同步到 sandbox
+            try:
+                await sandbox_manager.write_file(
+                    pipeline_id=pipeline_id,
+                    path=file_path,
+                    content=content
+                )
+                sync_success += 1
+                logger.debug(f"[Pipeline {pipeline_id}] 【P3】同步文件到 sandbox: {file_path}")
+            except Exception as e:
+                sync_failed += 1
+                logger.error(f"[Pipeline {pipeline_id}] 【P3】同步文件失败 {file_path}: {e}")
+        
+        logger.info(f"[Pipeline {pipeline_id}] 【P3】同步完成: {sync_success} 成功, {sync_failed} 失败, "
+                   f"{files_read_from_host} 从宿主机读取, {files_with_content} 已有 content")
+
+    async def _validate_code_syntax(
+        self,
+        all_files: List[Dict[str, Any]],
+        pipeline_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        验证代码语法（同步 E2E 测试脚本的语法验证逻辑）
+
+        Args:
+            all_files: 代码文件列表
+            pipeline_id: Pipeline ID
+
+        Returns:
+            语法错误列表，如果没有错误返回空列表
+        """
+        import py_compile
+        import tempfile
+        import os
+
+        syntax_errors = []
+
+        for file_change in all_files:
+            file_path = file_change.get("file_path", "")
+            content = file_change.get("content", "")
+
+            if not file_path or not content:
+                continue
+
+            # 只检查 Python 文件
+            if not file_path.endswith(".py"):
+                continue
+
+            # 创建临时文件进行语法检查
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
 
             try:
-                if full_path.exists():
-                    content = full_path.read_text(encoding='utf-8')
-                    await sandbox_manager.write_file(
-                        pipeline_id=pipeline_id,
-                        path=file_path,
-                        content=content
-                    )
-                    logger.info(f"[Pipeline {pipeline_id}] 同步文件到 sandbox: {file_path}")
-                else:
-                    logger.warning(f"[Pipeline {pipeline_id}] 文件不存在，跳过同步: {full_path}")
-            except Exception as e:
-                logger.error(f"[Pipeline {pipeline_id}] 同步文件失败 {file_path}: {e}")
+                py_compile.compile(tmp_path, doraise=True)
+            except py_compile.PyCompileError as e:
+                # 提取行号
+                line_no = 0
+                error_msg = str(e)
+                if "line" in error_msg.lower():
+                    import re
+                    line_match = re.search(r'line\s+(\d+)', error_msg, re.IGNORECASE)
+                    if line_match:
+                        line_no = int(line_match.group(1))
+
+                syntax_errors.append({
+                    "file": file_path,
+                    "error": error_msg,
+                    "line": line_no
+                })
+                logger.warning(f"[Pipeline {pipeline_id}] 语法错误: {file_path} - {error_msg}")
+            finally:
+                # 清理临时文件
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        return syntax_errors
 
     async def _verify_fixes(
         self,

@@ -412,58 +412,85 @@ class LangGraphAgent(ABC, Generic[T]):
     def _try_fix_truncated_json(self, json_str: str) -> Optional[str]:
         """
         尝试修复截断的不完整 JSON
-        
+
         策略：
         1. 如果 JSON 以 { 开头但不以 } 结尾，尝试添加缺少的闭合符号
-        2. 如果字符串在引号内被截断，尝试关闭引号
-        
+        2. 如果字符串在引号内被截断，尝试关闭引号并补全字段
+        3. 如果字段不完整，尝试补全缺失的字段
+
         Args:
             json_str: 可能截断的 JSON 字符串
-            
+
         Returns:
             Optional[str]: 修复后的 JSON 字符串，或 None 如果无法修复
         """
         if not json_str or not json_str.strip():
             return None
-        
+
         fixed = json_str.strip()
-        
+
+        # 【增强】检查关键字段是否缺失，如果缺失则补全
+        required_fields = ['"feature_description"', '"affected_files"', '"estimated_effort"',
+                          '"technical_design"', '"acceptance_criteria"', '"required_symbols"']
+
+        # 找到最后一个完整的字段
+        last_complete_field_end = 0
+        for field in required_fields:
+            pos = fixed.rfind(field)
+            if pos > last_complete_field_end:
+                last_complete_field_end = pos
+
+        # 如果在某个字段值内部被截断，截断到该字段的开始，并补全默认值
+        if last_complete_field_end > 0:
+            # 找到该字段的开始位置
+            field_start = last_complete_field_end
+            # 检查该字段是否完整（后面有逗号或右括号）
+            rest = fixed[field_start:]
+
+            # 如果看起来在字段值内部（有冒号但后面没有逗号或}）
+            if ':' in rest and not (rest.rstrip().endswith(',') or rest.rstrip().endswith(']') or rest.rstrip().endswith('}')):
+                # 截断到该字段之前
+                fixed = fixed[:field_start].rstrip()
+                # 如果最后一个字符是逗号，移除它
+                if fixed.endswith(','):
+                    fixed = fixed[:-1]
+
         # 统计各种符号的数量
         open_braces = fixed.count('{') - fixed.count('}')
         open_brackets = fixed.count('[') - fixed.count(']')
-        
+
         # 检查是否在字符串内被截断（奇数个未闭合的引号）
-        # 简单统计不在转义序列中的引号
         quote_count = 0
         i = 0
         while i < len(fixed):
             if fixed[i] == '"' and (i == 0 or fixed[i-1] != '\\'):
                 quote_count += 1
             i += 1
-        
+
         # 如果在字符串内被截断，先关闭字符串
         if quote_count % 2 == 1:
-            # 找到最后一个未闭合的引号位置
             last_quote = fixed.rfind('"')
             if last_quote > 0:
-                # 检查这个引号是否是键的开始（后面跟着 :）
                 after_quote = fixed[last_quote:].strip()
-                if ':' in after_quote[:10]:  # 如果在引号后不远处有冒号，可能是键
-                    # 这是一个键，需要补全 "key": "value" 结构
+                if ':' in after_quote[:10]:
                     fixed = fixed + '": ""'
                 else:
-                    # 这是一个值，只需要关闭引号
                     fixed = fixed + '"'
-        
+
+        # 【增强】补全缺失的必填字段
+        if '"acceptance_criteria"' not in fixed:
+            fixed = fixed.rstrip() + ',\n  "acceptance_criteria": []'
+        if '"required_symbols"' not in fixed:
+            fixed = fixed.rstrip() + ',\n  "required_symbols": []'
+
         # 补全闭合的大括号和方括号
-        # 注意：需要先关闭内部的再关闭外部的
         fixed = fixed + '}' * open_braces
         fixed = fixed + ']' * open_brackets
-        
-        # 检查是否修复成功（至少要有匹配的括号）
+
+        # 检查是否修复成功
         if fixed.count('{') == fixed.count('}') and fixed.count('[') == fixed.count(']'):
             return fixed
-        
+
         return None
     
     async def execute(
@@ -533,6 +560,9 @@ class LangGraphAgent(ABC, Generic[T]):
                 metrics.output_tokens = total_output_tokens
                 metrics.retry_count = result.get("retry_count", 0)
                 
+                # 【关键修复】从结果中提取工具调用计数
+                tool_calls = result.get("tool_calls", 0)
+                
                 if result.get("error"):
                     # 执行失败
                     error_msg = result["error"]
@@ -557,6 +587,7 @@ class LangGraphAgent(ABC, Generic[T]):
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
                         "duration_ms": duration_ms,
+                        "tool_calls": tool_calls,
                         "reasoning": reasoning_content
                     }
                 
@@ -569,7 +600,7 @@ class LangGraphAgent(ABC, Generic[T]):
                 )
 
                 # ★ DEBUG: 打印返回的指标
-                logger.info(f"[DEBUG] Agent={self.agent_name} returning metrics: input_tokens={total_input_tokens}, output_tokens={total_output_tokens}, duration_ms={duration_ms}")
+                logger.info(f"[DEBUG] Agent={self.agent_name} returning metrics: input_tokens={total_input_tokens}, output_tokens={total_output_tokens}, duration_ms={duration_ms}, tool_calls={tool_calls}")
 
                 return {
                     "success": True,
@@ -579,6 +610,7 @@ class LangGraphAgent(ABC, Generic[T]):
                     "input_tokens": total_input_tokens,
                     "output_tokens": total_output_tokens,
                     "duration_ms": duration_ms,
+                    "tool_calls": tool_calls,
                     "reasoning": reasoning_content
                 }
                 
@@ -612,6 +644,7 @@ class LangGraphAgent(ABC, Generic[T]):
                     "input_tokens": total_input_tokens,
                     "output_tokens": total_output_tokens,
                     "duration_ms": duration_ms,
+                    "tool_calls": result.get("tool_calls", 0),
                     "reasoning": reasoning_content
                 }
 

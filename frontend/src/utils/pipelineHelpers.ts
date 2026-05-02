@@ -102,7 +102,12 @@ export function extractTestCodeChanges(
     }));
   };
 
-  // 1. 从 output_data.testing_result.test_files 中提取（UNIT_TESTING 阶段的标准格式）
+  // 1. 从 output_data.test_files 中提取（UNIT_TESTING 阶段的直接格式）
+  if (outputData?.test_files && Array.isArray(outputData.test_files)) {
+    return extractFromFiles(outputData.test_files as Array<Record<string, string>>);
+  }
+
+  // 2. 从 output_data.testing_result.test_files 中提取（UNIT_TESTING 阶段的嵌套格式）
   if (outputData?.testing_result) {
     const testingResult = outputData.testing_result as Record<string, unknown>;
     if (testingResult?.test_files && Array.isArray(testingResult.test_files)) {
@@ -110,7 +115,7 @@ export function extractTestCodeChanges(
     }
   }
 
-  // 2. 从 input_data.coding_output.agent_outputs.tester 中提取（UNIT_TESTING 阶段的 input_data）
+  // 3. 从 input_data.coding_output.agent_outputs.tester 中提取（UNIT_TESTING 阶段的 input_data）
   if (inputData?.coding_output) {
     const codingOutput = inputData.coding_output as Record<string, unknown>;
     const agentOutputs = codingOutput?.agent_outputs as Record<string, unknown> | undefined;
@@ -125,7 +130,7 @@ export function extractTestCodeChanges(
     }
   }
 
-  // 3. 从 output_data.multi_agent_output.agent_outputs.tester 中提取（CODING 阶段的格式）
+  // 4. 从 output_data.multi_agent_output.agent_outputs.tester 中提取（CODING 阶段的格式）
   if (outputData?.multi_agent_output) {
     const multiAgent = outputData.multi_agent_output as Record<string, unknown>;
     const agentOutputs = multiAgent?.agent_outputs as Record<string, unknown> | undefined;
@@ -140,7 +145,7 @@ export function extractTestCodeChanges(
     }
   }
 
-  // 4. 从 sourceData.files 中过滤测试文件（兼容旧格式）
+  // 5. 从 sourceData.files 中过滤测试文件（兼容旧格式）
   const sourceData = outputData || inputData;
   if (Array.isArray(sourceData?.files) && (sourceData!.files as unknown[]).length > 0) {
     const files = sourceData!.files as Array<Record<string, string>>;

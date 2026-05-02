@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 
-from app.core.config import get_workspace_path, process_file_path
+from app.core.config import get_workspace_path
 from app.core.logging import error, info
 
 
@@ -89,9 +89,12 @@ def read_file_context(
     if workspace is None:
         workspace = get_workspace_path("frontend")
 
-    # 处理文件路径
-    processed_path = process_file_path(file_path)
-    full_path = workspace / processed_path
+    # 【修复】直接基于 workspace 解析路径，不使用 process_file_path
+    path = Path(file_path)
+    if path.is_absolute():
+        full_path = path
+    else:
+        full_path = workspace / path
 
     if not full_path.exists():
         raise FileNotFoundError(f"文件不存在: {file_path}")
@@ -120,7 +123,7 @@ def validate_file_path(
     workspace: Optional[Path] = None
 ) -> Tuple[bool, Optional[str]]:
     """
-    验证文件路径是否合法（确保在工作目录内）
+    验证文件路径是否合法（防止目录遍历攻击）
 
     Args:
         file_path: 文件路径
@@ -129,17 +132,34 @@ def validate_file_path(
     Returns:
         Tuple[bool, Optional[str]]: (是否合法, 错误信息)
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     if workspace is None:
         workspace = get_workspace_path("frontend")
 
+    logger.info(f"[DEBUG] validate_file_path: file_path={repr(file_path)}, workspace={workspace}")
+
     try:
-        processed_path = process_file_path(file_path)
-        full_path = workspace / processed_path
+        # 【修复】不要调用 process_file_path，直接基于 workspace 解析路径
+        path = Path(file_path)
+        if path.is_absolute():
+            full_path = path
+        else:
+            full_path = workspace / path
+
+        logger.info(f"[DEBUG] full_path: {full_path}")
+        logger.info(f"[DEBUG] full_path.resolve(): {full_path.resolve()}")
+        logger.info(f"[DEBUG] workspace.resolve(): {workspace.resolve()}")
+
         full_path.resolve().relative_to(workspace.resolve())
+        logger.info(f"[DEBUG] 路径验证通过")
         return True, None
-    except ValueError:
+    except ValueError as e:
+        logger.error(f"[DEBUG] 路径验证失败 (ValueError): {e}")
         return False, "非法文件路径"
     except Exception as e:
+        logger.error(f"[DEBUG] 路径验证失败 (Exception): {e}")
         return False, f"路径验证失败: {e}"
 
 
@@ -157,24 +177,39 @@ def read_file_content(
     Returns:
         Tuple[bool, str, Optional[str]]: (是否成功, 内容, 错误信息)
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"[DEBUG] read_file_content: file_path={repr(file_path)}")
+
     # 验证路径
     is_valid, error_msg = validate_file_path(file_path, workspace)
     if not is_valid:
+        logger.error(f"[DEBUG] 路径验证失败: {error_msg}")
         return False, "", error_msg
 
     if workspace is None:
         workspace = get_workspace_path("frontend")
 
     try:
-        processed_path = process_file_path(file_path)
-        full_path = workspace / processed_path
+        # 【修复】不要调用 process_file_path，直接基于 workspace 解析路径
+        path = Path(file_path)
+        if path.is_absolute():
+            full_path = path
+        else:
+            full_path = workspace / path
+
+        logger.info(f"[DEBUG] 读取文件: {full_path}")
 
         if not full_path.exists():
+            logger.error(f"[DEBUG] 文件不存在: {full_path}")
             return False, "", f"文件不存在: {file_path}"
 
         content = full_path.read_text(encoding='utf-8')
+        logger.info(f"[DEBUG] 文件读取成功: {len(content)} 字符")
         return True, content, None
     except Exception as e:
+        logger.error(f"[DEBUG] 读取文件失败: {e}")
         error(f"读取文件失败: {e}")
         return False, "", f"读取文件失败: {e}"
 
@@ -204,8 +239,12 @@ def write_file_content(
         workspace = get_workspace_path("frontend")
 
     try:
-        processed_path = process_file_path(file_path)
-        full_path = workspace / processed_path
+        # 【修复】直接基于 workspace 解析路径，不使用 process_file_path
+        path = Path(file_path)
+        if path.is_absolute():
+            full_path = path
+        else:
+            full_path = workspace / path
 
         # 确保目录存在
         full_path.parent.mkdir(parents=True, exist_ok=True)

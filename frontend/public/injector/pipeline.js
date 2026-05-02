@@ -213,6 +213,13 @@
   // 轻量级快速修改 - 带 AI 效果预览
   // ============================================
   async function quickModify(elementInfo, feedback, onComplete) {
+    // 【调试】检查传入的 elementInfo
+    console.log('[OmniFlowAI] ========== quickModify 调试 ==========');
+    console.log('[OmniFlowAI] 传入的 elementInfo:', elementInfo);
+    console.log('[OmniFlowAI] elementInfo.sourceFile:', elementInfo ? elementInfo.sourceFile : 'N/A');
+    console.log('[OmniFlowAI] elementInfo.xpath:', elementInfo ? elementInfo.xpath : 'N/A');
+    console.log('[OmniFlowAI] ========== quickModify 调试结束 ==========');
+    
     // 安全检查：确保 preview 模块已加载
     if (!window.OmniFlowAIPreview) {
       console.error('[OmniFlowAI] Preview 模块未加载');
@@ -231,6 +238,8 @@
       XPathResult.FIRST_ORDERED_NODE_TYPE,
       null
     ).singleNodeValue;
+
+    console.log('[OmniFlowAI] 通过 XPath 找到的元素:', element);
 
     if (!element) {
       UI.createToast('❌ 找不到要修改的元素', 'error');
@@ -272,6 +281,13 @@
           element_text: info.text,
         };
       });
+
+      // 【修复】验证所有文件路径
+      const invalidFiles = files.filter(f => !f.file || f.file.trim() === '');
+      if (invalidFiles.length > 0) {
+        console.error('[OmniFlowAI] 部分元素缺少源文件信息:', invalidFiles);
+        throw new Error(`${invalidFiles.length} 个元素无法获取源文件信息。请确保所有元素都有正确的 data-source 属性或 React 源码映射。`);
+      }
 
       UI.updateProgressBar(progressBar, '正在批量生成代码...', 50);
 

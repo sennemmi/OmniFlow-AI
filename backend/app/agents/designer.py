@@ -13,6 +13,7 @@
 
 import json
 import logging
+import time
 from typing import Dict, Optional, Any
 
 import instructor
@@ -54,6 +55,27 @@ class DesignerAgent(LangGraphAgent[DesignerOutput]):
 
 【核心原则】
 以创造接口为耻，以复用现有为荣！
+
+【项目标准对象字典 - 强制遵守】
+• ResponseModel: 这是一个 FastAPI 统一响应包装对象。
+  ◦ 结构: {success: bool, data: Any, error: Optional[str], request_id: str}
+  ◦ 访问方式: 测试代码必须通过 response.data["key"] 访问业务数据
+  ◦ 构造方式: 实现代码必须使用 success_response(data={...}) 或 error_response(message=...)
+  ◦ 禁止: 直接返回裸字典或裸对象
+
+• ComponentStatus: 这是一个枚举，值必须是 "healthy", "degraded", "unhealthy"
+  ◦ 用于: 系统组件健康状态标记
+  ◦ 转换: 底层状态 "up"/"down" 需要映射为 ComponentStatus
+
+• HealthCheckResponse: 健康检查标准响应结构
+  ◦ status: str - 整体状态 ("healthy"/"unhealthy"/"degraded")
+  ◦ health_score: int - 健康度评分 (0-100)
+  ◦ components: dict - 各组件状态详情
+  ◦ timestamp: str - ISO格式时间戳
+
+• DiskUsage / MemoryUsage / DatabaseStatus: 标准监控数据结构
+  ◦ 必须使用标准键名: usage_percent (不是 used_percent), total_gb, used_gb, free_gb
+  ◦ 禁止发明新的键名，必须与现有代码保持一致
 
 【任务要求】
 1. 仔细阅读 ArchitectAgent 的输出（功能描述、受影响文件列表）
@@ -220,22 +242,27 @@ mock_dependencies 字段格式：
 【禁止】不要遗漏任何字段，不要假设 CoderAgent 会自己决定键名！
 
 【验收标准与接口契约映射 - 强制要求】
-你必须输出 `criteria_mappings`，明确说明每条验收标准如何被接口契约覆盖。
+你必须输出 `contract_alignment`，明确说明每条验收标准如何被接口契约覆盖。
 
 这是**强制性要求**，不输出或输出不完整将导致设计被拒绝！
 
-criteria_mappings 格式：
+【重试模式关键规则 - 绝对禁止遗漏符号】
+如果你收到了反馈要求修正设计（rejection_feedback），必须遵守以下规则：
+1. **保留所有必需符号**：ArchitectAgent 在 required_symbols 中列出的所有符号必须出现在 interface_specs 中
+2. **不要删除已有符号**：即使你在修正 contract_alignment，也不要删除或遗漏任何 interface_specs 中的符号
+3. **累加而非替换**：新的设计应该是在之前设计的基础上累加修正，而不是重新生成
+4. **必需符号清单检查**：输出前必须检查 required_symbols 中的所有符号是否都在 interface_specs 中
+
+contract_alignment 格式（使用 DesignerOutputV2）：
 {
-  "criteria_mappings": [
+  "contract_alignment": [
     {
-      "criteria_index": 1,
-      "criteria_description": "API 返回健康状态字段 overall_health",
+      "acceptance_criteria": "API 返回健康状态字段 overall_health",
       "covered_by": ["health_check", "HealthService"],
       "mapping_reason": "health_check 函数返回的 dict 中包含 overall_health 字段，由 HealthService 计算得出"
     },
     {
-      "criteria_index": 2,
-      "criteria_description": "系统组件状态包含 database、disk、memory",
+      "acceptance_criteria": "系统组件状态包含 database、disk、memory",
       "covered_by": ["get_system_health"],
       "mapping_reason": "get_system_health 返回的 components 字段包含所有子系统状态"
     }
@@ -243,17 +270,17 @@ criteria_mappings 格式：
 }
 
 映射要求：
-1. **每条验收标准都必须有对应的映射**（criteria_index 从1开始，对应 acceptance_criteria 的顺序）
+1. **每条验收标准都必须有对应的映射**（acceptance_criteria 字段对应验收标准描述）
 2. **covered_by 中的符号必须在 interface_specs 中存在**
 3. **mapping_reason 必须具体说明接口如何满足验收标准**，不能写空话
 4. **如果一条验收标准需要多个接口共同满足，列出所有相关接口**
 5. **对齐率必须达到 100%**，缺少任何一条映射都会导致失败
 
 生成 checklist（输出前自检）：
-□ 是否列出了所有验收标准的映射？
+□ 是否列出了所有验收标准的映射（contract_alignment）？
 □ 每个映射的 covered_by 是否在 interface_specs 中？
 □ mapping_reason 是否具体说明了如何满足标准？
-□ covers_criteria 是否与 criteria_mappings 一致？
+□ required_symbols 中的所有符号是否都包含在 interface_specs 中？（重试模式必须检查）
 
 【接口契约设计原则 - 极其重要】
 1. **尽可能沿用 `generated_files` 中已经存在的函数名和结构**
@@ -434,6 +461,9 @@ signature_change_reason: 无需修改，复用现有函数
         """
         from app.core.sse_log_buffer import push_log
         
+        # 记录开始时间
+        start_time = time.perf_counter()
+        
         await push_log(pipeline_id, "info", "结构化设计师 Agent 开始工作（Instructor 模式）...", stage="DESIGN")
         
         # ========== 1. 前置静态检查 ==========
@@ -578,12 +608,17 @@ signature_change_reason: 无需修改，复用现有函数
                 await push_log(pipeline_id, "info", "✅ 契约-现有代码对齐检查通过", stage="DESIGN")
         
         # ========== 7. 返回与原有接口兼容的结果 ==========
+        # 计算耗时
+        end_time = time.perf_counter()
+        duration_ms = int((end_time - start_time) * 1000)
+        
         return {
             "success": True,
             "output": designer_output.model_dump(),
             "error": None,
             "input_tokens": 0,  # Instructor 暂不直接返回 usage，可从 litellm 全局统计获取
             "output_tokens": 0,
+            "duration_ms": duration_ms,
             "total_tokens": 0,
             "interface_specs_count": len(designer_output.interface_specs),
             "contract_alignment_count": len(designer_output.contract_alignment)

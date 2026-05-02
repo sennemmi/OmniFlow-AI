@@ -34,10 +34,13 @@ class AgentTools:
     代理到底层核心工具与高级工具，保持向后兼容的 API。
     """
 
-    def __init__(self, project_path: str, file_service=None):
+    def __init__(self, project_path: str, file_service=None, pipeline_id: Optional[int] = None, agent_role: Optional[str] = None):
         self._core = AgentToolsCore(project_path, file_service=file_service)
         self._advanced = AgentToolsAdvanced(project_path, file_service=file_service)
         self.project_path = project_path
+        self.__file_service = file_service  # 使用双下划线避免与 property 冲突
+        self._pipeline_id = pipeline_id
+        self._agent_role = agent_role  # Agent 角色，用于权限控制
 
     # =====================================================================
     # 内部状态代理（供外部如 ArchitectAgent 访问）
@@ -51,7 +54,13 @@ class AgentTools:
     @property
     def _file_service(self):
         """代理到底层核心工具的 _file_service"""
-        return self._core._file_service
+        # 优先返回实例变量，如果没有则返回核心工具的
+        return self.__file_service if self.__file_service is not None else self._core._file_service
+
+    @_file_service.setter
+    def _file_service(self, value):
+        """设置 file_service"""
+        self.__file_service = value
 
     @property
     def _sandbox_mode(self) -> bool:
@@ -133,7 +142,15 @@ class AgentTools:
 
     @property
     def tool_definitions(self) -> List[Dict[str, Any]]:
-        return [
+        """
+        获取工具定义列表
+
+        【权限控制】
+        - 所有 Agent 都可以使用代码操作工具
+        - RepairerAgent 额外拥有 install_dependency 工具
+        """
+        # 基础工具（所有 Agent 可用）
+        tools = [
             {
                 "type": "function",
                 "function": {
@@ -246,6 +263,84 @@ class AgentTools:
             }
         ]
 
+        # 【权限控制】RepairerAgent 额外拥有 install_dependency 工具
+        if self._agent_role == "repairer":
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "install_dependency",
+                    "description": "【RepairerAgent 专用】在沙箱中安装 Python 依赖包。当测试报错 'ModuleNotFoundError: No module named xxx' 时使用此工具安装缺失的依赖。安装完成后应该立即重新运行测试。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "package_name": {
+                                "type": "string",
+                                "description": "依赖包名称，如 'bcrypt', 'python-jose', 'passlib', 'jwt'"
+                            }
+                        },
+                        "required": ["package_name"]
+                    }
+                }
+            })
+
+        return tools
+
+    async def install_dependency(self, package_name: str) -> str:
+        """
+        在沙箱中安装 Python 依赖包
+
+        Args:
+            package_name: 依赖包名称，如 'bcrypt', 'python-jose'
+
+        Returns:
+            str: JSON 格式的安装结果
+        """
+        from app.service.sandbox_manager import sandbox_manager
+
+        try:
+            # 获取 pipeline_id
+            pipeline_id = self._pipeline_id
+            if not pipeline_id:
+                return json.dumps({
+                    "success": False,
+                    "error": "Pipeline ID 未设置，无法执行沙箱命令"
+                })
+
+            logger.info(f"[AgentTools] 安装依赖: {package_name}")
+
+            # 在沙箱中执行 pip install
+            exec_result = await sandbox_manager.exec(
+                pipeline_id,
+                f"pip install {package_name} --quiet 2>&1",
+                timeout=120
+            )
+
+            logs = exec_result.stdout + "\n" + exec_result.stderr
+            success = exec_result.exit_code == 0
+
+            if success:
+                logger.info(f"[AgentTools] 依赖 {package_name} 安装成功")
+                return json.dumps({
+                    "success": True,
+                    "message": f"依赖 {package_name} 安装成功",
+                    "package": package_name
+                })
+            else:
+                logger.error(f"[AgentTools] 依赖 {package_name} 安装失败: {logs[:500]}")
+                return json.dumps({
+                    "success": False,
+                    "error": f"安装失败: {logs[:500]}",
+                    "package": package_name
+                })
+
+        except Exception as e:
+            logger.error(f"[AgentTools] 安装依赖时出错: {e}")
+            return json.dumps({
+                "success": False,
+                "error": str(e),
+                "package": package_name
+            })
+
     async def execute_tool(self, tool_name: str, arguments: Dict[str, Any], pipeline_id: Optional[int] = None) -> str:
         sync_tool_map = {
             "glob": self.glob,
@@ -253,7 +348,8 @@ class AgentTools:
             "read_file": self.read_file
         }
         async_tool_map = {
-            "replace_lines": self.replace_lines
+            "replace_lines": self.replace_lines,
+            "install_dependency": self.install_dependency
         }
 
         if tool_name in sync_tool_map:
@@ -294,5 +390,5 @@ class AgentTools:
 
 
 # 便捷函数
-def get_agent_tools(project_path: str, file_service=None) -> AgentTools:
-    return AgentTools(project_path, file_service=file_service)
+def get_agent_tools(project_path: str, file_service=None, pipeline_id: int = 0, agent_role: Optional[str] = None) -> AgentTools:
+    return AgentTools(project_path, file_service=file_service, pipeline_id=pipeline_id, agent_role=agent_role)

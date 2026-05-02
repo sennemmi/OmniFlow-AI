@@ -113,21 +113,35 @@
     getElementInfo: (el) => {
       const rect = el.getBoundingClientRect();
 
+      // 【调试】记录元素信息获取过程
+      console.log('[OmniFlowAI] ========== getElementInfo 调试 ==========');
+      console.log('[OmniFlowAI] 元素标签:', el.tagName);
+      console.log('[OmniFlowAI] 元素 id:', el.id);
+      console.log('[OmniFlowAI] 元素 class:', el.className);
+
       let dataSource = el.getAttribute('data-source-id') ||
                        el.getAttribute('data-source') || '';
       let sourceElement = el;
 
+      console.log('[OmniFlowAI] 元素 data-source-id:', el.getAttribute('data-source-id'));
+      console.log('[OmniFlowAI] 元素 data-source:', el.getAttribute('data-source'));
+      console.log('[OmniFlowAI] dataSource 初始值:', dataSource);
+
       if (!dataSource) {
         const closestWithSource = el.closest('[data-source-id], [data-source]');
+        console.log('[OmniFlowAI] 最近的父元素有 data-source:', !!closestWithSource);
         if (closestWithSource) {
           dataSource = closestWithSource.getAttribute('data-source-id') ||
                        closestWithSource.getAttribute('data-source') || '';
           sourceElement = closestWithSource;
+          console.log('[OmniFlowAI] 从父元素获取的 dataSource:', dataSource);
         }
       }
 
       const reactInfo = ReactSourceMapper.getComponentInfo(el) ||
                        ReactSourceMapper.getComponentInfo(sourceElement);
+
+      console.log('[OmniFlowAI] React 信息:', reactInfo);
 
       let sourceFile = '';
       let sourceLine = 0;
@@ -135,6 +149,7 @@
 
       if (dataSource) {
         const parts = dataSource.split(':');
+        console.log('[OmniFlowAI] dataSource 分割结果:', parts);
         if (parts.length >= 2) {
           if (parts[0].length === 1 && parts[1].startsWith('\\')) {
             sourceFile = parts[0] + ':' + parts[1];
@@ -147,6 +162,9 @@
           }
         }
       }
+
+      console.log('[OmniFlowAI] 从 dataSource 解析的 sourceFile:', sourceFile);
+      console.log('[OmniFlowAI] 从 dataSource 解析的 sourceLine:', sourceLine);
 
       let finalSourceFile = sourceFile;
       let finalSourceLine = sourceLine;
@@ -163,6 +181,10 @@
           finalSourceColumn = reactInfo.sourceLocation.columnNumber || sourceColumn;
         }
       }
+
+      console.log('[OmniFlowAI] 最终的 finalSourceFile:', finalSourceFile);
+      console.log('[OmniFlowAI] 最终的 finalSourceLine:', finalSourceLine);
+      console.log('[OmniFlowAI] ========== getElementInfo 调试结束 ==========');
 
       const props = {};
       if (el.attributes) {

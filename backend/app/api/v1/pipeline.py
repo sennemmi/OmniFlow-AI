@@ -43,7 +43,7 @@ class LLMContext(BaseModel):
     selected_html: str = Field(..., description="选中的 HTML 片段")
     surrounding_code: str = Field(default="", description="周围代码上下文")
     user_instruction: str = Field(..., description="用户修改指令")
-    element_type: str = Field(..., description="元素类型（如 div, button）")
+    element_type: Optional[str] = Field(default=None, description="元素类型（如 div, button）")
     element_id: Optional[str] = Field(default=None, description="元素 ID")
     element_class: Optional[str] = Field(default=None, description="元素 class")
     xpath: str = Field(default="", description="元素 XPath")
@@ -207,6 +207,16 @@ class PipelineTerminateResponse(BaseModel):
     status: str = Field(..., description="当前状态: failed")
     message: str = Field(..., description="终止消息")
     terminated_at: Optional[str] = Field(None, description="终止时间")
+
+
+class PipelineRetryResponse(BaseModel):
+    """Pipeline 重试响应数据"""
+    pipeline_id: int = Field(..., description="Pipeline ID")
+    action: str = Field(..., description="操作类型: retry")
+    previous_stage: Optional[str] = Field(None, description="重试前的阶段")
+    current_stage: Optional[str] = Field(None, description="当前阶段（重置后）")
+    status: str = Field(..., description="当前状态: running")
+    message: str = Field(..., description="重试消息")
 
 
 async def run_architect_task(pipeline_id: int, requirement: str, element_context: Optional[Dict[str, Any]]) -> None:
@@ -702,7 +712,7 @@ async def approve_pipeline(
 
         if not result["success"]:
             return error_response(
-                error=result["error"],
+                error=result.get("error", "Pipeline approval failed"),
                 request_id=request_id
             )
 
@@ -1027,3 +1037,65 @@ async def handle_test_decision(
     await push_log(pipeline_id, "info",
                    "🔄 重新生成代码（允许更新旧测试）", stage="CODING")
     return success_response({"restarted": True}, request_id=request_id)
+
+
+@router.post(
+    "/pipeline/{pipeline_id}/retry",
+    response_model=ResponseModel,
+    summary="重试失败的 Pipeline",
+    description="""
+    重试失败的 Pipeline，从失败的阶段重新开始执行。
+    
+    重试流程：
+    1. 重置 Pipeline 状态为 running
+    2. 重置当前失败阶段为 pending
+    3. 重新启动 Sandbox（如果已停止）
+    4. 后台异步重新执行当前阶段
+    
+    只能重试状态为 failed 的 Pipeline。
+    """,
+    response_description="重试结果"
+)
+async def retry_pipeline(
+    request: Request,
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
+    background_tasks: BackgroundTasks = None,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    重试失败的 Pipeline
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        result = await PipelineService.retry_pipeline(
+            pipeline_id=pipeline_id,
+            session=session,
+            background_tasks=background_tasks
+        )
+
+        if not result["success"]:
+            return error_response(
+                error=result.get("error", "Pipeline retry failed"),
+                request_id=request_id
+            )
+
+        response_data = PipelineRetryResponse(
+            pipeline_id=pipeline_id,
+            action="retry",
+            previous_stage=result["data"].get("previous_stage"),
+            current_stage=result["data"].get("current_stage"),
+            status="running",
+            message=result["data"].get("message", "Pipeline retry started")
+        )
+
+        return success_response(
+            data=response_data.model_dump(),
+            request_id=request_id
+        )
+    except Exception as e:
+        error("重试 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(
+            error=f"Failed to retry pipeline: {str(e)}",
+            request_id=request_id
+        )

@@ -64,9 +64,9 @@ async def run_syntax_fix_loop(
         )
 
         # 构建定向设计输出
+        # 【修复】保留 interface_specs 和 required_symbols，让 CoderAgent 在修复语法错误时仍有契约约束
         targeted_design = {
-            **{k: v for k, v in design_output.items() if k != "interface_specs"},
-            "interface_specs": [],
+            **design_output,
             "affected_files": list(error_files.keys()),
             "fix_mode": True,
             "force_full_file": force_full_file,
@@ -106,28 +106,64 @@ async def run_syntax_fix_loop(
                 continue
 
             current_content = error_files.get(fp, "")
+            new_content = None
 
             if change_type == "modify" and search_block and current_content:
                 new_content = current_content.replace(search_block, replace_block, 1)
-                check_result = await validation_service.check_syntax_with_py_compile(
-                    [{"file_path": fp, "change_type": "add", "content": new_content}],
-                    file_service
-                )
-                if not check_result:
-                    fixed_files[fp] = new_content
-                    _update_files_to_check(files_to_check, fp, new_content)
-            elif content:
-                check_result = await validation_service.check_syntax_with_py_compile(
-                    [{"file_path": fp, "change_type": "add", "content": content}],
-                    file_service
-                )
-                if not check_result:
-                    fixed_files[fp] = content
-                    _update_files_to_check(files_to_check, fp, content)
 
-        # 检查剩余错误
+                # 【修复】检测 search_block 是否匹配成功
+                if new_content == current_content:
+                    logger.warning(f"search_block 未匹配到内容: {fp}，尝试使用全量替换")
+                    # 降级策略：如果提供了 content，使用全量替换
+                    if content and content != current_content:
+                        new_content = content
+                    else:
+                        logger.warning(f"未提供有效的全量替换内容，跳过: {fp}")
+                        continue
+            elif content:
+                new_content = content
+
+            if not new_content:
+                logger.warning(f"没有生成有效内容: {fp}")
+                continue
+
+            # 【关键修复1】将修复后的内容写入沙箱，并检查返回值
+            write_result = await file_service.write_file(fp, new_content)
+            if not write_result.get("success"):
+                logger.error(f"写入沙箱失败: {fp} - {write_result.get('error')}")
+                continue
+
+            # 【关键修复2】回读验证 - 确保写入成功
+            read_result = await file_service.read_file(fp)
+            if not read_result.exists:
+                logger.error(f"回读文件失败: {fp}")
+                continue
+
+            actual_content = read_result.content
+            if actual_content != new_content:
+                logger.error(f"写入验证失败: {fp} - 内容不匹配")
+                logger.debug(f"期望长度: {len(new_content)}, 实际长度: {len(actual_content)}")
+                # 使用实际内容继续
+                new_content = actual_content
+
+            # 【关键修复3】使用回读后的内容进行语法检查
+            check_result = await validation_service.check_syntax_with_py_compile(
+                [{"file_path": fp, "change_type": "add", "content": new_content}],
+                file_service
+            )
+
+            # 更新内存中的文件内容（使用回读后的实际内容）
+            _update_files_to_check(files_to_check, fp, new_content)
+
+            if not check_result:
+                fixed_files[fp] = new_content
+                logger.info(f"语法修复成功: {fp}")
+            else:
+                logger.warning(f"修复后仍有语法错误: {fp} - {check_result[0].error}")
+
+        # 【关键修复4】检查剩余错误时，从沙箱重新读取文件
         remaining_errors = await _check_remaining_syntax_errors(
-            syntax_errors, fixed_files, files_to_check, validation_service, file_service
+            syntax_errors, files_to_check, validation_service, file_service
         )
 
         if not remaining_errors:
@@ -429,33 +465,47 @@ def _update_files_to_check(files_to_check: List[Tuple[str, str]], file_path: str
 
 async def _check_remaining_syntax_errors(
     syntax_errors: List[Dict],
-    fixed_files: Dict[str, str],
     files_to_check: List[Tuple[str, str]],
     validation_service,
     file_service: SandboxFileService
 ) -> List[Dict]:
-    """检查剩余的语法错误"""
+    """
+    检查剩余的语法错误
+    
+    【关键修复】从沙箱重新读取文件内容进行验证，而不是使用内存中的内容
+    """
     remaining = []
+    checked_files = set()
+    
     for err in syntax_errors:
         fp = err.get("file", "")
-        check_content = fixed_files.get(fp, "")
-
-        if not check_content:
-            for check_fp, content in files_to_check:
-                if check_fp == fp:
-                    check_content = content
-                    break
-
+        if fp in checked_files:
+            continue
+        checked_files.add(fp)
+        
+        # 【关键】从沙箱重新读取文件内容
+        read_result = await file_service.read_file(fp)
+        if not read_result.exists:
+            logger.warning(f"无法读取文件进行语法检查: {fp}")
+            remaining.append(err)
+            continue
+            
+        check_content = read_result.content
+        
         if check_content:
             check_result = await validation_service.check_syntax_with_py_compile(
                 [{"file_path": fp, "change_type": "add", "content": check_content}],
                 file_service
             )
             if check_result:
+                logger.warning(f"仍有语法错误: {fp} - {check_result[0].error}")
                 remaining.append({
                     "file": fp,
                     "error": check_result[0].error,
                     "line": check_result[0].line
                 })
+        else:
+            logger.warning(f"文件内容为空: {fp}")
+            remaining.append(err)
 
     return remaining

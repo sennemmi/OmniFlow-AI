@@ -77,38 +77,56 @@ class LLMCallError(Exception):
     pass
 
 
-class ModelScopeProvider(LLMProvider):
+class OpenAICompatibleProvider(LLMProvider):
     """
-    ModelScope (魔搭) Provider
+    OpenAI 兼容 Provider 基类
 
-    使用 OpenAI 兼容接口，集成智能重试机制
+    为所有使用 OpenAI 兼容接口的 Provider 提供通用实现。
+    子类只需配置 provider_name、model、api_key、api_base 即可。
     """
 
-    def __init__(self):
-        self._client = None
+    def __init__(
+        self,
+        provider_name: str,
+        model: str,
+        api_key: str,
+        api_base: str,
+        retry_name: str,
+        use_openai_prefix: bool = True,
+        custom_llm_provider: Optional[str] = None
+    ):
+        """
+        初始化 OpenAI 兼容 Provider
+
+        Args:
+            provider_name: Provider 显示名称
+            model: 模型名称
+            api_key: API 密钥
+            api_base: API 基础 URL
+            retry_name: 重试执行器名称
+            use_openai_prefix: 是否在模型名前加 openai/ 前缀
+            custom_llm_provider: 自定义 LLM Provider 标识
+        """
+        self._provider_name = provider_name
+        self._model = model
+        self._api_key = api_key
+        self._api_base = api_base
+        self._use_openai_prefix = use_openai_prefix
+        self._custom_llm_provider = custom_llm_provider
+
         # 【智能重试】初始化重试执行器
         self._retry_executor = ResilienceManager.get_executor(
-            name="modelscope_provider",
+            name=retry_name,
             **RetryConfig.LLM_ROBUST
         )
 
     @property
     def provider_name(self) -> str:
-        return "ModelScope"
+        return self._provider_name
 
     @property
     def model_name(self) -> str:
-        return settings.llm_model
-
-    def _get_client(self):
-        """懒加载 AsyncOpenAI 客户端"""
-        if self._client is None:
-            from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(
-                base_url=settings.llm_api_base,
-                api_key=settings.llm_api_key
-            )
-        return self._client
+        return self._model
 
     async def _do_call(
         self,
@@ -118,22 +136,26 @@ class ModelScopeProvider(LLMProvider):
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """实际调用 ModelScope API（使用 LiteLLM 路由）"""
-        # 使用 LiteLLM 统一路由，加上 openai/ 前缀让 LiteLLM 正确识别
-        model_with_prefix = f"openai/{settings.llm_model}"
+        """实际调用 API（使用 LiteLLM 路由）"""
+        # 构建模型名称
+        model = f"openai/{self._model}" if self._use_openai_prefix else self._model
 
         # 构建调用参数
         call_params = {
-            "model": model_with_prefix,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "api_key": settings.llm_api_key,
-            "api_base": settings.llm_api_base,
+            "api_key": self._api_key,
+            "api_base": self._api_base,
             "temperature": temperature,
             "max_tokens": max_tokens
         }
+
+        # 如果指定了 custom_llm_provider，添加到参数中
+        if self._custom_llm_provider:
+            call_params["custom_llm_provider"] = self._custom_llm_provider
 
         # 如果指定了 response_format，添加到参数中
         if response_format:
@@ -154,12 +176,12 @@ class ModelScopeProvider(LLMProvider):
             logger.error(
                 f"[{self.provider_name}] Empty choices detected! "
                 f"This is typically an API intermittent issue (rate limiting or service unavailable). "
-                f"usage={usage_info}, model={settings.llm_model}"
+                f"usage={usage_info}, model={self._model}"
             )
             # 返回一个可重试的错误信号
             raise LLMCallError(
                 f"API 间歇性错误：LLM 返回空响应 (usage: {usage_info}). "
-                f"这通常是 ModelScope API 的临时问题，建议自动重试。"
+                f"这通常是 {self.provider_name} API 的临时问题，建议自动重试。"
             )
 
         # 检查 message content 是否为空
@@ -211,15 +233,15 @@ class ModelScopeProvider(LLMProvider):
         response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        调用 ModelScope API（带智能重试）
+        调用 API（带智能重试）
 
         【智能重试】自动处理以下错误：
         - Empty choices（API 间歇性错误）
         - 网络超时
         - 服务端错误（500, 502, 503, 504）
         """
-        if not settings.llm_api_key:
-            raise LLMCallError("ModelScope API Key 未配置")
+        if not self._api_key:
+            raise LLMCallError(f"{self.provider_name} API Key 未配置")
 
         try:
             # 【智能重试】使用 RetryExecutor 执行调用
@@ -243,7 +265,25 @@ class ModelScopeProvider(LLMProvider):
             raise
 
 
-class OpenAIProvider(LLMProvider):
+class ModelScopeProvider(OpenAICompatibleProvider):
+    """
+    ModelScope (魔搭) Provider
+
+    使用 OpenAI 兼容接口，集成智能重试机制
+    """
+
+    def __init__(self):
+        super().__init__(
+            provider_name="ModelScope",
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            api_base=settings.llm_api_base,
+            retry_name="modelscope_provider",
+            use_openai_prefix=True
+        )
+
+
+class OpenAIProvider(OpenAICompatibleProvider):
     """
     OpenAI Provider
 
@@ -251,142 +291,18 @@ class OpenAIProvider(LLMProvider):
     """
 
     def __init__(self):
-        # 【智能重试】初始化重试执行器
-        self._retry_executor = ResilienceManager.get_executor(
-            name="openai_provider",
-            **RetryConfig.LLM_ROBUST
+        super().__init__(
+            provider_name="OpenAI",
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            api_base=settings.llm_api_base,
+            retry_name="openai_provider",
+            use_openai_prefix=False,
+            custom_llm_provider="openai"
         )
 
-    @property
-    def provider_name(self) -> str:
-        return "OpenAI"
 
-    @property
-    def model_name(self) -> str:
-        return settings.llm_model
-
-    async def _do_call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        response_format: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """实际调用 OpenAI API (via LiteLLM)（内部方法，供重试执行器调用）"""
-        # 构建调用参数
-        call_params = {
-            "model": settings.llm_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "api_key": settings.llm_api_key,
-            "api_base": settings.llm_api_base,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "custom_llm_provider": "openai"  # 强制使用 OpenAI 兼容方式
-        }
-
-        # 如果指定了 response_format，添加到参数中
-        if response_format:
-            call_params["response_format"] = response_format
-            logger.info(f"[{self.provider_name}] 使用结构化输出: {response_format}")
-
-        response = await litellm.acompletion(**call_params)
-
-        # 【详细日志】记录完整响应结构以诊断问题
-        logger.debug(f"[{self.provider_name}] Raw response: {response}")
-
-        if not response:
-            raise LLMCallError("LLM 返回 None 响应")
-
-        if not response.choices:
-            logger.error(f"[{self.provider_name}] Empty choices! response: {response}")
-            raise LLMCallError(f"LLM 返回空 choices，可能原因：API 限流、内容被过滤。usage: {getattr(response, 'usage', 'N/A')}")
-
-        # 检查 message content 是否为空
-        message = response.choices[0].message
-        if not message.content or not message.content.strip():
-            logger.warning(f"[{self.provider_name}] Message content is empty! finish_reason: {response.choices[0].finish_reason}")
-            # 某些模型可能返回 reasoning 内容
-            reasoning_content = getattr(message, 'reasoning_content', None) or getattr(message, 'reasoning', None)
-            if reasoning_content:
-                logger.info(f"[{self.provider_name}] Found reasoning content, using as fallback")
-                return {
-                    "content": reasoning_content,
-                    "input_tokens": response.usage.prompt_tokens if response.usage else 0,
-                    "output_tokens": response.usage.completion_tokens if response.usage else 0
-                }
-            raise LLMCallError(f"LLM 返回空内容 (finish_reason: {response.choices[0].finish_reason})")
-
-        # 提取 Token 信息
-        if response.usage:
-            input_tokens = response.usage.prompt_tokens or 0
-            output_tokens = response.usage.completion_tokens or 0
-        else:
-            # 降级：通过内容长度粗略估算（1字符≈0.3 token）
-            content = response.choices[0].message.content or ""
-            input_tokens = int(len(user_prompt) * 0.3)
-            output_tokens = int(len(content) * 0.3)
-            logger.warning(
-                f"[{self.provider_name}] response.usage is None, "
-                f"using estimated tokens: input={input_tokens}, output={output_tokens}"
-            )
-
-        logger.info(
-            f"[{self.provider_name}] response.usage: {response.usage}, "
-            f"input_tokens={input_tokens}, output_tokens={output_tokens}"
-        )
-
-        return {
-            "content": response.choices[0].message.content,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
-
-    async def call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        response_format: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        调用 OpenAI API (via LiteLLM)（带智能重试）
-
-        【智能重试】自动处理以下错误：
-        - Empty choices（API 间歇性错误）
-        - 网络超时
-        - 服务端错误（500, 502, 503, 504）
-        """
-        if not settings.llm_api_key:
-            raise LLMCallError("OpenAI API Key 未配置")
-
-        try:
-            # 【智能重试】使用 RetryExecutor 执行调用
-            return await self._retry_executor.execute(
-                self._do_call,
-                system_prompt,
-                user_prompt,
-                temperature,
-                max_tokens,
-                response_format
-            )
-        except CircuitBreakerOpenError as e:
-            # 【用户感知分级】熔断通知
-            logger.error(f"[{self.provider_name}] Circuit breaker open: {e}")
-            raise LLMCallError(
-                "服务端暂时不稳定，系统正在冷却，请稍后再试..."
-            ) from e
-        except Exception as e:
-            # 【用户感知分级】致命错误或重试耗尽
-            logger.error(f"[{self.provider_name}] Call failed after retries: {e}")
-            raise
-
-
-class MiMoProvider(LLMProvider):
+class MiMoProvider(OpenAICompatibleProvider):
     """
     MiMo (小米米墨) Provider
 
@@ -394,141 +310,14 @@ class MiMoProvider(LLMProvider):
     """
 
     def __init__(self):
-        self._client = None
-        self._retry_executor = ResilienceManager.get_executor(
-            name="mimo_provider",
-            **RetryConfig.LLM_ROBUST
+        super().__init__(
+            provider_name="MiMo",
+            model=settings.MIMO_DEFAULT_MODEL,
+            api_key=settings.MIMO_API_KEY,
+            api_base=settings.MIMO_API_BASE,
+            retry_name="mimo_provider",
+            use_openai_prefix=True
         )
-
-    @property
-    def provider_name(self) -> str:
-        return "MiMo"
-
-    @property
-    def model_name(self) -> str:
-        return settings.MIMO_DEFAULT_MODEL
-
-    def _get_client(self):
-        """懒加载 AsyncOpenAI 客户端"""
-        if self._client is None:
-            from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(
-                base_url=settings.MIMO_API_BASE,
-                api_key=settings.MIMO_API_KEY
-            )
-        return self._client
-
-    async def _do_call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        response_format: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """实际调用 MiMo API（使用 LiteLLM 路由）"""
-        model_with_prefix = f"openai/{settings.MIMO_DEFAULT_MODEL}"
-
-        # 构建调用参数
-        call_params = {
-            "model": model_with_prefix,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "api_key": settings.MIMO_API_KEY,
-            "api_base": settings.MIMO_API_BASE,
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-
-        # 如果指定了 response_format，添加到参数中
-        if response_format:
-            call_params["response_format"] = response_format
-            logger.info(f"[{self.provider_name}] 使用结构化输出: {response_format}")
-
-        response = await litellm.acompletion(**call_params)
-
-        logger.debug(f"[{self.provider_name}] Raw response: {response}")
-
-        if not response:
-            raise LLMCallError("LLM 返回 None 响应")
-
-        if not response.choices:
-            usage_info = response.usage if hasattr(response, 'usage') else None
-            logger.error(
-                f"[{self.provider_name}] Empty choices detected! "
-                f"usage={usage_info}, model={settings.MIMO_DEFAULT_MODEL}"
-            )
-            raise LLMCallError(
-                f"API 间歇性错误：LLM 返回空响应 (usage: {usage_info})."
-            )
-
-        message = response.choices[0].message
-        if not message.content or not message.content.strip():
-            logger.warning(f"[{self.provider_name}] Message content is empty!")
-            reasoning_content = getattr(message, 'reasoning_content', None) or getattr(message, 'reasoning', None)
-            if reasoning_content:
-                logger.info(f"[{self.provider_name}] Found reasoning content, using as fallback")
-                return {
-                    "content": reasoning_content,
-                    "input_tokens": response.usage.prompt_tokens if response.usage else 0,
-                    "output_tokens": response.usage.completion_tokens if response.usage else 0
-                }
-            raise LLMCallError(f"LLM 返回空内容 (finish_reason: {response.choices[0].finish_reason})")
-
-        if response.usage:
-            input_tokens = response.usage.prompt_tokens or 0
-            output_tokens = response.usage.completion_tokens or 0
-        else:
-            content = response.choices[0].message.content or ""
-            input_tokens = int(len(user_prompt) * 0.3)
-            output_tokens = int(len(content) * 0.3)
-            logger.warning(
-                f"[{self.provider_name}] response.usage is None, "
-                f"using estimated tokens: input={input_tokens}, output={output_tokens}"
-            )
-
-        logger.info(
-            f"[{self.provider_name}] response.usage: {response.usage}, "
-            f"input_tokens={input_tokens}, output_tokens={output_tokens}"
-        )
-
-        return {
-            "content": response.choices[0].message.content,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
-
-    async def call(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        response_format: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """调用 MiMo API（带智能重试）"""
-        if not settings.MIMO_API_KEY:
-            raise LLMCallError("MiMo API Key 未配置")
-
-        try:
-            return await self._retry_executor.execute(
-                self._do_call,
-                system_prompt,
-                user_prompt,
-                temperature,
-                max_tokens,
-                response_format
-            )
-        except CircuitBreakerOpenError as e:
-            logger.error(f"[{self.provider_name}] Circuit breaker open: {e}")
-            raise LLMCallError(
-                "服务端暂时不稳定，系统正在冷却，请稍后再试..."
-            ) from e
-        except Exception as e:
-            logger.error(f"[{self.provider_name}] Call failed after retries: {e}")
-            raise
 
 
 class LLMProviderFactory:

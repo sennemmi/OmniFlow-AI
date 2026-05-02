@@ -4,14 +4,24 @@ Repairer 工具函数
 提供构建修复工单、收集目标文件等功能
 """
 
+import ast
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.service.sandbox_file_service import SandboxFileService
 from app.utils.file_operation_utils import clean_backend_prefix
 
 
-def extract_pytest_failures(logs: str, max_chars: int = 5000) -> str:
+# 核心契约文件映射表（用于 import 关联提取）
+CORE_CONTRACT_MODULES = {
+    "app.core.response": "app/core/response.py",
+    "app.core.database": "app/core/database.py",
+    "app.core.config": "app/core/config.py",
+    "app.core.security": "app/core/security.py",
+}
+
+
+def extract_pytest_failures(logs: Optional[str], max_chars: int = 5000) -> str:
     """
     从 pytest 日志中提取 FAILURES 部分
 
@@ -22,6 +32,10 @@ def extract_pytest_failures(logs: str, max_chars: int = 5000) -> str:
     Returns:
         提取的错误内容
     """
+    # 确保 logs 是字符串
+    if not logs:
+        return ""
+
     # 尝试提取 FAILURES 部分
     failures_match = re.search(
         r'=+\s*FAILURES\s*=+(.*?)(?:=+\s*short test summary info\s*=+|=+\s*\d+ failed|$)',
@@ -48,7 +62,7 @@ def extract_pytest_failures(logs: str, max_chars: int = 5000) -> str:
 
 def build_fix_order(
     failed_tests: List[str],
-    logs: str,
+    logs: Optional[str],
     generated_file_paths: List[str],
     missing_symbols: Optional[List[str]] = None,
     errors_list: Optional[List[Dict]] = None,
@@ -252,3 +266,274 @@ def print_fix_result(repair_result: Dict, output: Dict) -> None:
     else:
         rounds = output.get("rounds", 0)
         print(f"   ❌ RepairerAgentWithTools 修复失败（进行了 {rounds} 轮修复）: {repair_result.get('error')}")
+
+
+def extract_critical_files(logs: str, all_generated_paths: List[str]) -> List[str]:
+    """
+    【全量收集 + 智能过滤】从报错日志中提取关键文件
+
+    策略：
+    1. 全量收集：扫描日志中所有可能的 Python 文件路径
+    2. 智能过滤：只保留包含 'app/' 或 'tests/' 的业务相关文件
+    3. 强制注入：地基文件（response.py, database.py）
+    """
+    critical_files = set()
+
+    # 1. 【地基】强制注入核心契约文件
+    CORE_CONTRACTS = [
+        "app/core/response.py",
+        "app/core/database.py",
+    ]
+    critical_files.update(CORE_CONTRACTS)
+
+    # 2. 【全量收集】扫描所有可能的 Python 文件路径
+    # 匹配：/workspace/backend/app/service/health_service.py
+    # 匹配：backend/app/service/health_service.py
+    # 匹配：app/service/health_service.py
+    all_paths = re.findall(r'(/[\w/.-]+\.py)', logs)
+
+    # 3. 【智能过滤】只保留业务相关文件
+    for p in all_paths:
+        # 清理路径，适配项目结构
+        clean_p = p.split('backend/')[-1] if 'backend/' in p else p
+        clean_p = clean_p.lstrip('/')
+
+        # 只保留包含 'app/' 或 'tests/' 的文件
+        if 'app/' in clean_p or 'tests/' in clean_p:
+            critical_files.add(clean_p)
+
+    # 4. 额外提取：FAILED 行中的测试文件（备用方案）
+    failed_matches = re.findall(r"FAILED ([\w/.-]+)::", logs)
+    for f in failed_matches:
+        clean_f = f.replace("backend/", "").lstrip("/")
+        if 'tests/' in clean_f:
+            critical_files.add(clean_f)
+
+    # 5. 确保 all_generated_paths 中的文件也被包含
+    for gen_path in all_generated_paths:
+        clean_path = gen_path.replace("backend/", "").lstrip("/")
+        if clean_path not in critical_files:
+            critical_files.add(clean_path)
+
+    return list(critical_files)[:8]  # 放宽到最多8个文件
+
+
+def parse_local_imports(file_content: str, file_path: str) -> Set[str]:
+    """
+    解析 Python 文件内容，提取本地项目 import 的核心契约文件
+
+    Args:
+        file_content: 文件内容
+        file_path: 文件路径（用于相对路径计算）
+
+    Returns:
+        被 import 的核心契约文件路径集合
+    """
+    imported_core_files: Set[str] = set()
+
+    try:
+        tree = ast.parse(file_content)
+    except SyntaxError:
+        return imported_core_files
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module
+            if not module:
+                continue
+
+            # 检查是否 import 了核心契约模块（支持前缀匹配）
+            for core_module, core_path in CORE_CONTRACT_MODULES.items():
+                if module == core_module or module.startswith(core_module + "."):
+                    imported_core_files.add(core_path)
+
+    return imported_core_files
+
+
+def parse_all_app_imports(file_content: str) -> Set[str]:
+    """
+    【主动探索】解析文件中所有 from app.xxx import 的模块路径
+
+    用于 RepairerAgent 上下文收集，确保测试文件引用的所有 app/* 模块都被包含。
+
+    Args:
+        file_content: Python 文件内容
+
+    Returns:
+        被 import 的 app.* 模块路径集合（如 {"app.service.health_service", "app.utils.system_monitor"}）
+    """
+    imported_modules: Set[str] = set()
+
+    try:
+        tree = ast.parse(file_content)
+    except SyntaxError:
+        return imported_modules
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module
+            if not module:
+                continue
+
+            # 只收集 app.* 模块
+            if module.startswith("app."):
+                imported_modules.add(module)
+
+    return imported_modules
+
+
+def module_to_file_path(module_path: str) -> str:
+    """
+    将 Python 模块路径转换为文件路径
+
+    Args:
+        module_path: 模块路径（如 "app.service.health_service"）
+
+    Returns:
+        文件路径（如 "app/service/health_service.py"）
+    """
+    return module_path.replace(".", "/") + ".py"
+
+
+async def extract_critical_files_with_imports_recursive(
+    logs: str,
+    all_generated_paths: List[str],
+    file_contents: Dict[str, str],
+    file_service,
+    max_depth: int = 2
+) -> List[str]:
+    """
+    【P2】增强版：递归解析 Import 关联路径（深度2）
+
+    1. 确定性提取：从 Traceback 提取所有提到的 app/*.py 和 tests/*.py
+    2. 关联性提取（递归深度2）：
+       - 第1层：解析关键文件的 import
+       - 第2层：解析被 import 文件的 import
+
+    Args:
+        logs: 错误日志
+        all_generated_paths: 所有生成的文件路径
+        file_contents: 文件内容映射
+        file_service: 文件服务（用于读取依赖文件）
+        max_depth: 最大递归深度（默认2）
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"[RepairUtils] 【P2】启动递归上下文收集，最大深度: {max_depth}")
+    
+    # 第1步：确定性提取（从 Traceback）
+    essential_paths = set(extract_critical_files(logs, all_generated_paths))
+    logger.info(f"[RepairUtils] 【P2】从 Traceback 提取 {len(essential_paths)} 个关键文件")
+    for p in essential_paths:
+        logger.debug(f"[RepairUtils] 【P2】  - {p}")
+    
+    all_discovered = set(essential_paths)
+    
+    # 准备已知的文件内容
+    known_contents = dict(file_contents)
+    
+    # 递归解析 import
+    current_depth = 0
+    current_paths = list(essential_paths)
+    
+    while current_depth < max_depth and current_paths:
+        logger.info(f"[RepairUtils] 【P2】第 {current_depth + 1} 层递归，处理 {len(current_paths)} 个文件")
+        next_paths = []
+        
+        for path in current_paths:
+            content = known_contents.get(path, "")
+            
+            # 如果内容未知，尝试读取
+            if not content and file_service:
+                try:
+                    read_res = await file_service.read_file(path)
+                    if read_res.exists and read_res.content:
+                        content = read_res.content
+                        known_contents[path] = content
+                        logger.debug(f"[RepairUtils] 【P2】从沙箱读取文件: {path} ({len(content)} 字符)")
+                except Exception as e:
+                    logger.debug(f"[RepairUtils] 【P2】无法读取文件 {path}: {e}")
+                    continue
+            
+            if not content:
+                continue
+            
+            # 【P2】解析所有 app.* import（不只是核心契约）
+            imported_modules = parse_all_app_imports(content)
+            
+            if imported_modules:
+                logger.debug(f"[RepairUtils] 【P2】{path} 导入 {len(imported_modules)} 个模块: {list(imported_modules)[:5]}")
+            
+            for module in imported_modules:
+                dep_file_path = module_to_file_path(module)
+                
+                if dep_file_path not in all_discovered:
+                    all_discovered.add(dep_file_path)
+                    next_paths.append(dep_file_path)
+                    logger.debug(f"[RepairUtils] 【P2】发现新依赖: {dep_file_path} (来自 {path})")
+                    
+                    # 尝试读取该文件内容（为下一轮递归做准备）
+                    if file_service and dep_file_path not in known_contents:
+                        try:
+                            read_res = await file_service.read_file(dep_file_path)
+                            if read_res.exists and read_res.content:
+                                known_contents[dep_file_path] = read_res.content
+                        except Exception:
+                            pass
+        
+        logger.info(f"[RepairUtils] 【P2】第 {current_depth + 1} 层发现 {len(next_paths)} 个新文件")
+        current_paths = next_paths
+        current_depth += 1
+    
+    # 确保核心契约文件始终被包含
+    core_contracts = [
+        "app/core/response.py",
+        "app/core/database.py",
+        "app/core/config.py",
+        "app/core/security.py",
+    ]
+    for core in core_contracts:
+        if core not in all_discovered:
+            all_discovered.add(core)
+            logger.debug(f"[RepairUtils] 【P2】强制添加核心契约文件: {core}")
+    
+    final_list = list(all_discovered)[:15]  # 放宽到最多15个文件
+    logger.info(f"[RepairUtils] 【P2】递归上下文收集完成，共 {len(final_list)} 个文件")
+    for p in final_list[:10]:  # 只显示前10个避免日志过长
+        logger.debug(f"[RepairUtils] 【P2】  - {p}")
+    if len(final_list) > 10:
+        logger.debug(f"[RepairUtils] 【P2】  ... 还有 {len(final_list) - 10} 个文件")
+    
+    return final_list
+
+
+def extract_critical_files_with_imports(
+    logs: str,
+    all_generated_paths: List[str],
+    file_contents: Dict[str, str]
+) -> List[str]:
+    """
+    【Traceback 路径 + Import 关联路径】组合策略（非递归版本，向后兼容）
+
+    1. 确定性提取：从 Traceback 提取所有提到的 app/*.py 和 tests/*.py
+    2. 关联性提取：解析这些文件的 import，将引用的核心契约文件也加入
+    """
+    # 第1步：确定性提取（从 Traceback）
+    essential_paths = set(extract_critical_files(logs, all_generated_paths))
+
+    # 第2步：关联性提取（解析 import）
+    for path in list(essential_paths):
+        content = file_contents.get(path, "")
+        if not content:
+            continue
+
+        # 解析该文件 import 了哪些核心库
+        imported_cores = parse_local_imports(content, path)
+
+        # 将被 import 的核心文件加入上下文
+        for core_file in imported_cores:
+            if core_file not in essential_paths:
+                essential_paths.add(core_file)
+
+    return list(essential_paths)[:10]  # 放宽到最多10个文件

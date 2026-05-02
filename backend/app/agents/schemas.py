@@ -96,6 +96,11 @@ class RequiredSymbol(BaseModel):
     module: str = Field(description="所在模块路径（如 app/service/health_service.py）")
     signature: Optional[str] = Field(default=None, description="函数签名或类定义（可选）")
     description: Optional[str] = Field(default=None, description="简短描述（可选）")
+    # 【P0-1】新增：强制要求定义返回值的键名契约
+    return_fields_contract: Optional[List[str]] = Field(
+        default=None,
+        description="【契约强制执行】返回值字典必须包含的键名列表，如 ['status', 'response_time_ms', 'health_score']。CoderAgent 将据此校验实现。"
+    )
 
 
 class ArchitectOutput(BaseAgentOutput):
@@ -131,6 +136,7 @@ class ReturnFieldSpec(BaseModel):
     type: str = Field(description="字段类型（如 str, int, dict, list）")
     description: Optional[str] = Field(default=None, description="字段描述")
     required: bool = Field(default=True, description="是否必填")
+    location: Optional[str] = Field(default="data", description="字段位置：'data' 表示在 ResponseModel.data 内，'root' 表示在响应根层级")
 
 
 class ErrorResponseSpec(BaseModel):
@@ -191,7 +197,7 @@ class InterfaceSpec(BaseModel):
     signature: str = Field(description="函数签名或类定义（如 async def check() -> dict）")
     expected_behavior: str = Field(description="简短行为描述")
     is_async: bool = Field(default=False, description="是否为异步函数")
-    return_type: Optional[str] = Field(default=None, description="返回类型注解")
+    return_type: str = Field(description="具体的返回类型描述。例如：ResponseModel(data包含status, cpu) 或 dict包含health_score, components")
     return_fields: List[ReturnFieldSpec] = Field(
         default_factory=list,
         description="【强制】返回对象的所有必填字段规范。如果返回 dict，必须列出所有键名。禁止为空列表！"

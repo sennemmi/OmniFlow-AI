@@ -16,19 +16,52 @@ from typing import Dict, Any, List, Set
 
 logger = logging.getLogger(__name__)
 
-# 【改进7】CONVENTIONS.md 路径
-_CONVENTIONS_PATH = Path(__file__).parent.parent.parent.parent / "CONVENTIONS.md"
+# 【改进】CONVENTIONS.md 路径 - 支持多个可能的位置
+# 优先级：.omniflow/CONVENTIONS.md > 项目根目录 CONVENTIONS.md
+_CONVENTIONS_PATHS = [
+    Path(__file__).parent.parent.parent.parent / ".omniflow" / "CONVENTIONS.md",
+    Path(__file__).parent.parent.parent.parent / "CONVENTIONS.md",
+]
 
 def _load_conventions() -> str:
-    """加载项目代码约定文档"""
-    try:
-        if _CONVENTIONS_PATH.exists():
-            content = _CONVENTIONS_PATH.read_text(encoding="utf-8")
-            logger.info(f"加载 CONVENTIONS.md: {len(content)} 字符")
-            return content
-    except Exception as e:
-        logger.warning(f"加载 CONVENTIONS.md 失败: {e}")
+    """
+    加载项目代码约定文档
+
+    按优先级尝试多个路径，返回第一个存在的文件内容。
+    这是"软编码"实践：逻辑通用，内容由项目决定。
+    """
+    for path in _CONVENTIONS_PATHS:
+        try:
+            if path.exists():
+                content = path.read_text(encoding='utf-8')
+                logger.info(f"加载 CONVENTIONS.md: {path} ({len(content)} 字符)")
+                return content
+        except Exception as e:
+            logger.warning(f"尝试加载 {path} 失败: {e}")
+            continue
+
+    logger.warning("未找到 CONVENTIONS.md 文件")
     return ""
+
+def get_conventions_for_agent() -> str:
+    """
+    获取格式化的约定文档，用于注入到 Agent System Prompt
+
+    Returns:
+        格式化的约定文档字符串，包含在【项目约定】标记中
+    """
+    content = _load_conventions()
+    if not content:
+        return ""
+
+    return f"""
+【项目约定 - CONVENTIONS.md】
+以下内容来自项目根目录的 CONVENTIONS.md 文件，定义了本项目的编码规范、命名约定和标准用法。你必须严格遵守！
+
+{content}
+
+【项目约定结束】
+"""
 
 
 class ProjectCardBuilder:
@@ -394,6 +427,115 @@ class ProjectCardBuilder:
             count += 1
 
         return index
+
+    def search_symbol(self, symbol_name: str) -> Optional[Dict[str, Any]]:
+        """
+        【基于符号画像的精准搜索】根据符号名称查找定义
+
+        在项目的符号索引中搜索指定的函数或类名，
+        返回包含该符号的文件路径和定义内容。
+
+        Args:
+            symbol_name: 要搜索的符号名称（如 "error_response"）
+
+        Returns:
+            Optional[Dict]: 包含 file_path, symbol_info, source_code 的字典，
+                          如果未找到则返回 None
+        """
+        for py_file in sorted(self.project_path.rglob("*.py")):
+            if any(part in self.SKIP_DIRS for part in py_file.parts):
+                continue
+
+            rel = py_file.relative_to(self.project_path).as_posix()
+
+            try:
+                content = py_file.read_text(encoding='utf-8', errors='ignore')
+                tree = ast.parse(content)
+            except Exception:
+                continue
+
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name == symbol_name:
+                        # 提取函数源代码
+                        source_lines = content.splitlines()
+                        start_line = node.lineno - 1
+                        end_line = node.end_lineno if hasattr(node, 'end_lineno') else start_line + 1
+                        source_code = "\n".join(source_lines[start_line:end_line])
+
+                        return {
+                            "file_path": rel,
+                            "symbol_type": "function",
+                            "symbol_name": symbol_name,
+                            "signature": self._extract_func_signature(node),
+                            "source_code": source_code,
+                            "line_number": node.lineno
+                        }
+
+                elif isinstance(node, ast.ClassDef):
+                    if node.name == symbol_name:
+                        # 提取类源代码
+                        source_lines = content.splitlines()
+                        start_line = node.lineno - 1
+                        end_line = node.end_lineno if hasattr(node, 'end_lineno') else start_line + 1
+                        source_code = "\n".join(source_lines[start_line:end_line])
+
+                        return {
+                            "file_path": rel,
+                            "symbol_type": "class",
+                            "symbol_name": symbol_name,
+                            "source_code": source_code,
+                            "line_number": node.lineno
+                        }
+
+        return None
+
+    def get_symbol_context_for_repair(self, error_message: str) -> str:
+        """
+        【Repairer 辅助】根据错误消息提取相关符号的上下文
+
+        分析错误消息（如 "error_response() got unexpected keyword argument 'message'"），
+        自动搜索相关符号并返回其定义代码，作为 fix_hint 的一部分。
+
+        Args:
+            error_message: 错误消息字符串
+
+        Returns:
+            str: 格式化的符号定义上下文
+        """
+        import re
+
+        # 提取可能的符号名称
+        # 匹配模式：symbol_name() 或 symbol_name 或 ClassName.method
+        patterns = [
+            r"(\w+)\(\)",  # error_response()
+            r"'(\w+)'",     # 'message'
+            r"(\w+)\.",     # error_response.
+        ]
+
+        found_symbols = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, error_message)
+            found_symbols.update(matches)
+
+        # 过滤掉常见但无关的词汇
+        stop_words = {"got", "unexpected", "keyword", "argument", "type", "object", "str", "int", "bool"}
+        found_symbols = found_symbols - stop_words
+
+        if not found_symbols:
+            return ""
+
+        context_parts = ["【相关符号定义 - 供修复参考】"]
+
+        for symbol_name in found_symbols:
+            result = self.search_symbol(symbol_name)
+            if result:
+                context_parts.append(f"\n--- {result['symbol_name']} (定义于 {result['file_path']}:{result['line_number']}) ---")
+                context_parts.append("```python")
+                context_parts.append(result['source_code'])
+                context_parts.append("```")
+
+        return "\n".join(context_parts) if len(context_parts) > 1 else ""
 
     def _extract_func_signature(self, node: ast.FunctionDef) -> str:
         """提取函数签名字符串，如 'async def foo(a: int, b: str) -> dict'"""

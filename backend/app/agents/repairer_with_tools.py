@@ -20,6 +20,7 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 
 from app.agents.base import LangGraphAgent
+from app.agents.tool_agent import ToolUsingAgent
 from app.agents.schemas import CoderOutput
 from app.service.sandbox_manager import sandbox_manager
 from app.utils.repair_utils import extract_pytest_failures
@@ -72,11 +73,12 @@ class RepairerState:
         return "\n".join(context_parts)
 
 
-class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
+class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
     """
     带测试运行工具的代码修复代理
     
     支持多轮对话和快速测试验证
+    继承 ToolUsingAgent 以获得工具调用能力
     """
 
     def __init__(self):
@@ -103,9 +105,34 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
 
 【工具使用】
 你有以下工具可用：
-- run_tests: 运行测试验证修复效果
-  参数: test_path (可选，默认为 "backend/tests/ai_generated")
-  返回: {"success": true/false, "logs": "测试日志", "failed_tests": [...]}
+
+1. **run_tests**: 运行测试验证修复效果
+   参数: test_path (可选，默认为 "backend/tests/ai_generated")
+   返回: {"success": true/false, "logs": "测试日志", "failed_tests": [...]}
+
+2. **install_dependency**: 【新增】安装 Python 依赖包
+   参数: package_name (必填，如 "python-jose", "passlib", "bcrypt")
+   返回: {"success": true/false, "message": "安装结果"}
+   使用场景: 当测试报错 `ModuleNotFoundError: No module named 'xxx'` 时，优先使用此工具安装依赖，而不是修改代码
+   
+   ⚠️ **【强制要求】使用 install_dependency 后，你必须立即调用 run_tests 运行测试，不能调用其他任何工具！**
+
+3. **read_file**: 读取文件内容
+4. **replace_lines**: 替换文件中的代码行
+5. **glob**: 查找匹配模式的文件
+6. **grep**: 在文件中搜索匹配的行
+
+【依赖安装流程 - 严格执行】
+当测试报错 ModuleNotFoundError 时：
+1. 调用 install_dependency 安装缺失的依赖
+2. **【强制】安装成功后必须立即调用 run_tests 重新运行测试，不能调用 read_file/replace_lines/glob/grep！**
+3. 如果还有新的依赖缺失，重复步骤1-2
+4. 如果连续3次安装同一依赖都失败，停止并报告错误
+
+【重要规则】
+- 使用 install_dependency 后，下一个工具调用**必须是** run_tests
+- 禁止在 install_dependency 和 run_tests 之间插入其他工具调用
+- 违反此规则会导致依赖安装流程中断
 
 【输出格式】
 你必须输出 JSON 格式，包含：
@@ -137,6 +164,13 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
    - 断言值与契约不符
    - mock patch 路径错误
 
+【强制：修复优先级指南】
+当你收到测试失败任务时，必须按以下顺序思考：
+1. **检查报错堆栈的底层**：如果报错是 `TypeError` (object can't be used in await) 或 `AttributeError` (mock object has no attribute)，这 90% 是【测试代码】的 Mock 配置写错了，请优先修改测试文件（tests/）。
+2. **只有当 Mock 配置完全正确，但断言（AssertionError）的值不符合业务逻辑时**，才去修改业务代码（app/）。
+3. **严禁为了通过测试而删除测试断言。**
+4. **如果报错提示 `AsyncMock` 或 `MagicMock` 对象在进行比较/包含运算，说明你忘记给 Mock 设置 `return_value` 了。**
+
 【判断修哪边的规则】
 - `argument of type 'coroutine' is not iterable` → 测试代码缺少 await，改测试文件
 - `AttributeError: module has no attribute xxx` → mock patch 路径错误，改测试文件
@@ -145,6 +179,19 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
   - 如果测试断言违反契约 → 改测试文件
 - 测试文件导入错误 → 改测试文件
 - 被测代码导入错误 → 改被测代码
+
+【修复 NameError / 导入错误的绝招】
+如果测试报错 `NameError: name 'AsyncMock' is not defined` 或缺少其他 import：
+1. 你必须在对应文件的顶部添加 import 语句。
+2. 为了确保 `search_block` 能精确匹配成功，建议你把文件最开头的前几行（包含 `import pytest` 等）完整作为 `search_block`。
+3. 如果 `search_block` 反复匹配失败，你可以直接使用 `change_type: "add"` 并输出包含完整 import 的全量文件内容（content）来覆盖它！
+
+【强制修复指令 - 掀桌子模式】
+如果你在上一轮收到"内容未变化"或"search_block 未匹配"的警告：
+1. 不要再尝试微调 search_block。
+2. 立即改用 change_type: "add" 模式。
+3. 直接输出该文件的完整代码内容（全量覆盖）。
+4. 这是强制指令，必须遵守，不要犹豫！
 
 【重要提示】
 - 每次只修复明确的问题
@@ -175,6 +222,86 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
 
         return summary
 
+    async def _run_test_with_dependency_handling(
+        self,
+        installed_packages: Dict[str, int],
+        max_same_package_installs: int
+    ) -> Dict[str, Any]:
+        """
+        【依赖安装循环】运行测试，自动处理依赖缺失
+
+        逻辑：
+        1. 运行测试
+        2. 如果报错 ModuleNotFoundError，提取包名
+        3. 检查该包是否已连续安装超过限制次数
+        4. 安装依赖
+        5. 重新运行测试（循环直到没有新的依赖缺失或测试通过）
+
+        Args:
+            installed_packages: 已安装依赖及其安装次数
+            max_same_package_installs: 同一依赖最多安装次数
+
+        Returns:
+            Dict: 最终测试结果
+        """
+        import re
+
+        while True:
+            # 运行测试
+            test_result = await self.run_tests_tool()
+
+            # 如果测试通过，直接返回
+            if test_result.get("success"):
+                return test_result
+
+            # 检查是否是依赖缺失错误
+            logs = test_result.get("logs", "")
+            module_not_found_match = re.search(
+                r"ModuleNotFoundError: No module named ['\"](\w+)['\"]",
+                logs
+            )
+
+            if not module_not_found_match:
+                # 不是依赖缺失错误，返回测试结果
+                return test_result
+
+            # 提取缺失的包名
+            package_name = module_not_found_match.group(1)
+            print(f"\n[RepairerAgent] 📦 检测到依赖缺失: {package_name}")
+
+            # 检查该包是否已连续安装超过限制次数
+            install_count = installed_packages.get(package_name, 0)
+            if install_count >= max_same_package_installs:
+                error_msg = (
+                    f"依赖安装失败: 连续 {max_same_package_installs} 次尝试安装 '{package_name}' "
+                    f"仍未解决问题。可能是包名错误或网络问题。"
+                )
+                logger.error(f"[RepairerAgent] {error_msg}")
+                print(f"[RepairerAgent] ❌ {error_msg}")
+                # 返回包含错误信息的测试结果
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "logs": logs,
+                    "dependency_error": True,
+                    "failed_package": package_name
+                }
+
+            # 安装依赖
+            print(f"[RepairerAgent] 🔄 正在安装依赖 ({install_count + 1}/{max_same_package_installs} 次)...")
+            install_result = await self.install_dependency_tool(package_name)
+
+            if not install_result.get("success"):
+                # 安装失败，记录并继续（可能网络问题，下次重试）
+                logger.warning(f"[RepairerAgent] 依赖 {package_name} 安装失败: {install_result.get('message')}")
+                print(f"[RepairerAgent] ⚠️ 依赖安装失败，将重试...")
+
+            # 记录安装次数
+            installed_packages[package_name] = install_count + 1
+
+            # 安装后立即重新运行测试（继续循环）
+            print(f"[RepairerAgent] 🧪 依赖安装完成，重新运行测试...")
+
     async def run_tests_tool(self, test_path: str = "backend/tests/ai_generated") -> Dict[str, Any]:
         """
         运行测试工具
@@ -196,6 +323,7 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
         pipeline_id = self.state.pipeline_id
 
         logger.info(f"[RepairerAgent] 运行测试: {test_path}")
+        print(f"\n[RepairerAgent] 🧪 运行测试: {test_path}")
 
         try:
             # 在沙箱中运行测试
@@ -211,36 +339,131 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
             # 提取失败的测试
             import re
             failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+            
+            # 【调试】提取收集到的测试数量
+            collected_match = re.search(r'collected\s+(\d+)\s+item', logs)
+            collected_count = int(collected_match.group(1)) if collected_match else 0
+            
+            # 【调试】提取错误类型
+            errors_match = re.search(r'(\d+)\s+error', logs, re.IGNORECASE)
+            errors_count = int(errors_match.group(1)) if errors_match else 0
+            
+            # 【调试】提取 passed 数量
+            passed_match = re.search(r'(\d+)\s+passed', logs, re.IGNORECASE)
+            passed_count = int(passed_match.group(1)) if passed_match else 0
+
+            # 【调试】打印详细统计
+            print(f"[RepairerAgent] 📊 测试统计:")
+            print(f"  - 退出码: {exec_result.exit_code}")
+            print(f"  - 收集到: {collected_count} 个测试")
+            print(f"  - 通过: {passed_count} 个")
+            print(f"  - 失败: {len(failed_tests)} 个")
+            print(f"  - 错误: {errors_count} 个")
+            print(f"  - 成功: {success}")
 
             # 提取错误摘要
             error_summary = ""
-            if not success and failed_tests:
-                error_summary = self._extract_error_summary(logs)
-                # 打印到控制台
-                print(f"\n[RepairerAgent] 测试失败摘要:")
+            if not success:
+                if failed_tests:
+                    # 有测试失败
+                    error_summary = self._extract_error_summary(logs)
+                    print(f"\n[RepairerAgent] ❌ 测试失败摘要:")
+                elif errors_count > 0:
+                    # 测试收集/导入错误
+                    error_summary = self._extract_error_summary(logs)
+                    print(f"\n[RepairerAgent] ❌ 测试收集错误（导入失败）:")
+                elif collected_count == 0:
+                    # 没有收集到任何测试
+                    error_summary = "没有收集到任何测试，可能是测试文件路径错误或文件为空"
+                    print(f"\n[RepairerAgent] ⚠️ 警告: {error_summary}")
+                else:
+                    # 其他原因导致失败
+                    error_summary = f"测试退出码非0，但未识别到失败原因。日志:\n{logs[:1000]}"
+                    print(f"\n[RepairerAgent] ❌ 未知错误:")
+                
                 print("-" * 60)
-                print(error_summary)
+                print(error_summary[:2000])
                 print("-" * 60)
 
-            logger.info(f"[RepairerAgent] 测试结果: success={success}, failed={len(failed_tests)}")
+            logger.info(f"[RepairerAgent] 测试结果: success={success}, collected={collected_count}, passed={passed_count}, failed={len(failed_tests)}, errors={errors_count}")
 
             return {
                 "success": success,
                 "exit_code": exec_result.exit_code,
-                "logs": logs[:2000],  # 限制日志长度
+                "logs": logs[:3000],  # 增加日志长度限制
                 "failed_tests": failed_tests,
-                "error": None if success else f"{len(failed_tests)} 个测试失败",
-                "error_summary": error_summary  # 新增错误摘要
+                "collected_count": collected_count,
+                "passed_count": passed_count,
+                "errors_count": errors_count,
+                "error": None if success else f"测试失败: {len(failed_tests)} failed, {errors_count} errors, {passed_count} passed",
+                "error_summary": error_summary
             }
 
         except Exception as e:
             logger.error(f"[RepairerAgent] 运行测试失败: {e}")
+            print(f"[RepairerAgent] ❌ 运行测试时发生异常: {e}")
             return {
                 "success": False,
                 "error": str(e),
                 "logs": str(e),
                 "failed_tests": [],
-                "error_summary": ""
+                "error_summary": f"运行测试时发生异常: {e}"
+            }
+
+    async def install_dependency_tool(self, package_name: str) -> Dict[str, Any]:
+        """
+        【新增】安装 Python 依赖包工具
+
+        Args:
+            package_name: 依赖包名称（如 "python-jose", "passlib", "bcrypt"）
+
+        Returns:
+            Dict: 安装结果
+        """
+        if not self.state:
+            return {
+                "success": False,
+                "message": "状态未初始化"
+            }
+
+        pipeline_id = self.state.pipeline_id
+
+        logger.info(f"[RepairerAgent] 安装依赖: {package_name}")
+        print(f"[RepairerAgent] 📦 正在安装依赖: {package_name}...")
+
+        try:
+            # 在沙箱中安装依赖
+            exec_result = await sandbox_manager.exec(
+                pipeline_id,
+                f"pip install {package_name} --quiet 2>&1",
+                timeout=120
+            )
+
+            logs = exec_result.stdout + "\n" + exec_result.stderr
+            success = exec_result.exit_code == 0
+
+            if success:
+                message = f"✅ 依赖 {package_name} 安装成功"
+                logger.info(f"[RepairerAgent] {message}")
+                print(f"[RepairerAgent] {message}")
+            else:
+                message = f"❌ 依赖 {package_name} 安装失败: {logs[:500]}"
+                logger.error(f"[RepairerAgent] {message}")
+                print(f"[RepairerAgent] {message}")
+
+            return {
+                "success": success,
+                "message": message,
+                "logs": logs[:1000]
+            }
+
+        except Exception as e:
+            message = f"安装依赖时出错: {str(e)}"
+            logger.error(f"[RepairerAgent] {message}")
+            return {
+                "success": False,
+                "message": message,
+                "logs": str(e)
             }
 
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
@@ -255,12 +478,22 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
         failed_tests = fix_order.get("failed_tests", [])
         error_logs = fix_order.get("error_logs", "")
         
-        # 构建文件内容部分
+        # 构建文件内容部分（带角色标签）
         files_section = []
         for path, content in target_files.items():
+            # 为文件打上角色标签
+            if "app/" in path:
+                role = "【被测业务代码】"
+            elif "tests/" in path:
+                role = "【测试验证代码】"
+            else:
+                role = "【辅助文件】"
+
             numbered_lines = [f"{i+1:04d} | {line}" for i, line in enumerate(content.splitlines())]
             numbered_content = "\n".join(numbered_lines)
-            files_section.append(f"""【文件: {path}】
+            files_section.append(f"""【文件路径】: {path}
+【文件角色】: {role}
+【代码内容】:
 ```python
 {numbered_content}
 ```""")
@@ -334,8 +567,15 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
         max_rounds: int = 3
     ) -> Dict[str, Any]:
         """
-        执行带工具的修复（支持多轮对话）
-        
+        执行带工具的修复（支持多轮对话和依赖自动安装）
+
+        【新增功能】
+        1. 检测 ModuleNotFoundError 错误
+        2. 自动调用 install_dependency 安装缺失的依赖
+        3. 安装后立即重新运行测试
+        4. 如果有新的依赖缺失，继续安装（无次数限制）
+        5. 如果连续三次安装相同依赖，抛出错误
+
         Args:
             pipeline_id: Pipeline ID
             stage_name: 阶段名称
@@ -343,7 +583,7 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
             target_files: 目标文件内容
             file_service: 文件服务
             max_rounds: 最大修复轮数
-            
+
         Returns:
             Dict: 修复结果
         """
@@ -355,8 +595,12 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
             pipeline_id=pipeline_id,
             max_rounds=max_rounds
         )
-        
+
         all_files_modified = []
+
+        # 【依赖安装跟踪】记录已安装的依赖及其次数
+        installed_packages: Dict[str, int] = {}
+        MAX_SAME_PACKAGE_INSTALLS = 3  # 同一依赖最多安装次数
 
         # 【修复3】记录上一轮写入的文件内容哈希，用于检测死循环
         last_written_hashes = {}
@@ -366,7 +610,6 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
             logger.info(f"[RepairerAgent] 开始第 {round_num + 1}/{max_rounds} 轮修复")
 
             # 【修复】每轮循环开始前，重新从沙箱读取所有目标文件的最新内容
-            # 避免 search_block 基于旧快照生成导致匹配失败
             if round_num > 0 and file_service:
                 refreshed_count = 0
                 for file_path in list(target_files.keys()):
@@ -469,8 +712,10 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                 logger.info(f"[RepairerAgent] 第 {round_num + 1} 轮修复完成，跳过测试")
                 break
 
-            # 运行测试
-            test_result = await self.run_tests_tool()
+            # 【依赖安装循环】运行测试，如果依赖缺失则安装后重试
+            test_result = await self._run_test_with_dependency_handling(
+                installed_packages, MAX_SAME_PACKAGE_INSTALLS
+            )
 
             # 记录到对话历史
             self.state.add_round(
@@ -487,7 +732,8 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                     "output": {
                         "files": all_files_modified,
                         "summary": f"修复成功，经过 {round_num + 1} 轮修复后测试通过",
-                        "rounds": round_num + 1
+                        "rounds": round_num + 1,
+                        "installed_packages": list(installed_packages.keys())
                     },
                     "test_result": test_result
                 }
@@ -506,7 +752,7 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
                     "error_summary": test_result.get("error_summary", ""),
                     "fix_hint": fix_order.get("fix_hint", "上一轮修复未完全解决问题，请根据新的错误日志继续修复")
                 }
-        
+
         # 达到最大轮数仍未通过
         logger.warning(f"[RepairerAgent] 达到最大轮数 {max_rounds}，测试仍未通过")
         return {
@@ -514,7 +760,8 @@ class RepairerAgentWithTools(LangGraphAgent[CoderOutput]):
             "output": {
                 "files": all_files_modified,
                 "summary": f"经过 {max_rounds} 轮修复，测试仍未通过",
-                "rounds": max_rounds
+                "rounds": max_rounds,
+                "installed_packages": list(installed_packages.keys())
             },
             "error": "达到最大修复轮数",
             "last_test_result": self.state.test_results[-1] if self.state.test_results else None

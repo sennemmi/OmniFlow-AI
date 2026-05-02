@@ -112,6 +112,13 @@
     
     // 显示编辑弹窗
     const elementInfo = DOM.getElementInfo(el);
+    
+    // 【调试】检查 elementInfo
+    console.log('[OmniFlowAI] ========== handleElementClick 调试 ==========');
+    console.log('[OmniFlowAI] elementInfo:', elementInfo);
+    console.log('[OmniFlowAI] elementInfo.sourceFile:', elementInfo ? elementInfo.sourceFile : 'N/A');
+    console.log('[OmniFlowAI] ========== handleElementClick 调试结束 ==========');
+    
     PanelManager.showEditDialog(
       elementInfo,
       false,
@@ -120,6 +127,7 @@
       () => deselectAll(),
       // 提交
       (feedback) => {
+        console.log('[OmniFlowAI] 提交修改，elementInfo.sourceFile:', elementInfo ? elementInfo.sourceFile : 'N/A');
         if (callbacks.onHandleModify) {
           callbacks.onHandleModify(elementInfo, feedback);
         }

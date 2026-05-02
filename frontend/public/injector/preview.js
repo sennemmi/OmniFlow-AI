@@ -11,6 +11,9 @@
 (function () {
   'use strict';
 
+  // 【版本标记】用于确认文件是否更新
+  console.log('[OmniFlowAI] preview.js 版本: 2025-01-24-v3 - 带详细调试信息');
+
   const getUI = () => {
     const omniUI = window.OmniFlowAIUI;
     return omniUI ? omniUI.UI : null;
@@ -232,6 +235,21 @@
    * @param {Function} onCancel - 取消回调
    */
   async function startPreview(elementInfo, instruction, onComplete) {
+    // 【调试】函数入口 - 确保这行一定会执行
+    console.log('[OmniFlowAI] ========== startPreview 被调用 (v3) ==========');
+    console.log('[OmniFlowAI] 参数 elementInfo:', elementInfo);
+    console.log('[OmniFlowAI] 参数 instruction:', instruction);
+    
+    // 关键检查：验证 elementInfo 和 sourceFile
+    if (!elementInfo) {
+      console.error('[OmniFlowAI] elementInfo 为 null/undefined');
+      throw new Error('elementInfo 为空');
+    }
+    
+    console.log('[OmniFlowAI] elementInfo.sourceFile:', elementInfo.sourceFile);
+    console.log('[OmniFlowAI] elementInfo.sourceFile 类型:', typeof elementInfo.sourceFile);
+    console.log('[OmniFlowAI] elementInfo.sourceFile 长度:', elementInfo.sourceFile ? elementInfo.sourceFile.length : 0);
+    
     const UI = getUI();
     const CONFIG = getConfig();
 
@@ -248,6 +266,53 @@
     try {
       const filePath = elementInfo.sourceFile;
 
+      // 【修复】验证文件路径
+      if (!filePath || typeof filePath !== 'string' || filePath.trim() === '') {
+        console.error('[OmniFlowAI] ========== 非法文件路径调试信息 ==========');
+        console.error('[OmniFlowAI] filePath 值:', JSON.stringify(filePath));
+        console.error('[OmniFlowAI] filePath 类型:', typeof filePath);
+        console.error('[OmniFlowAI] elementInfo 完整内容:', JSON.stringify(elementInfo, null, 2));
+        
+        // 检查 elementInfo 的各个字段
+        if (elementInfo) {
+          console.error('[OmniFlowAI] elementInfo.sourceFile:', JSON.stringify(elementInfo.sourceFile));
+          console.error('[OmniFlowAI] elementInfo.sourceLine:', elementInfo.sourceLine);
+          console.error('[OmniFlowAI] elementInfo.sourceColumn:', elementInfo.sourceColumn);
+          console.error('[OmniFlowAI] elementInfo.tag:', elementInfo.tag);
+          console.error('[OmniFlowAI] elementInfo.id:', elementInfo.id);
+          console.error('[OmniFlowAI] elementInfo.class:', elementInfo.class);
+          console.error('[OmniFlowAI] elementInfo.xpath:', elementInfo.xpath);
+          console.error('[OmniFlowAI] elementInfo.selector:', elementInfo.selector);
+        } else {
+          console.error('[OmniFlowAI] elementInfo 为 null 或 undefined');
+        }
+        console.error('[OmniFlowAI] ========== 调试信息结束 ==========');
+        
+        const errorMsg = `
+❌ 无法获取元素的源文件信息
+
+调试信息：
+- filePath 值: ${JSON.stringify(filePath)}
+- filePath 类型: ${typeof filePath}
+- elementInfo.sourceFile: ${elementInfo ? JSON.stringify(elementInfo.sourceFile) : 'N/A'}
+
+可能的原因：
+1. 元素没有 data-source 或 data-source-id 属性
+2. React DevTools 没有安装或未启用
+3. 项目没有配置 source map
+4. 元素是动态生成的，没有对应的源文件
+
+建议解决方案：
+1. 确保 React DevTools 浏览器扩展已安装并启用
+2. 检查 vite.config.ts 中是否配置了 sourcemap: true
+3. 尝试选择其他元素
+4. 刷新页面后重试
+
+详细调试信息请查看浏览器控制台 (F12 -> Console)
+        `.trim();
+        throw new Error(errorMsg);
+      }
+
       // 步骤1: 获取原始文件内容并缓存
       UI.updateProgressBar(progressBar, '正在读取文件内容...', 20);
 
@@ -257,11 +322,15 @@
       );
 
       if (!contentResponse.ok) {
-        throw new Error('无法读取文件内容');
+        const errorText = await contentResponse.text();
+        console.error('[OmniFlowAI] HTTP 请求失败:', contentResponse.status, errorText);
+        throw new Error(`无法读取文件内容: ${contentResponse.status} ${errorText}`);
       }
 
       const contentResult = await contentResponse.json();
+      console.log('[OmniFlowAI] 后端 API 返回结果:', contentResult);
       if (!contentResult.success) {
+        console.error('[OmniFlowAI] 读取文件失败:', contentResult.error);
         throw new Error(contentResult.error || '读取文件失败');
       }
 
@@ -309,12 +378,38 @@
       UI.updateProgressBar(progressBar, '正在应用变更...', 80);
 
       const data = result.data;
-      const modifiedContent = data.new_content;
+      const { search_block, replace_block, new_content } = data;
+
+      // 步骤3: 使用 SearchReplaceEngine 执行搜索替换（与后端逻辑一致）
+      const SearchReplace = window.OmniFlowAISearchReplace;
+      let modifiedContent = null;
+
+      if (SearchReplace && search_block && replace_block) {
+        // 使用元素信息中的行号作为 fallback
+        const fallbackStart = elementInfo.sourceLine > 0 ? elementInfo.sourceLine : undefined;
+        const fallbackEnd = elementInfo.sourceLine > 0
+          ? elementInfo.sourceLine + (search_block.split('\n').length || 1) - 1
+          : undefined;
+
+        modifiedContent = SearchReplace.applySearchReplace(
+          originalContent,
+          search_block,
+          replace_block,
+          fallbackStart,
+          fallbackEnd
+        );
+      }
+
+      // 如果搜索替换失败，回退到全量内容
+      if (!modifiedContent) {
+        console.warn('[OmniFlowAI] Search block 匹配失败，回退到全量内容');
+        modifiedContent = new_content;
+      }
 
       // 保存修改后的内容
       previewState.modifiedContent = modifiedContent;
 
-      // 步骤3: 直接写入修改后的文件（触发 Vite HMR）
+      // 步骤4: 直接写入修改后的文件（触发 Vite HMR）
       await writeFile(filePath, modifiedContent);
 
       UI.removeProgressBar(progressBar);

@@ -20,7 +20,7 @@ from typing import Dict, Optional, Any, List
 
 from app.agents.base import LangGraphAgent
 from app.agents.schemas import CoderOutput
-from app.agents.project_card_builder import ProjectCardBuilder
+from app.agents.project_card_builder import ProjectCardBuilder, get_conventions_for_agent
 
 logger = logging.getLogger(__name__)
 
@@ -43,16 +43,12 @@ class CoderAgent(LangGraphAgent[CoderOutput]):
     @property
     def system_prompt(self) -> str:
         """系统 Prompt - 强调纯 JSON 输出和契约强制"""
-        conventions = ProjectCardBuilder.get_conventions()
-        
-        # 构建约定部分（避免 f-string 嵌套）
+        # 【软编码】从 CONVENTIONS.md 加载项目约定
+        conventions = get_conventions_for_agent()
+
+        # 构建约定部分
         if conventions:
-            conventions_section = (
-                "【项目代码约定 - CONVENTIONS.md - 必须严格遵守】\n"
-                "以下是项目的全局代码约定文档，你在生成代码时必须遵守。违反约定将导致代码被拒绝！\n\n"
-                + conventions +
-                "\n\n---\n"
-            )
+            conventions_section = conventions + "\n\n---\n"
         else:
             conventions_section = ""
         
@@ -306,13 +302,27 @@ return {
 你必须直接输出纯 JSON 格式，不要包含任何其他文本、解释或标记。
 输出必须是一个有效的 JSON 对象。
 
-正确示例（直接输出 JSON）：
-{"files": [{"file_path": "app/api/v1/health.py", "change_type": "modify", "search_block": "def health_check():\\n    return {\"status\": \"ok\"}", "replace_block": "def health_check():\\n    db_status = await check_db()\\n    return {\"status\": \"ok\", \"db\": db_status}", "description": "添加数据库状态检查"}]}
+【关键】search_block 和 replace_block 中的换行符：
+- 使用实际的换行符（按 Enter 键），不是 \\n 字符串
+- 确保代码块的每一行都有正确的缩进
+- 代码块末尾应该有换行符，除非这是文件的最后一行
+
+正确示例（注意：这是多行格式，不是单行）：
+{
+  "files": [{
+    "file_path": "app/api/v1/health.py",
+    "change_type": "modify",
+    "search_block": "def health_check():\n    return {\"status\": \"ok\"}",
+    "replace_block": "def health_check():\n    db_status = await check_db()\n    return {\"status\": \"ok\", \"db\": db_status}",
+    "description": "添加数据库状态检查"
+  }]
+}
 
 错误示例（不要这样输出）：
 - 不要添加 ```json 标记
 - 不要添加解释文本
 - 不要输出 "我需要先分析..." 等思考过程
+- 不要在 JSON 中使用 \\n 字符串代替实际换行符
 - 只输出纯 JSON
 
 【强制要求】
@@ -464,6 +474,13 @@ def check_health():
 
         design_str = json.dumps(design_output, indent=2, ensure_ascii=False)
 
+        # 【常驻基础设施上下文】注入地基代码
+        evergreen_context = state.get("evergreen_context", "")
+        evergreen_section = f"""
+{evergreen_context}
+
+""" if evergreen_context else ""
+
         # 【接口契约】生成契约清单部分
         interface_specs_section = self._build_interface_specs_section(design_output)
 
@@ -475,8 +492,12 @@ def check_health():
         logger = logging.getLogger(__name__)
         logger.info(f"[CoderAgent] 接收到的 injected_files: {len(injected_files)} 个文件")
         for path in injected_files.keys():
-            content_len = len(injected_files[path])
-            logger.info(f"[CoderAgent]   - {path}: {content_len} 字符")
+            content = injected_files[path]
+            if content is None:
+                logger.warning(f"[CoderAgent]   - {path}: 内容为空 (None)")
+            else:
+                content_len = len(content)
+                logger.info(f"[CoderAgent]   - {path}: {content_len} 字符")
 
         files_section = ""
         if injected_files:
@@ -487,6 +508,10 @@ def check_health():
 
             files_section += "\n【文件现有内容 - search_block 必须从这里精确复制】\n"
             for path, content in injected_files.items():
+                # 【修复】跳过 None 内容的文件
+                if content is None:
+                    logger.warning(f"[CoderAgent] injected_files 中的文件内容为空，跳过: {path}")
+                    continue
                 # 限制每个文件最多 150 行，避免 prompt 过长
                 lines = content.splitlines()
                 shown = "\n".join(lines[:150])
@@ -495,7 +520,7 @@ def check_health():
         else:
             files_section = "\n⚠️ 警告：未提供文件内容，请确保 search_block 与实际文件完全一致\n"
 
-        prompt = f"""【技术设计方案】
+        prompt = f"""{evergreen_section}【技术设计方案】
 {design_str}
 {interface_specs_section}
 {files_section}
@@ -682,14 +707,14 @@ def hello():
             if pipeline_id:
                 await push_log(pipeline_id, "info", f"代码生成完成，共 {len(output_files)} 个文件", stage="CODING")
             
-            # 【新增】静态键名比对：检查生成的代码是否符合 interface_specs 中的 return_fields
+            # 【简化】静态键名比对：只检查 interface_specs 的 return_fields
+            # 移除 required_symbols 的双重校验，因为 interface_specs 已经包含了契约信息
             interface_specs = design_output.get("interface_specs", [])
-            # 【修复】如果本次是强制完整文件覆盖（来自重试），标记需要后续检查，但先允许生成
-            if design_output.get("force_full_file"):
-                logger.info("[CoderAgent] 强制完整文件覆盖模式，标记需要后续静态键名检查")
-                result["needs_post_check"] = True  # 标记需要后续检查
-            elif interface_specs:
+            
+            if interface_specs and not design_output.get("force_full_file"):
+                logger.info(f"[CoderAgent] 开始键名校验: {len(interface_specs)} 个 interface_specs")
                 key_mismatches = self._validate_return_keys(output_files, interface_specs, injected_files or {})
+                
                 if key_mismatches:
                     error_msg = f"生成的代码返回键名与契约不一致: {key_mismatches}"
                     logger.error(f"[CoderAgent] {error_msg}")
@@ -701,6 +726,9 @@ def hello():
                         "output": result.get("output")
                     }
                 logger.info("[CoderAgent] 返回键名与契约一致，验证通过")
+            elif design_output.get("force_full_file"):
+                logger.info("[CoderAgent] 强制完整文件覆盖模式，跳过键名校验")
+                result["needs_post_check"] = True
         else:
             logger.error(f"CoderAgent 代码生成失败", extra={
                 "pipeline_id": pipeline_id,
@@ -739,6 +767,18 @@ def hello():
         mismatches = []
         injected_files = injected_files or {}
         
+        # 【辅助函数】标准化路径，用于匹配
+        def normalize_path(p: str) -> str:
+            p = p.replace("\\", "/")
+            if p.startswith("backend/"):
+                p = p[8:]  # 去掉 backend/ 前缀
+            return p.lstrip("/")
+        
+        # 【改进】构建标准化的 injected_files 查找表
+        normalized_injected_files = {}
+        for path, content in injected_files.items():
+            normalized_injected_files[normalize_path(path)] = content
+        
         # 【改进】构建文件路径到内容的映射，处理 modify 类型
         file_contents = {}
         
@@ -751,9 +791,13 @@ def hello():
                 file_contents[fp] = content
             elif change_type == "modify":
                 # 【修复】对于 modify 类型，从 injected_files 获取原始内容，然后应用修改
-                original_content = injected_files.get(fp, "")
+                # 使用标准化路径查找
+                normalized_fp = normalize_path(fp)
+                original_content = normalized_injected_files.get(normalized_fp, "")
+                
                 if not original_content:
-                    logger.warning(f"[CoderAgent] modify 操作缺少原始文件内容，跳过验证: {fp}")
+                    logger.warning(f"[CoderAgent] modify 操作缺少原始文件内容，跳过验证: {fp} (标准化: {normalized_fp})")
+                    logger.debug(f"[CoderAgent] 可用的 injected_files 键: {list(normalized_injected_files.keys())}")
                     continue
                 
                 # 应用修改
@@ -882,7 +926,19 @@ def hello():
                         elif isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.BitOr):
                             # 处理 {**a, **b} 这种合并
                             local_vars[var_name] = node.value
-        
+            # ===== 增加对带类型注解变量的支持 =====
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    var_name = node.target.id
+                    # 记录变量赋值的内容类型
+                    if isinstance(node.value, ast.Dict):
+                        local_vars[var_name] = node.value
+                    elif isinstance(node.value, ast.Call):
+                        local_vars[var_name] = node.value
+                    elif isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.BitOr):
+                        # 处理 {**a, **b} 这种合并
+                        local_vars[var_name] = node.value
+
         # 然后分析所有 return 语句
         for node in ast.walk(func_node):
             if isinstance(node, ast.Return) and node.value:
@@ -963,7 +1019,6 @@ def hello():
         elif isinstance(key_node, ast.Str):
             return key_node.s
         return None
-
 
 # 单例实例
 coder_agent = CoderAgent()

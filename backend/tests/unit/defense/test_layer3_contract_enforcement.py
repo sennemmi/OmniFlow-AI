@@ -68,7 +68,8 @@ class TestInterfaceSpecsValidation:
                     symbol_name="get_user",
                     module="app/service/user.py",
                     signature="def get_user(user_id: int) -> User",
-                    expected_behavior="根据ID获取用户"
+                    expected_behavior="根据ID获取用户",
+                    return_type="User"
                 )
             ]
         )

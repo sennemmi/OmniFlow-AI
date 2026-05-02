@@ -185,8 +185,7 @@ class AgentCoordinatorService:
             # 这样整个流程都在 Sandbox 中运行，节省本地开销
             sandbox_orchestrator = get_sandbox_orchestrator(pipeline_id)
             sandbox_result = await sandbox_orchestrator.initialize(
-                project_path=project_path,
-                timeout=120
+                project_path=project_path
             )
 
             if not sandbox_result["success"]:
