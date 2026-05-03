@@ -54,20 +54,30 @@ class AgentToolsCore:
             clean_pattern = pattern.replace('backend/', '').replace('backend\\', '').lstrip('/')
             WORKSPACE_ROOT = '/workspace'
 
-            # 【优化】使用更高效的查找策略，限制搜索范围和深度
+            # 【修复】使用更可靠的查找策略
             if '**' in clean_pattern:
-                # 对于递归模式，先尝试在特定目录下查找，避免全盘扫描
-                # 提取目录前缀（如 app/**/*.py -> app）
+                # 对于递归模式，提取目录前缀和文件模式
                 parts = clean_pattern.split('**', 1)
                 if parts[0] and parts[0].strip('/'):
-                    # 有特定目录前缀，如 app/
+                    # 有特定目录前缀，如 app/**/*.py -> app
                     base_dir = f"{WORKSPACE_ROOT}/{parts[0].strip('/')}"
-                    file_pattern = parts[1].lstrip('/').replace('**/', '').replace('**', '') if len(parts) > 1 else '*'
-                    # 限制最大深度为 5 层，避免深层遍历
-                    cmd = f"find {base_dir} -maxdepth 5 -name '{file_pattern}' -type f 2>/dev/null | head -{max_results}"
                 else:
                     # 无特定目录前缀，如 **/*.py，限制在 backend 目录下查找
-                    cmd = f"find {WORKSPACE_ROOT}/backend -maxdepth 5 -name '{clean_pattern.replace('**/', '').replace('**', '')}' -type f 2>/dev/null | head -{max_results}"
+                    base_dir = f"{WORKSPACE_ROOT}/backend"
+                
+                # 提取文件模式（如 *.py）
+                file_pattern = parts[1].lstrip('/').replace('**/', '').replace('**', '') if len(parts) > 1 else '*'
+                
+                # 【关键修复】使用 -name 支持递归匹配
+                # find 的 -name 在递归模式下会匹配所有子目录中的文件
+                if ',' in file_pattern:
+                    # 处理多扩展名，如 *.py,*.txt
+                    exts = file_pattern.split(',')
+                    name_conditions = ' -o '.join([f"-name '{ext.strip()}'" for ext in exts])
+                    cmd = f"find {base_dir} -maxdepth 5 -type f ( {name_conditions} ) 2>/dev/null | head -{max_results}"
+                else:
+                    # 单扩展名
+                    cmd = f"find {base_dir} -maxdepth 5 -name '{file_pattern}' -type f 2>/dev/null | head -{max_results}"
             else:
                 dir_path = WORKSPACE_ROOT
                 file_pattern = clean_pattern

@@ -1,30 +1,52 @@
 @echo off
-REM 构建 OmniFlowAI Sandbox 镜像 (Windows)
+setlocal enabledelayedexpansion
 
 echo ==========================================
 echo Building OmniFlowAI Sandbox Image
 echo ==========================================
 
-set IMAGE_NAME=omniflowai/sandbox
-set TAG=latest
+set "IMAGE_NAME=omniflowai/sandbox"
+set "TAG=latest"
 
-echo Project root: %~dp0..
-echo Building image: %IMAGE_NAME%:%TAG%
+REM determine project root (parent of sandbox directory)
+set "PROJECT_ROOT=%~dp0.."
 
-REM 构建镜像（从项目根目录）
-cd /d "%~dp0.."
-docker build -f sandbox/Dockerfile -t "%IMAGE_NAME%:%TAG%" .
+echo Project root: "%PROJECT_ROOT%"
+echo Target image: %IMAGE_NAME%:%TAG%
 
+REM switch to project root
+pushd "%PROJECT_ROOT%"
 if %ERRORLEVEL% neq 0 (
-    echo Build failed!
+    echo ERROR: Cannot switch to project root "%PROJECT_ROOT%"
+    exit /b 1
+)
+
+REM ensure Dockerfile exists
+if not exist "sandbox\Dockerfile" (
+    echo ERROR: sandbox\Dockerfile not found in "%PROJECT_ROOT%"
+    popd
+    exit /b 1
+)
+
+echo Starting Docker build...
+echo Command: docker build -f sandbox/Dockerfile -t "%IMAGE_NAME%:%TAG%" .
+
+docker build -f sandbox/Dockerfile -t "%IMAGE_NAME%:%TAG%" .
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo Build FAILED!
+    popd
     exit /b 1
 )
 
 echo.
 echo ==========================================
-echo Build completed!
+echo Build SUCCESSFUL!
 echo Image: %IMAGE_NAME%:%TAG%
 echo ==========================================
 echo.
-echo To test the image:
+echo Test the image with:
 echo   docker run --rm -it %IMAGE_NAME%:%TAG% python -m pytest --version
+
+popd
+exit /b 0

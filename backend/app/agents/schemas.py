@@ -90,16 +90,20 @@ class RequiredSymbol(BaseModel):
     必需实现的符号定义
     
     用于 ArchitectAgent 明确要求 DesignerAgent 必须实现的函数/类
+    
+    【契约流转说明】
+    - return_fields: 定义返回值字段规范，与 InterfaceSpec.return_fields 格式一致
+    - DesignerAgent 会将其转换为完整的 InterfaceSpec
+    - CoderAgent 和 TesterAgent 基于 InterfaceSpec 进行验证
     """
     name: str = Field(description="符号名称（函数名或类名）")
     type: str = Field(description="符号类型：function/class/endpoint")
     module: str = Field(description="所在模块路径（如 app/service/health_service.py）")
     signature: Optional[str] = Field(default=None, description="函数签名或类定义（可选）")
     description: Optional[str] = Field(default=None, description="简短描述（可选）")
-    # 【P0-1】新增：强制要求定义返回值的键名契约
-    return_fields_contract: Optional[List[str]] = Field(
-        default=None,
-        description="【契约强制执行】返回值字典必须包含的键名列表，如 ['status', 'response_time_ms', 'health_score']。CoderAgent 将据此校验实现。"
+    return_fields: List["ReturnFieldSpec"] = Field(
+        default_factory=list,
+        description="【契约强制执行】返回值字段规范列表。如果函数返回 dict，必须列出所有键名及其类型。"
     )
 
 

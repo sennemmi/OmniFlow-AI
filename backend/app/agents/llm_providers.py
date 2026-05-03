@@ -37,7 +37,7 @@ class LLMProvider(ABC):
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -132,7 +132,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -228,7 +228,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -413,7 +413,7 @@ async def call_with_tools(
     tools: list,
     api_key: str,
     api_base: str,
-    temperature: float = 0.7,
+    temperature: float = 0.0,
     max_tokens: Optional[int] = None,
 ) -> Any:
     """

@@ -35,7 +35,7 @@ async def add_numbers(a: int = Body(...), b: int = Body(...)) -> dict:
         return success_response(data={"result": result})
     except Exception as e:
         logger.error("计算失败", error=str(e), a=a, b=b)
-        return error_response(message=f"计算失败: {str(e)}", code="CALCULATION_ERROR")
+        return error_response(error=f"计算失败: {str(e)}")
 
 
 @calculator_router.post("/multiply")
@@ -55,4 +55,4 @@ async def multiply_numbers(a: int = Body(...), b: int = Body(...)) -> dict:
         return success_response(data={"result": result})
     except Exception as e:
         logger.error("计算失败", error=str(e), a=a, b=b)
-        return error_response(message=f"计算失败: {str(e)}", code="CALCULATION_ERROR")
+        return error_response(error=f"计算失败: {str(e)}")

@@ -96,6 +96,12 @@ class SandboxOrchestrator:
                         'node_modules', '.venv', 'venv', '.env'
                     )
                 )
+                # 【环境隔离补丁】清理掉沙箱中历史遗留的 AI 生成测试，防止被污染的测试阻断后续 pytest collection
+                ai_generated_dir = Path(self.temp_dir) / "backend" / "tests" / "ai_generated"
+                if ai_generated_dir.exists():
+                    import glob
+                    for f in glob.glob(str(ai_generated_dir / "test_*.py")):
+                        Path(f).unlink(missing_ok=True)
                 logger.info(f"[Pipeline {self.pipeline_id}] 项目代码复制完成")
             except Exception as copy_error:
                 logger.error(f"[Pipeline {self.pipeline_id}] 复制项目代码失败: {copy_error}")
@@ -140,9 +146,21 @@ class SandboxOrchestrator:
             if not verify_result["success"]:
                 logger.error(f"[Pipeline {self.pipeline_id}] Sandbox 文件系统验证失败")
                 return verify_result
-            
+
+            # 4. 初始化 Git 环境（为 SnapshotService 做准备）
+            git_init_result = await self._init_git_environment()
+            if not git_init_result["success"]:
+                logger.warning(f"[Pipeline {self.pipeline_id}] Git 环境初始化失败: {git_init_result.get('error')}")
+                # Git 初始化失败不阻断流程，只是警告
+
+            # 5. 【新增】验证关键文件的语法完整性
+            syntax_check_result = await self._verify_file_syntax_integrity()
+            if not syntax_check_result["success"]:
+                logger.error(f"[Pipeline {self.pipeline_id}] 文件语法完整性验证失败")
+                return syntax_check_result
+
             self._is_initialized = True
-            
+
             return {
                 "success": True,
                 "sandbox_info": self.sandbox_info,
@@ -170,7 +188,7 @@ class SandboxOrchestrator:
     async def _verify_sandbox_filesystem(self) -> Dict[str, Any]:
         """
         验证 Sandbox 中的文件系统
-        
+
         Returns:
             Dict: 验证结果
         """
@@ -181,20 +199,184 @@ class SandboxOrchestrator:
                 "ls -la /workspace/backend/",
                 timeout=10
             )
-            
+
             if check_result.exit_code != 0:
                 return {
                     "success": False,
                     "error": f"无法访问 /workspace/backend/: {check_result.error}"
                 }
-            
+
             logger.info(f"[Pipeline {self.pipeline_id}] Sandbox 文件系统验证通过")
             return {"success": True}
-            
+
         except Exception as e:
             logger.error(f"[Pipeline {self.pipeline_id}] 验证 Sandbox 文件系统失败: {e}")
             return {"success": False, "error": str(e)}
-    
+
+    async def _init_git_environment(self) -> Dict[str, Any]:
+        """
+        在 Sandbox 中初始化 Git 环境
+
+        为 SnapshotService 的 git stash 功能做准备。
+        执行: git init -> config -> add -> commit
+
+        Returns:
+            Dict: 初始化结果
+        """
+        try:
+            await push_log(
+                self.pipeline_id,
+                "info",
+                "🔧 初始化 Git 环境...",
+                stage="REQUIREMENT"
+            )
+
+            # 【新增】强制清理可能存在的锁文件，防止上一次失败导致的死锁
+            await sandbox_manager.exec(
+                self.pipeline_id,
+                "rm -f /workspace/.git/index.lock",
+                timeout=5
+            )
+
+            # 1. git init
+            init_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git init",
+                timeout=10
+            )
+            if init_result.exit_code != 0:
+                return {
+                    "success": False,
+                    "error": f"git init 失败: {init_result.stderr}"
+                }
+
+            # 2. git config
+            config_email_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git config user.email 'omniflow@ai.local'",
+                timeout=5
+            )
+            config_name_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git config user.name 'OmniFlow AI'",
+                timeout=5
+            )
+            if config_email_result.exit_code != 0 or config_name_result.exit_code != 0:
+                return {
+                    "success": False,
+                    "error": f"git config 失败: {config_email_result.stderr or config_name_result.stderr}"
+                }
+
+            # 3. git add (增加超时到 60 秒，因为项目文件可能很多)
+            add_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git add -A",  # 使用 -A 确保包含所有文件
+                timeout=60
+            )
+            if add_result.exit_code != 0:
+                return {
+                    "success": False,
+                    "error": f"git add 失败: {add_result.stderr}"
+                }
+
+            # 4. git commit (增加超时到 30 秒)
+            commit_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git commit -m 'Initial commit'",
+                timeout=30
+            )
+            if commit_result.exit_code != 0:
+                return {
+                    "success": False,
+                    "error": f"git commit 失败: {commit_result.stderr}"
+                }
+
+            logger.info(f"[Pipeline {self.pipeline_id}] Git 环境初始化成功")
+            await push_log(
+                self.pipeline_id,
+                "info",
+                "✅ Git 环境初始化成功",
+                stage="REQUIREMENT"
+            )
+            return {"success": True}
+
+        except Exception as e:
+            logger.error(f"[Pipeline {self.pipeline_id}] 初始化 Git 环境失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _verify_file_syntax_integrity(self) -> Dict[str, Any]:
+        """
+        验证关键文件的语法完整性
+
+        在 Sandbox 初始化完成后，对关键 Python 文件执行语法检查，
+        确保文件复制过程中没有损坏。
+
+        Returns:
+            Dict: 验证结果
+        """
+        try:
+            await push_log(
+                self.pipeline_id,
+                "info",
+                "🔍 检查关键文件语法完整性...",
+                stage="REQUIREMENT"
+            )
+
+            # 定义关键文件列表（这些文件如果损坏会导致系统无法运行）
+            critical_files = [
+                "app/service/stage_handlers/coding_handler.py",
+                "app/service/stage_handlers/base.py",
+                "app/service/workflow.py",
+                "app/agents/coder.py",
+                "app/agents/base.py",
+            ]
+
+            failed_files = []
+
+            for file_path in critical_files:
+                # 使用 py_compile 检查语法
+                check_result = await sandbox_manager.exec(
+                    self.pipeline_id,
+                    f"python -m py_compile /workspace/backend/{file_path} 2>&1",
+                    timeout=10
+                )
+
+                if check_result.exit_code != 0:
+                    logger.error(f"[Pipeline {self.pipeline_id}] {file_path} 语法错误: {check_result.stderr}")
+                    failed_files.append({
+                        "file": file_path,
+                        "error": check_result.stderr[:200]
+                    })
+
+            if failed_files:
+                error_msg = f"发现 {len(failed_files)} 个关键文件语法错误: " + \
+                           ", ".join([f["file"] for f in failed_files])
+                logger.error(f"[Pipeline {self.pipeline_id}] {error_msg}")
+                await push_log(
+                    self.pipeline_id,
+                    "error",
+                    f"❌ {error_msg}",
+                    stage="REQUIREMENT"
+                )
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "failed_files": failed_files
+                }
+
+            logger.info(f"[Pipeline {self.pipeline_id}] 所有关键文件语法检查通过")
+            await push_log(
+                self.pipeline_id,
+                "info",
+                "✅ 关键文件语法检查通过",
+                stage="REQUIREMENT"
+            )
+            return {"success": True}
+
+        except Exception as e:
+            logger.error(f"[Pipeline {self.pipeline_id}] 文件语法完整性检查异常: {e}")
+            return {"success": False, "error": str(e)}
+
     def get_file_service(self) -> Optional[SandboxFileService]:
         """
         获取 SandboxFileService 实例

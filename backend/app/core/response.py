@@ -11,7 +11,7 @@ from pydantic import BaseModel
 class ResponseModel(BaseModel):
     """
     统一响应模型
-    
+
     Attributes:
         success: 请求是否成功
         data: 响应数据
@@ -22,6 +22,10 @@ class ResponseModel(BaseModel):
     data: Optional[Any] = None
     error: Optional[str] = None
     request_id: str
+
+    # 增加这部分，让对象可以像字典一样被访问 [key]
+    def __getitem__(self, item):
+        return getattr(self, item)
 
 
 def success_response(data: Any = None, request_id: str = "") -> ResponseModel:

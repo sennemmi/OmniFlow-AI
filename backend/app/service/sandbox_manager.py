@@ -188,8 +188,8 @@ class SandboxManager:
                 "--name", container_name,
                 "-v", f"{project_path}:/workspace",
                 "-p", f"{port}:8000",
-                "--memory", "512m",
-                "--cpus", "1",
+                "--memory", "1g",
+                "--cpus", "2",
                 "--network", self._network_name,
                 "omniflowai/sandbox:latest",
             ]

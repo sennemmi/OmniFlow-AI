@@ -32,7 +32,7 @@ class StructuredLLMClient:
         system_prompt: str,
         user_prompt: str,
         model: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         max_retries: int = 3,
         **kwargs

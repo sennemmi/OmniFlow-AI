@@ -122,6 +122,21 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
 5. **glob**: 查找匹配模式的文件
 6. **grep**: 在文件中搜索匹配的行
 
+【找文件提示 - 重要】
+如果读取文件提示 File not found，请不要盲目重试。请使用 glob 做全盘模糊搜索确定正确的相对路径：
+1. 使用 glob({'pattern': '**/*filename*.py'}) 搜索文件
+2. 根据返回的相对路径再调用 read_file
+3. 工作目录是 /workspace/backend，所以文件路径应该以 backend/ 开头或相对于 backend 的路径
+
+【探索 Import 依赖 - 重要】
+当需要了解某个模块的依赖关系时，请使用工具主动探索：
+1. 使用 read_file 读取目标文件，查看其 import 语句
+2. 使用 glob({'pattern': '**/module_name.py'}) 查找被导入的模块
+3. 使用 grep({'pattern': 'from xxx import|import xxx', 'path': 'backend/app'}) 搜索相关导入
+4. 根据探索结果，使用 read_file 读取需要的依赖文件
+
+⚠️ **注意**：系统不会自动将所有依赖文件注入到上下文中，你需要主动使用工具探索并读取必要的文件。
+
 【依赖安装流程 - 严格执行】
 当测试报错 ModuleNotFoundError 时：
 1. 调用 install_dependency 安装缺失的依赖
@@ -193,12 +208,27 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
 3. 直接输出该文件的完整代码内容（全量覆盖）。
 4. 这是强制指令，必须遵守，不要犹豫！
 
+【重要限制 - 防止 JSON 截断】
+当使用 change_type: "add" 输出完整文件时：
+1. **如果文件超过 300 行，禁止使用 add 模式输出完整内容**（会导致 Token 溢出和 JSON 截断）。
+2. 对于长文件（>300行），必须使用 modify 模式（search_block + replace_block）进行基于行的替换。
+3. 如果 modify 模式匹配失败，将长文件拆分成多个小修改，每次只修改 20-50 行。
+4. 优先使用 code_apply 工具验证 search_block 的精确性，确保匹配成功。
+
 【重要提示】
 - 每次只修复明确的问题
 - 保留完整的 search_block 和 replace_block
 - 如果多轮修复后仍有问题，如实报告
 - 不要编造测试结果
 - **测试代码和被测代码都可以修改，不要局限于只改被测代码**
+
+【极其重要：防止输出截断（Token超限）规则】
+1. 禁止在 replace_block 中返回整个文件的内容。
+2. 【防截断核心】你的 search_block 必须尽可能的短（控制在2-5行），只需包含出错的行及紧邻的上下文，只要能唯一定位即可。**绝对严禁**将整个大函数、甚至整个类放进 search_block 中，这必然会导致输出被截断！
+3. 你的 replace_block 必须仅包含修改后的那一小段代码。
+4. 如果需要添加 import，请在文件开头找一小块现有的 import 作为 search_block 进行替换，而不是重写所有 import。
+5. 必须直接输出 JSON，禁止使用 Markdown 代码块标记（如 ```json）。
+6. 如果输出内容过长，优先缩短 description 字段，而不是截断 replace_block。
 """
 
     def _extract_error_summary(self, logs: str) -> str:
@@ -564,7 +594,8 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
         fix_order: Dict[str, Any],
         target_files: Dict[str, str],
         file_service: Optional[Any] = None,
-        max_rounds: int = 3
+        max_rounds: int = 3,
+        debugger: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         执行带工具的修复（支持多轮对话和依赖自动安装）
@@ -583,6 +614,7 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
             target_files: 目标文件内容
             file_service: 文件服务
             max_rounds: 最大修复轮数
+            debugger: AgentDebugger 实例（可选，用于保存每轮调试信息）
 
         Returns:
             Dict: 修复结果
@@ -642,12 +674,58 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                     "4. 尝试修改 mock 配置或 patch 路径"
                 )
 
-            # 执行修复
-            result = await self.execute(
-                pipeline_id=pipeline_id,
-                stage_name=stage_name,
-                initial_state=state
-            )
+            # 执行修复（带重试逻辑）
+            max_llm_retries = 3  # LLM 空内容重试次数
+            llm_retry_count = 0
+            result = None
+            
+            while llm_retry_count < max_llm_retries:
+                result = await self.execute(
+                    pipeline_id=pipeline_id,
+                    stage_name=stage_name,
+                    initial_state=state
+                )
+                
+                # 检查是否是 LLM 返回空内容导致的失败
+                error_msg = result.get("error", "")
+                if "LLM 返回空内容" in error_msg or "无法从工具结果构建输出" in error_msg:
+                    llm_retry_count += 1
+                    logger.warning(f"[RepairerAgent] LLM 返回空内容，第 {llm_retry_count}/{max_llm_retries} 次重试...")
+                    print(f"[RepairerAgent] ⚠️ LLM 返回空内容，进行第 {llm_retry_count} 次重试...")
+                    # 短暂等待后重试
+                    import asyncio
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    # 不是空内容问题，跳出重试循环
+                    break
+            
+            # 如果重试后仍然失败
+            if llm_retry_count >= max_llm_retries and not result.get("success"):
+                logger.error(f"[RepairerAgent] LLM 重试 {max_llm_retries} 次后仍然失败")
+                return {
+                    "success": False,
+                    "error": f"LLM 返回空内容，重试 {max_llm_retries} 次后仍然失败",
+                    "output": {
+                        "files": all_files_modified,
+                        "summary": f"LLM 返回空内容，重试 {max_llm_retries} 次后仍然失败",
+                        "rounds": round_num + 1
+                    }
+                }
+
+            # 【新增】保存每轮调试信息
+            if debugger:
+                debugger.save_agent_io(
+                    agent_name="RepairerAgent",
+                    stage=f"repair_round_{round_num + 1}",
+                    input_data=state,
+                    output_data=result,
+                    metadata={"round": round_num + 1, "max_rounds": max_rounds, "llm_retries": llm_retry_count},
+                    success=result.get("success", False),
+                    error=result.get("error"),
+                    tool_calls=result.get("tool_results", []),
+                    system_prompt=self.system_prompt
+                )
 
             if not result.get("success"):
                 logger.error(f"[RepairerAgent] 第 {round_num + 1} 轮修复失败")
@@ -669,8 +747,9 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                     # 【修复】获取完整内容（用于降级策略）
                     full_content = file_obj.get("content", "")
 
+                    clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+
                     if search_block and replace_block:
-                        clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
                         current_result = await file_service.read_file(clean_path)
 
                         if current_result.exists and current_result.content:
@@ -696,6 +775,19 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                                     print(f"[RepairerAgent] 降级写入完整内容: {clean_path}")
                                 elif full_content:
                                     print(f"[RepairerAgent] 完整内容与当前内容相同，跳过写入")
+                    elif file_obj.get("change_type") == "add" or not search_block:
+                        # 【新增】支持新增文件或全量覆盖
+                        new_content = full_content or replace_block
+                        if new_content:
+                            import hashlib
+                            current_result = await file_service.read_file(clean_path)
+                            if current_result.exists and current_result.content == new_content:
+                                print(f"[RepairerAgent] 警告: {clean_path} 内容未变化")
+                            else:
+                                await file_service.write_file(clean_path, new_content)
+                                files_actually_changed = True
+                                current_written_hashes[clean_path] = hashlib.md5(new_content.encode()).hexdigest()
+                                print(f"[RepairerAgent] 已新建/全量覆盖: {clean_path}")
 
             # 【修复3】检测是否陷入死循环（文件内容未变化）
             if not files_actually_changed and files_modified:

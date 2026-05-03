@@ -71,7 +71,9 @@ class DeliveryHandler(StageHandler):
         git_branch = None
         commit_hash = None
         pr_url = None
+        pr_created = False
         execution_result = None
+        pr_result = None
 
         try:
             # 使用 WorkspaceService 管理临时工作区
@@ -151,7 +153,11 @@ class DeliveryHandler(StageHandler):
 
                 if pr_result.success:
                     pr_url = pr_result.pr_url
+                    pr_created = True
                     await push_log(pipeline_id, "info", f"PR 创建成功: {pr_url}", stage="DELIVERY")
+                else:
+                    pr_created = False
+                    await push_log(pipeline_id, "warning", f"PR 创建失败: {pr_result.error}", stage="DELIVERY")
 
             # 返回成功结果
             return StageResult.success_result(
@@ -160,7 +166,7 @@ class DeliveryHandler(StageHandler):
                     "git_branch": git_branch,
                     "commit_hash": commit_hash,
                     "pr_url": pr_url,
-                    "pr_created": pr_result.success if 'pr_result' in dir() else False,
+                    "pr_created": pr_created,
                     "execution_summary": execution_result.summary if execution_result else {}
                 },
                 status=PipelineStatus.SUCCESS,

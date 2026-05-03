@@ -5,11 +5,14 @@
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from app.agents.coder import coder_agent, CoderAgent, CoderOutput
 from app.agents.tester import tester_agent
 from app.service.sandbox_file_service import SandboxFileService
+
+if TYPE_CHECKING:
+    from app.utils.agent_debug_utils import AgentDebugger
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,9 @@ async def run_syntax_fix_loop(
     files_to_check: List[Tuple[str, str]],
     file_service: SandboxFileService,
     design_output: Dict,
-    max_retries: int = 3
+    max_retries: int = 3,
+    debugger: Optional["AgentDebugger"] = None,
+    coder_system_prompt: Optional[str] = None
 ) -> Dict[str, str]:
     """
     运行语法错误修复循环
@@ -65,22 +70,39 @@ async def run_syntax_fix_loop(
 
         # 构建定向设计输出
         # 【修复】保留 interface_specs 和 required_symbols，让 CoderAgent 在修复语法错误时仍有契约约束
+        # 【新增】添加 syntax_fix_mode 标识，让 CoderAgent 知道这是语法修复模式
         targeted_design = {
             **design_output,
             "affected_files": list(error_files.keys()),
             "fix_mode": True,
+            "syntax_fix_mode": True,  # 明确告知 CoderAgent 这是语法修复模式
             "force_full_file": force_full_file,
             "fix_instruction": fix_instruction,
             "syntax_errors": syntax_errors
         }
 
         # 调用 CoderAgent
-        fix_result = await coder_agent.generate_code(
-            design_output=targeted_design,
-            pipeline_id=design_output.get("pipeline_id", 0),
-            injected_files=error_files,
-            error_context=fix_instruction
-        )
+        fix_input = {
+            "design_output": targeted_design,
+            "pipeline_id": design_output.get("pipeline_id", 0),
+            "injected_files": error_files,
+            "error_context": fix_instruction
+        }
+        fix_result = await coder_agent.generate_code(**fix_input)
+
+        # 保存调试信息
+        if debugger:
+            debugger.save_agent_io(
+                agent_name="CoderAgent",
+                stage="syntax_fix",
+                input_data=fix_input,
+                output_data=fix_result,
+                metadata={"attempt": attempt + 1, "max_retries": max_retries},
+                success=fix_result.get("success", False),
+                error=fix_result.get("error"),
+                tool_calls=fix_result.get("tool_results", []),
+                system_prompt=coder_system_prompt
+            )
 
         if not fix_result.get("success"):
             logger.warning(f"CoderAgent 语法修复调用失败: {fix_result.get('error')}")
@@ -180,7 +202,9 @@ async def run_contract_fix_loop(
     interface_specs: List[Dict],
     design_output: Dict,
     file_service: SandboxFileService,
-    max_retries: int = 3
+    max_retries: int = 3,
+    debugger: Optional["AgentDebugger"] = None,
+    coder_system_prompt: Optional[str] = None
 ) -> Tuple[bool, List[str], List[Dict]]:
     """
     运行契约修复循环
@@ -235,11 +259,26 @@ async def run_contract_fix_loop(
                     injected_files[clean] = read_res.content
 
         # 调用 CoderAgent
-        fix_result = await coder_agent.generate_code(
-            design_output=targeted_design,
-            pipeline_id=design_output.get("pipeline_id", 0),
-            injected_files=injected_files
-        )
+        fix_input = {
+            "design_output": targeted_design,
+            "pipeline_id": design_output.get("pipeline_id", 0),
+            "injected_files": injected_files
+        }
+        fix_result = await coder_agent.generate_code(**fix_input)
+
+        # 保存调试信息
+        if debugger:
+            debugger.save_agent_io(
+                agent_name="CoderAgent",
+                stage="contract_fix",
+                input_data=fix_input,
+                output_data=fix_result,
+                metadata={"attempt": attempt + 1, "max_retries": max_retries, "missing_syms": current_missing},
+                success=fix_result.get("success", False),
+                error=fix_result.get("error"),
+                tool_calls=fix_result.get("tool_results", []),
+                system_prompt=coder_system_prompt
+            )
 
         if not fix_result.get("success"):
             logger.warning(f"CoderAgent 修复调用失败: {fix_result.get('error')}")
@@ -252,6 +291,7 @@ async def run_contract_fix_loop(
             continue
 
         # 写入修复文件
+        written_files = []  # 记录成功写入的文件路径
         for fc in fix_files:
             fp = fc.get("file_path", "").replace("backend/", "").replace("backend\\", "")
             change_type = fc.get("change_type")
@@ -259,22 +299,42 @@ async def run_contract_fix_loop(
             replace_block = fc.get("replace_block", "")
             content = fc.get("content", "")
 
+            write_success = False
             if change_type == "modify":
                 if search_block:
                     read_r = await file_service.read_file(fp)
                     if read_r.exists:
                         new_content = read_r.content.replace(search_block, replace_block, 1)
-                        await file_service.write_file(fp, new_content)
+                        if new_content != read_r.content:
+                            await file_service.write_file(fp, new_content)
+                            write_success = True
+                        else:
+                            logger.warning(f"search_block 未匹配，跳过写入: {fp}")
                 elif content:
                     await file_service.write_file(fp, content)
+                    write_success = True
             elif change_type == "add" and content:
                 await file_service.write_file(fp, content)
+                write_success = True
+            
+            if write_success:
+                written_files.append(fp)
+                logger.info(f"契约修复文件写入成功: {fp}")
+
+        # 【关键修复】验证前回读确认写入成功
+        for fp in written_files:
+            read_check = await file_service.read_file(fp)
+            if not read_check.exists:
+                logger.error(f"契约修复验证失败: 文件 {fp} 写入后无法读取")
+            else:
+                logger.debug(f"契约修复文件确认: {fp} ({len(read_check.content)} 字符)")
 
         all_fix_files.extend(fix_files)
 
-        # 重新检查契约
+        # 【关键修复】重新检查契约时，传入空列表强制从沙箱读取所有文件
+        # 而不是依赖 fix_files 中可能不完整的 content 字段
         current_missing = await e2e_service.verify_contract(
-            file_service, fix_files + all_fix_files, interface_specs
+            file_service, [], interface_specs
         )
 
         if not current_missing:
@@ -290,7 +350,9 @@ async def run_test_import_fix_loop(
     file_service: SandboxFileService,
     design_output: Dict,
     code_output: Dict,
-    max_retries: int = 2
+    max_retries: int = 2,
+    debugger: Optional["AgentDebugger"] = None,
+    tester_system_prompt: Optional[str] = None
 ) -> bool:
     """
     运行测试导入错误修复循环
@@ -326,16 +388,31 @@ async def run_test_import_fix_loop(
                 injected_files[fp] = read_res.content
 
         # 调用 TesterAgent
-        fix_result = await tester_agent.generate_tests(
-            design_output={
+        fix_input = {
+            "design_output": {
                 **design_output,
                 "fix_mode": True,
                 "fix_instruction": fix_instruction,
                 "existing_test_files": test_files
             },
-            code_output=code_output,
-            pipeline_id=design_output.get("pipeline_id", 0)
-        )
+            "code_output": code_output,
+            "pipeline_id": design_output.get("pipeline_id", 0)
+        }
+        fix_result = await tester_agent.generate_tests(**fix_input)
+
+        # 保存调试信息
+        if debugger:
+            debugger.save_agent_io(
+                agent_name="TesterAgent",
+                stage="import_fix",
+                input_data=fix_input,
+                output_data=fix_result,
+                metadata={"attempt": attempt + 1, "max_retries": max_retries, "import_errors": import_errors},
+                success=fix_result.get("success", False),
+                error=fix_result.get("error"),
+                tool_calls=fix_result.get("tool_results", []),
+                system_prompt=tester_system_prompt
+            )
 
         if not fix_result.get("success"):
             logger.warning(f"TesterAgent 修复调用失败: {fix_result.get('error')}")
@@ -375,7 +452,9 @@ async def run_test_syntax_fix_loop(
     file_service: SandboxFileService,
     design_output: Dict,
     code_output: Dict,
-    max_retries: int = 2
+    max_retries: int = 2,
+    debugger: Optional["AgentDebugger"] = None,
+    tester_system_prompt: Optional[str] = None
 ) -> List[Dict]:
     """
     运行测试语法错误修复循环
@@ -401,16 +480,31 @@ async def run_test_syntax_fix_loop(
 
         fix_instruction = build_test_syntax_fix_instruction(syntax_errors)
 
-        fix_result = await tester_agent.generate_tests(
-            design_output={
+        fix_input = {
+            "design_output": {
                 **design_output,
                 "fix_mode": True,
                 "fix_instruction": fix_instruction,
                 "existing_test_files": test_files
             },
-            code_output=code_output,
-            pipeline_id=design_output.get("pipeline_id", 0)
-        )
+            "code_output": code_output,
+            "pipeline_id": design_output.get("pipeline_id", 0)
+        }
+        fix_result = await tester_agent.generate_tests(**fix_input)
+
+        # 保存调试信息
+        if debugger:
+            debugger.save_agent_io(
+                agent_name="TesterAgent",
+                stage="test_syntax_fix",
+                input_data=fix_input,
+                output_data=fix_result,
+                metadata={"attempt": attempt + 1, "max_retries": max_retries, "syntax_errors": syntax_errors},
+                success=fix_result.get("success", False),
+                error=fix_result.get("error"),
+                tool_calls=fix_result.get("tool_results", []),
+                system_prompt=tester_system_prompt
+            )
 
         if not fix_result.get("success"):
             logger.warning(f"TesterAgent 语法修复调用失败: {fix_result.get('error')}")

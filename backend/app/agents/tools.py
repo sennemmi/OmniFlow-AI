@@ -22,6 +22,8 @@ from typing import Dict, Any, List, Optional
 from app.agents.agent_tools_core import AgentToolsCore
 from app.agents.agent_tools_advanced import AgentToolsAdvanced
 from app.agents.project_card_builder import ProjectCardBuilder
+from app.agents.tools_code_apply import CodeApplyTool
+from app.agents.tools_edit import EditToolsExecutor
 from app.core.sse_log_buffer import push_log
 
 logger = logging.getLogger(__name__)
@@ -260,6 +262,78 @@ class AgentTools:
                         "required": ["file_path", "search_block", "replace_block", "read_token"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "code_apply",
+                    "description": (
+                        "执行精确的代码搜索替换。【极其重要】此工具只做精确匹配,不做模糊匹配。"
+                        "如果 search_block 与文件内容不完全一致,工具会返回结构化的错误信息,"
+                        "告诉你为什么失败以及如何修正。请先使用 read_file 读取文件,确保 search_block 精确复制。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string", "description": "文件路径"},
+                            "search_block": {"type": "string", "description": "要替换的代码块(必须精确匹配原文件)"},
+                            "replace_block": {"type": "string", "description": "新代码块"}
+                        },
+                        "required": ["file_path", "search_block", "replace_block"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "func_replace",
+                    "description": (
+                        "替换指定函数/方法的完整实现。"
+                        "比 code_apply 更适合修改整个函数的场景。"
+                        "系统会自动定位函数边界,你只需要提供新的函数实现。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "func_name": {"type": "string", "description": "函数名或方法名"},
+                            "new_func_body": {"type": "string", "description": "新的完整函数实现(包括 def 行)"},
+                        },
+                        "required": ["file_path", "func_name", "new_func_body"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "insert_after",
+                    "description": "在指定行之后插入新代码",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "after_line": {"type": "integer", "description": "在此行之后插入"},
+                            "code_block": {"type": "string", "description": "要插入的代码块"},
+                        },
+                        "required": ["file_path", "after_line", "code_block"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_lines",
+                    "description": "删除指定行范围的代码",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "start_line": {"type": "integer"},
+                            "end_line": {"type": "integer"},
+                        },
+                        "required": ["file_path", "start_line", "end_line"]
+                    }
+                }
             }
         ]
 
@@ -386,7 +460,126 @@ class AgentTools:
                     await push_log(pipeline_id, "error", f"❌ 工具 {tool_name} 执行异常: {str(e)}", stage="CODING")
                 return json.dumps({"error": str(e)})
 
+        if tool_name == "code_apply":
+            try:
+                file_path = arguments.get("file_path")
+                search_block = arguments.get("search_block")
+                replace_block = arguments.get("replace_block")
+
+                if pipeline_id:
+                    await push_log(pipeline_id, "info", f"🔧 调用工具: {tool_name} - {file_path}", stage="CODING")
+
+                # 读取文件内容 - 使用 _advanced._read_content 处理路径前缀
+                read_result = self._advanced._read_content(file_path)
+                if read_result[0] is None:
+                    error_msg = read_result[1] or f"无法读取文件: {file_path}"
+                    if pipeline_id:
+                        await push_log(pipeline_id, "warning", f"⚠️ 工具 {tool_name} 执行失败: {error_msg}", stage="CODING")
+                    return json.dumps({
+                        "success": False,
+                        "error": error_msg
+                    })
+
+                file_content = read_result[0]
+                result = CodeApplyTool.execute(file_path, search_block, replace_block, file_content)
+
+                if pipeline_id:
+                    result_data = json.loads(result)
+                    if result_data.get("success", False):
+                        await push_log(pipeline_id, "success", f"✅ 工具 {tool_name} 执行成功", stage="CODING")
+                    else:
+                        await push_log(pipeline_id, "warning", f"⚠️ 工具 {tool_name} 执行失败: {result_data.get('error_detail', '未知错误')}", stage="CODING")
+
+                return result
+            except Exception as e:
+                logger.error(f"[execute_tool] Error executing {tool_name}: {e}")
+                if pipeline_id:
+                    await push_log(pipeline_id, "error", f"❌ 工具 {tool_name} 执行异常: {str(e)}", stage="CODING")
+                return json.dumps({"error": str(e)})
+
+        # 处理新的编辑工具
+        edit_tools = ["func_replace", "insert_after", "delete_lines"]
+        if tool_name in edit_tools:
+            try:
+                file_path = arguments.get("file_path")
+
+                if pipeline_id:
+                    await push_log(pipeline_id, "info", f"🔧 调用工具: {tool_name} - {file_path}", stage="CODING")
+
+                # 读取文件内容
+                read_result = self._advanced._read_content(file_path)
+                if read_result[0] is None:
+                    error_msg = read_result[1] or f"无法读取文件: {file_path}"
+                    if pipeline_id:
+                        await push_log(pipeline_id, "warning", f"⚠️ 工具 {tool_name} 执行失败: {error_msg}", stage="CODING")
+                    return json.dumps({
+                        "success": False,
+                        "error": error_msg
+                    })
+
+                file_content = read_result[0]
+
+                # 执行编辑工具
+                executor = EditToolsExecutor(file_service=self._file_service)
+                result = await executor.execute(tool_name, arguments, file_content, file_path)
+
+                # 解析结果
+                result_data = json.loads(result)
+
+                if pipeline_id:
+                    if result_data.get("success", False):
+                        await push_log(pipeline_id, "success", f"✅ 工具 {tool_name} 执行成功", stage="CODING")
+                    else:
+                        await push_log(pipeline_id, "warning", f"⚠️ 工具 {tool_name} 执行失败: {result_data.get('error', '未知错误')}", stage="CODING")
+
+                # 【微提交】执行成功后自动 commit
+                if result_data.get("success") and pipeline_id:
+                    await self._micro_commit(pipeline_id, tool_name, arguments)
+
+                return result
+            except Exception as e:
+                logger.error(f"[execute_tool] Error executing {tool_name}: {e}")
+                if pipeline_id:
+                    await push_log(pipeline_id, "error", f"❌ 工具 {tool_name} 执行异常: {str(e)}", stage="CODING")
+                return json.dumps({"error": str(e)})
+
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    async def _micro_commit(self, pipeline_id: int, tool_name: str, arguments: Dict[str, Any]):
+        """每次成功的工具调用后自动微提交"""
+        try:
+            file_path = arguments.get("file_path", "unknown")
+
+            # 构建提交信息
+            if tool_name == "func_replace":
+                func_name = arguments.get("func_name", "")
+                commit_msg = f"micro: {tool_name} on {file_path} - func: {func_name}"
+            elif tool_name == "insert_after":
+                after_line = arguments.get("after_line", "")
+                commit_msg = f"micro: {tool_name} on {file_path} - after line: {after_line}"
+            elif tool_name == "delete_lines":
+                start_line = arguments.get("start_line", "")
+                end_line = arguments.get("end_line", "")
+                commit_msg = f"micro: {tool_name} on {file_path} - lines: {start_line}-{end_line}"
+            elif tool_name == "code_apply":
+                commit_msg = f"micro: {tool_name} on {file_path}"
+            else:
+                commit_msg = f"micro: {tool_name} on {file_path}"
+
+            # 在 Sandbox 中执行 git commit
+            result = await sandbox_manager.exec(
+                pipeline_id,
+                f'cd /workspace && git add -A && git commit -m "{commit_msg}" --allow-empty',
+                timeout=5
+            )
+
+            if result.exit_code == 0:
+                logger.info(f"[MicroCommit] {commit_msg}")
+            else:
+                logger.warning(f"[MicroCommit] 提交失败: {result.stderr}")
+
+        except Exception as e:
+            logger.warning(f"[MicroCommit] 微提交异常: {e}")
 
 
 # 便捷函数

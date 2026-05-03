@@ -9,13 +9,24 @@
 所有 API 端点必须使用统一的响应函数：
 
 ```python
+from fastapi import Request
 from app.core.response import success_response, error_response
 
-# 成功响应
-return success_response(data={"status": "up"})
+# 成功响应 - 必须传入 request_id
+return success_response(data={"status": "up"}, request_id=request_id)
 
-# 错误响应
-return error_response(message="数据库连接失败", code="DB_CONNECTION_ERROR")
+# 错误响应 - 使用 error 参数而不是 message/code
+return error_response(error="数据库连接失败", request_id=request_id)
+```
+
+**重要：所有 API 端点必须引入 `request: Request` 参数以获取 `request_id`：**
+```python
+from fastapi import Request
+
+@router.get("/health")
+async def health_check(request: Request):
+    request_id = getattr(request.state, "request_id", "")
+    # ... 使用 request_id 调用响应函数
 ```
 
 禁止手动构建响应字典：

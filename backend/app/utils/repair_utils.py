@@ -120,6 +120,11 @@ def build_fix_order(
     # 提取 pytest 错误内容
     error_content = extract_pytest_failures(logs)
 
+    # 【强制护栏】对错误内容进行硬截断，防止超大异常堆栈塞爆 Prompt
+    MAX_LOG_LEN = 8000
+    if len(error_content) > MAX_LOG_LEN:
+        error_content = error_content[:MAX_LOG_LEN] + "\n...[日志过长，为防止上下文崩溃已由系统强制截断]"
+
     return {
         "type": "fix_order",
         "category": "code_bug",
@@ -275,16 +280,22 @@ def extract_critical_files(logs: str, all_generated_paths: List[str]) -> List[st
     策略：
     1. 全量收集：扫描日志中所有可能的 Python 文件路径
     2. 智能过滤：只保留包含 'app/' 或 'tests/' 的业务相关文件
-    3. 强制注入：地基文件（response.py, database.py）
+    3. 【移除】不再强制注入核心契约文件，由 AI 自行探索
+    4. 【新增】SyntaxError 文件优先提取
     """
     critical_files = set()
+    syntax_error_files = set()  # 语法错误文件优先级最高
 
-    # 1. 【地基】强制注入核心契约文件
-    CORE_CONTRACTS = [
-        "app/core/response.py",
-        "app/core/database.py",
-    ]
-    critical_files.update(CORE_CONTRACTS)
+    # 0. 【新增】从 SyntaxError 信息中提取确切文件（优先级最高）
+    # 匹配格式: File "/workspace/backend/app/.../file.py", line X
+    syntax_file_pattern = re.findall(r'File "([^"]+)"', logs)
+    for f in syntax_file_pattern:
+        clean_f = f.replace("/workspace/backend/", "").replace("/workspace/", "").lstrip("/")
+        if clean_f.endswith(".py") and ('/app/' in clean_f or '/tests/' in clean_f):
+            syntax_error_files.add(clean_f)
+
+    # 1. 【已移除】不再强制注入核心契约文件
+    # 由 AI 使用工具自行探索需要的依赖文件
 
     # 2. 【全量收集】扫描所有可能的 Python 文件路径
     # 匹配：/workspace/backend/app/service/health_service.py
@@ -315,7 +326,11 @@ def extract_critical_files(logs: str, all_generated_paths: List[str]) -> List[st
         if clean_path not in critical_files:
             critical_files.add(clean_path)
 
-    return list(critical_files)[:8]  # 放宽到最多8个文件
+    # 【优先级排序】SyntaxError 文件排在最前面
+    # 先返回语法错误文件，再返回其他关键文件
+    ordered_files = list(syntax_error_files) + [f for f in critical_files if f not in syntax_error_files]
+
+    return ordered_files[:8]  # 放宽到最多8个文件
 
 
 def parse_local_imports(file_content: str, file_path: str) -> Set[str]:
@@ -518,7 +533,16 @@ def extract_critical_files_with_imports(
 
     1. 确定性提取：从 Traceback 提取所有提到的 app/*.py 和 tests/*.py
     2. 关联性提取：解析这些文件的 import，将引用的核心契约文件也加入
+    3. 【新增】SyntaxError 文件优先级最高
     """
+    # 第0步：【新增】从 SyntaxError 信息中提取确切文件（优先级最高）
+    syntax_error_files = set()
+    syntax_file_pattern = re.findall(r'File "([^"]+)"', logs)
+    for f in syntax_file_pattern:
+        clean_f = f.replace("/workspace/backend/", "").replace("/workspace/", "").lstrip("/")
+        if clean_f.endswith(".py") and ('/app/' in clean_f or '/tests/' in clean_f):
+            syntax_error_files.add(clean_f)
+
     # 第1步：确定性提取（从 Traceback）
     essential_paths = set(extract_critical_files(logs, all_generated_paths))
 
@@ -536,4 +560,7 @@ def extract_critical_files_with_imports(
             if core_file not in essential_paths:
                 essential_paths.add(core_file)
 
-    return list(essential_paths)[:10]  # 放宽到最多10个文件
+    # 【优先级排序】SyntaxError 文件排在最前面
+    ordered_paths = list(syntax_error_files) + [p for p in essential_paths if p not in syntax_error_files]
+
+    return ordered_paths[:10]  # 放宽到最多10个文件

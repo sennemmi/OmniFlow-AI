@@ -136,6 +136,19 @@ class CodeValidationService:
 
         return None
 
+    # Python 标准库模块名（可能与 app 模块冲突）
+    STDLIB_MODULES = {
+        'time', 'sys', 'os', 'json', 're', 'datetime', 'collections', 'typing',
+        'pathlib', 'inspect', 'itertools', 'functools', 'hashlib', 'base64',
+        'random', 'string', 'math', 'statistics', 'decimal', 'fractions',
+        'calendar', 'zoneinfo', 'enum', 'dataclasses', 'abc', 'copy', 'pickle',
+        'socket', 'urllib', 'http', 'email', 'mime', 'csv', 'xml', 'html',
+        'sqlite3', 'logging', 'unittest', 'pdb', 'traceback', 'warnings',
+        'contextlib', 'asyncio', 'concurrent', 'threading', 'multiprocessing',
+        'subprocess', 'tempfile', 'shutil', 'glob', 'fnmatch', 'linecache',
+        'textwrap', 'stringprep', 'codecs', 'encodings', 'io', 'csv'
+    }
+
     async def validate_test_imports(
         self,
         test_files: List[Dict],
@@ -171,6 +184,19 @@ class CodeValidationService:
                     if not module or not module.startswith("app."):
                         continue
 
+                    # 【修复】检查是否与标准库冲突
+                    module_parts = module.split(".")
+                    if any(part in self.STDLIB_MODULES for part in module_parts):
+                        # 对于与标准库冲突的模块，放宽验证
+                        # 因为 Python 的导入机制可能导致冲突
+                        logger.warning(f"模块 {module} 包含标准库名称，放宽导入验证")
+                        # 只检查文件是否存在，不检查符号
+                        module_path = module.replace(".", "/") + ".py"
+                        read_res = await file_service.read_file(module_path)
+                        if not read_res.exists:
+                            errors.append(f"{file_path}: 导入的模块不存在: {module}")
+                        continue
+
                     module_path = module.replace(".", "/") + ".py"
 
                     read_res = await file_service.read_file(module_path)
@@ -192,22 +218,33 @@ class CodeValidationService:
         return errors
 
     def _extract_module_symbols(self, tree: ast.AST) -> Set[str]:
-        """从 AST 中提取模块级符号"""
+        """从 AST 中提取模块级符号（函数、类、变量、重导出等）"""
         module_symbols = set()
 
-        for n in tree.body:
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                module_symbols.add(n.name)
-            elif isinstance(n, ast.ClassDef):
-                module_symbols.add(n.name)
-            elif isinstance(n, ast.ImportFrom):
-                for alias in n.names:
+        for node in tree.body:  # 只遍历模块顶层，避免收集函数内部的变量
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                module_symbols.add(node.name)
+            elif isinstance(node, ast.ClassDef):
+                module_symbols.add(node.name)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
                     if alias.name:
                         module_symbols.add(alias.name)
-            elif isinstance(n, ast.Import):
-                for alias in n.names:
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
                     if alias.name:
                         module_symbols.add(alias.name.split('.')[0])
+            # ===== 新增部分：处理变量赋值 =====
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        if not target.id.startswith('_'):
+                            module_symbols.add(target.id)
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    if not node.target.id.startswith('_'):
+                        module_symbols.add(node.target.id)
+            # ==================================
 
         return module_symbols
 

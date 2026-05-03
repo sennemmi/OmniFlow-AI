@@ -27,7 +27,8 @@ class TestPipelineStateTransitionRestriction:
     目的: 防止生命周期错乱。
     """
 
-    def test_cannot_reject_success_pipeline(self):
+    @pytest.mark.asyncio
+    async def test_cannot_reject_success_pipeline(self):
         """测试不能驳回已成功的 Pipeline"""
         # 创建模拟的 Pipeline 对象
         pipeline = MagicMock(spec=Pipeline)
@@ -38,37 +39,33 @@ class TestPipelineStateTransitionRestriction:
         pipeline.stages = []
 
         # 验证 validate_can_reject 会返回 False
-        can_reject, error_msg = asyncio.run(
-            WorkflowService.validate_can_reject(pipeline)
-        )
+        can_reject, error_msg = await WorkflowService.validate_can_reject(pipeline)
 
         assert can_reject is False
         assert error_msg is not None
         assert "SUCCESS" in error_msg or "cannot" in error_msg.lower()
 
-    def test_cannot_reject_failed_pipeline(self):
+    @pytest.mark.asyncio
+    async def test_cannot_reject_failed_pipeline(self):
         """测试不能驳回已失败的 Pipeline"""
         pipeline = MagicMock(spec=Pipeline)
         pipeline.id = 2
         pipeline.status = PipelineStatus.FAILED
         pipeline.current_stage = StageName.CODING
 
-        can_reject, error_msg = asyncio.run(
-            WorkflowService.validate_can_reject(pipeline)
-        )
+        can_reject, error_msg = await WorkflowService.validate_can_reject(pipeline)
 
         assert can_reject is False
 
-    def test_can_reject_running_pipeline(self):
+    @pytest.mark.asyncio
+    async def test_can_reject_running_pipeline(self):
         """测试可以驳回运行中的 Pipeline"""
         pipeline = MagicMock(spec=Pipeline)
         pipeline.id = 3
         pipeline.status = PipelineStatus.PAUSED  # 暂停状态可以驳回
         pipeline.current_stage = StageName.DESIGN
 
-        can_reject, error_msg = asyncio.run(
-            WorkflowService.validate_can_reject(pipeline)
-        )
+        can_reject, error_msg = await WorkflowService.validate_can_reject(pipeline)
 
         # PAUSED 状态的 Pipeline 应该可以驳回
         assert can_reject is True
@@ -205,45 +202,40 @@ class TestPipelineStageLifecycle:
 class TestWorkflowValidation:
     """工作流验证测试"""
 
-    def test_validate_can_approve_checks_status(self):
+    @pytest.mark.asyncio
+    async def test_validate_can_approve_checks_status(self):
         """测试验证能否审批时检查状态"""
         # 成功的 Pipeline 不能审批
         success_pipeline = MagicMock(spec=Pipeline)
         success_pipeline.status = PipelineStatus.SUCCESS
 
-        can_approve, error = asyncio.run(
-            WorkflowService.validate_can_approve(success_pipeline)
-        )
+        can_approve, error = await WorkflowService.validate_can_approve(success_pipeline)
         assert can_approve is False
 
         # 失败的 Pipeline 不能审批
         failed_pipeline = MagicMock(spec=Pipeline)
         failed_pipeline.status = PipelineStatus.FAILED
 
-        can_approve, error = asyncio.run(
-            WorkflowService.validate_can_approve(failed_pipeline)
-        )
+        can_approve, error = await WorkflowService.validate_can_approve(failed_pipeline)
         assert can_approve is False
 
-    def test_validate_can_approve_allows_paused(self):
+    @pytest.mark.asyncio
+    async def test_validate_can_approve_allows_paused(self):
         """测试暂停状态的 Pipeline 可以审批"""
         paused_pipeline = MagicMock(spec=Pipeline)
         paused_pipeline.status = PipelineStatus.PAUSED
         paused_pipeline.current_stage = StageName.DESIGN
 
-        can_approve, error = asyncio.run(
-            WorkflowService.validate_can_approve(paused_pipeline)
-        )
+        can_approve, error = await WorkflowService.validate_can_approve(paused_pipeline)
         assert can_approve is True
 
 
 class TestPipelineServiceRejection:
     """PipelineService 驳回功能测试"""
 
-    def test_reject_pipeline_validates_status(self):
+    @pytest.mark.asyncio
+    async def test_reject_pipeline_validates_status(self):
         """测试驳回 Pipeline 时验证状态"""
-        import asyncio
-
         # 模拟无法驳回的 Pipeline
         mock_pipeline = MagicMock(spec=Pipeline)
         mock_pipeline.id = 1
@@ -255,12 +247,12 @@ class TestPipelineServiceRejection:
             with patch('app.service.pipeline.WorkflowService.validate_can_reject') as mock_validate:
                 mock_validate.return_value = (False, "Cannot reject SUCCESS pipeline")
 
-                result = asyncio.run(PipelineService.reject_pipeline(
+                result = await PipelineService.reject_pipeline(
                     pipeline_id=1,
                     reason="Test",
                     suggested_changes=None,
                     session=MagicMock()
-                ))
+                )
 
                 assert result["success"] is False
                 assert "Cannot reject" in result["error"]

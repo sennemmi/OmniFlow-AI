@@ -197,10 +197,11 @@ mock_dependencies 字段格式：
 2. patch_target 必须与被测代码的 import 方式完全一致
 3. 不声明 mock_dependencies 会导致测试访问真实资源，测试失败！
 
-正确示例：
-{
+正确示例1 - 健康检查服务：
+```json
+{{
   "interface_specs": [
-    {
+    {{
       "symbol_name": "check_database_status",
       "module": "app/api/v1/health.py",
       "signature": "async def check_database_status() -> dict",
@@ -209,35 +210,95 @@ mock_dependencies 字段格式：
       "return_type": "dict",
       "covers_criteria": [1, 2],
       "return_fields": [
-        {"name": "status", "type": "str", "description": "数据库状态: up/down", "required": true},
-        {"name": "response_time_ms", "type": "float", "description": "响应时间(毫秒)", "required": true}
+        {{"name": "status", "type": "str", "description": "数据库状态: up/down", "required": true}},
+        {{"name": "response_time_ms", "type": "float", "description": "响应时间(毫秒)", "required": true}}
       ],
       "error_responses": [
-        {
+        {{
           "error_code": "SERVICE_UNAVAILABLE",
-          "message_format": "Service unavailable: {reason}",
+          "message_format": "Service unavailable: {{reason}}",
           "message_contains": ["unavailable", "service"],
           "status_code": 503
-        }
+        }}
       ]
-    },
-    {
-      "symbol_name": "check_disk_status",
-      "module": "app/utils/system_monitor.py",
-      "signature": "def check_disk_status() -> dict",
-      "expected_behavior": "返回磁盘使用状态",
+    }}
+  ]
+}}
+```
+
+正确示例2 - 用户服务：
+```json
+{{
+  "interface_specs": [
+    {{
+      "symbol_name": "get_user_profile",
+      "module": "app/api/v1/user.py",
+      "signature": "async def get_user_profile(user_id: int) -> dict",
+      "expected_behavior": "返回用户信息",
+      "is_async": true,
+      "return_type": "dict",
+      "covers_criteria": [1],
+      "return_fields": [
+        {{"name": "id", "type": "int", "description": "用户ID", "required": true}},
+        {{"name": "username", "type": "str", "description": "用户名", "required": true}},
+        {{"name": "email", "type": "str", "description": "邮箱地址", "required": true}}
+      ],
+      "error_responses": [
+        {{
+          "error_code": "USER_NOT_FOUND",
+          "message_format": "User not found: {{user_id}}",
+          "message_contains": ["not found"],
+          "status_code": 404
+        }}
+      ]
+    }},
+    {{
+      "symbol_name": "UserService",
+      "module": "app/service/user_service.py",
+      "signature": "class UserService",
+      "expected_behavior": "用户服务类，提供用户相关操作",
+      "is_async": false,
+      "return_type": "class",
+      "covers_criteria": [1, 2],
+      "return_fields": [],
+      "error_responses": []
+    }}
+  ]
+}}
+```
+
+正确示例3 - 时间戳服务：
+```json
+{{
+  "interface_specs": [
+    {{
+      "symbol_name": "get_current_timestamp",
+      "module": "app/service/timestamp_service.py",
+      "signature": "def get_current_timestamp() -> dict",
+      "expected_behavior": "返回当前时间戳",
       "is_async": false,
       "return_type": "dict",
-      "covers_criteria": [3],
+      "covers_criteria": [1],
       "return_fields": [
-        {"name": "status", "type": "str", "description": "磁盘状态: healthy/warning/critical", "required": true},
-        {"name": "usage_percent", "type": "float", "description": "使用百分比(0-100)", "required": true},
-        {"name": "free_gb", "type": "float", "description": "剩余空间(GB)", "required": true}
+        {{"name": "timestamp", "type": "float", "description": "Unix时间戳", "required": true}},
+        {{"name": "iso_format", "type": "str", "description": "ISO格式时间", "required": true}}
       ],
       "error_responses": []
-    }
+    }},
+    {{
+      "symbol_name": "timestamp_router",
+      "module": "app/api/v1/timestamp.py",
+      "signature": "timestamp_router = APIRouter()",
+      "expected_behavior": "时间戳 API 路由器",
+      "is_async": false,
+      "return_type": "APIRouter",
+      "covers_criteria": [1],
+      "return_fields": [],
+      "error_responses": []
+    }}
   ]
-}
+}}
+```
 
 【禁止】不要遗漏任何字段，不要假设 CoderAgent 会自己决定键名！
 
@@ -517,7 +578,7 @@ signature_change_reason: 无需修改，复用现有函数
                 model=f"openai/{settings.llm_model}",
                 messages=messages,
                 response_model=DesignerOutputV2,
-                temperature=0.7,
+                temperature=0.0,
                 max_retries=max_retries,
                 max_tokens=8192,
                 api_key=settings.llm_api_key,

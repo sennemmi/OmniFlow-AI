@@ -113,6 +113,15 @@ class Config(BaseSettings):
     GITHUB_OWNER: Optional[str] = None
     GITHUB_REPO: Optional[str] = None
 
+    # ============================================
+    # Agent 调试配置
+    # ============================================
+
+    # 是否启用 Agent 调试输出
+    AGENT_DEBUG_ENABLED: bool = True
+    # Agent 调试输出目录
+    AGENT_DEBUG_OUTPUT_DIR: str = "./agent_debug_output"
+
     class Config:
         env_file = ".env"
         case_sensitive = True

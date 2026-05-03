@@ -6,6 +6,7 @@
 - 执行测试验证
 - 支持测试失败时的 RepairerAgent 自动修复
 - 与 E2E 测试脚本保持一致
+- 【新增】集成 E2ETestService 统一测试服务
 """
 
 from typing import Any, Dict, List, Optional
@@ -13,9 +14,15 @@ import re
 
 from app.core.sse_log_buffer import push_log
 from app.models.pipeline import StageName, PipelineStatus
+from app.service.e2e_test_service import e2e_test_service
+from app.service.layered_test_runner import LayeredTestRunner
+from app.service.sandbox_file_service import SandboxFileService
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
 from app.service.workspace import async_workspace_context
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class TestingHandler(StageHandler):
@@ -90,6 +97,166 @@ class TestingHandler(StageHandler):
             "error_detail": "未知错误",
             "suggestion": "查看详细日志"
         }
+
+    async def _run_layered_tests(
+        self,
+        workspace_dir: str,
+        test_files: List[Dict],
+        code_files: List[Dict],
+        pipeline_id: int,
+        file_service=None
+    ) -> Dict[str, Any]:
+        """
+        【新增】使用 LayeredTestRunner 运行分层测试
+        
+        Args:
+            workspace_dir: 工作目录路径
+            test_files: 测试文件列表
+            code_files: 代码文件列表
+            pipeline_id: Pipeline ID
+            file_service: 可选的文件服务（Docker 环境）
+            
+        Returns:
+            Dict: 测试结果
+        """
+        await push_log(
+            pipeline_id,
+            "info",
+            "🔍 使用分层测试运行器执行测试...",
+            stage="UNIT_TESTING"
+        )
+        
+        # 合并代码文件和测试文件
+        all_files = code_files + test_files
+        
+        # 运行分层测试
+        layered_result = await LayeredTestRunner.run(
+            workspace_path=workspace_dir,
+            new_files=all_files,
+            sandbox_port=None,  # TODO: 从配置获取
+            timeout=120,
+            file_service=file_service
+        )
+        
+        # 转换结果为统一格式
+        result = {
+            "success": layered_result.all_passed,
+            "logs": "\n\n".join([layer.logs for layer in layered_result.layers]),
+            "summary": f"分层测试: {len([l for l in layered_result.layers if l.passed])}/{len(layered_result.layers)} 层通过",
+            "failed_tests": layered_result.failed_tests,
+            "layered_result": {
+                "all_passed": layered_result.all_passed,
+                "failure_cause": layered_result.failure_cause,
+                "layers": [
+                    {
+                        "layer": layer.layer,
+                        "passed": layer.passed,
+                        "summary": layer.summary,
+                        "failed_tests": layer.failed_tests,
+                        "error_type": layer.error_type
+                    }
+                    for layer in layered_result.layers
+                ]
+            }
+        }
+        
+        # 记录每层的结果
+        for layer in layered_result.layers:
+            status = "✅" if layer.passed else "❌"
+            await push_log(
+                pipeline_id,
+                "info" if layer.passed else "warning",
+                f"{status} {layer.layer}: {layer.summary}",
+                stage="UNIT_TESTING"
+            )
+        
+        return result
+
+    async def _run_preliminary_test(
+        self,
+        pipeline_id: int,
+        test_files: List[Dict],
+        code_files: List[Dict],
+        workspace_dir: str,
+        file_service=None
+    ) -> Dict[str, Any]:
+        """
+        【新增】运行预测试：快速验证新生成的测试文件
+        
+        在完整测试套件之前运行，用于快速发现问题
+        
+        Args:
+            pipeline_id: Pipeline ID
+            test_files: 测试文件列表
+            code_files: 代码文件列表
+            workspace_dir: 工作目录路径
+            file_service: 可选的文件服务（Docker 环境）
+            
+        Returns:
+            Dict: 预测试结果
+        """
+        await push_log(
+            pipeline_id,
+            "info",
+            "🧪 运行预测试（快速验证新测试文件）...",
+            stage="UNIT_TESTING"
+        )
+        
+        try:
+            # 如果没有提供 file_service，创建一个临时的
+            if file_service is None:
+                file_service = SandboxFileService(workspace_dir)
+                # 上传代码文件
+                for cf in code_files:
+                    fp = cf.get("file_path", "")
+                    content = cf.get("content", "")
+                    if fp and content:
+                        await file_service.write_file(fp, content)
+                # 上传测试文件
+                for tf in test_files:
+                    fp = tf.get("file_path", "")
+                    content = tf.get("content", "")
+                    if fp and content:
+                        await file_service.write_file(fp, content)
+            
+            # 调用 E2ETestService 的预测试方法
+            result = await e2e_test_service.run_preliminary_test(
+                pipeline_id=pipeline_id,
+                test_files=test_files,
+                file_service=file_service
+            )
+            
+            if result.get("success"):
+                await push_log(
+                    pipeline_id,
+                    "success",
+                    "✅ 预测试通过",
+                    stage="UNIT_TESTING"
+                )
+            else:
+                failed_count = len(result.get("failed_tests", []))
+                await push_log(
+                    pipeline_id,
+                    "warning" if failed_count > 0 else "info",
+                    f"⚠️ 预测试发现问题: {failed_count} 个测试失败",
+                    stage="UNIT_TESTING"
+                )
+                
+            return result
+            
+        except Exception as e:
+            await push_log(
+                pipeline_id,
+                "error",
+                f"❌ 预测试执行失败: {str(e)}",
+                stage="UNIT_TESTING"
+            )
+            return {
+                "success": False,
+                "logs": str(e),
+                "failed_tests": [],
+                "error": str(e)
+            }
 
     async def _generate_tests_with_retry(
         self,
@@ -172,8 +339,43 @@ class TestingHandler(StageHandler):
                         file_path = f"tests/{file_path}"
                     executor.apply_changes({file_path: content}, create_if_missing=True)
 
-            # 运行测试验证
-            await push_log(pipeline_id, "info", "运行测试验证...", stage="UNIT_TESTING")
+            # 【新增】运行预测试（快速验证新测试文件）
+            workspace_dir = str(executor.workspace_dir)
+            preliminary_result = await self._run_preliminary_test(
+                pipeline_id=pipeline_id,
+                test_files=test_files,
+                code_files=[],  # 代码文件已在工作区中
+                workspace_dir=workspace_dir
+            )
+            
+            # 如果预测试失败且是测试文件本身的问题，直接返回错误以便重试
+            if not preliminary_result.get("success"):
+                logs = preliminary_result.get("logs", "")
+                failure_analysis = self._analyze_test_failure(logs)
+                
+                if failure_analysis.get("is_test_file_error") and retry_count < self.MAX_TEST_RETRIES:
+                    retry_count += 1
+                    last_error_context = f"""
+【预测试失败 - 第 {retry_count} 次重试】
+错误类型: {failure_analysis['error_type']}
+错误详情: {failure_analysis['error_detail']}
+建议: {failure_analysis['suggestion']}
+
+【预测试日志】
+{logs[:2000]}
+
+请修复测试文件中的错误并重新生成。
+"""
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"⚠️ 预测试发现测试文件错误，准备重试 ({retry_count}/{self.MAX_TEST_RETRIES})...",
+                        stage="UNIT_TESTING"
+                    )
+                    continue
+
+            # 运行完整测试验证
+            await push_log(pipeline_id, "info", "运行完整测试验证...", stage="UNIT_TESTING")
             test_run_result = await test_runner.run_tests(str(executor.workspace_dir))
 
             if test_run_result["success"]:
@@ -260,7 +462,7 @@ class TestingHandler(StageHandler):
         """
         from app.agents.repairer_with_tools import RepairerAgentWithTools
         from app.utils.repair_utils import (
-            extract_critical_files_with_imports,
+            extract_critical_files,
             build_fix_order,
             extract_pytest_failures,
             extract_file_paths
@@ -278,20 +480,34 @@ class TestingHandler(StageHandler):
         all_generated_files = code_files + test_files
         generated_file_paths = extract_file_paths(all_generated_files)
 
-        # 读取所有文件内容
+        # 读取所有文件内容（带大小限制）
         file_contents = {}
+        MAX_FILE_SIZE = 8000  # 最大字符数，超过则截断
+
         for path in generated_file_paths:
             # 从 executor 读取文件内容
             try:
                 content = executor.read_file(path.replace("backend/", "").replace("backend\\", ""))
                 if content:
-                    file_contents[path] = content
+                    # 【新增】文件大小限制，超过则截断
+                    if len(content) > MAX_FILE_SIZE:
+                        truncated_content = content[:MAX_FILE_SIZE] + "\n\n# ... (文件内容已截断，共 " + str(len(content)) + " 字符)"
+                        file_contents[path] = truncated_content
+                        logger.warning(f"[TestingHandler] 文件 {path} 过大 ({len(content)} 字符)，已截断至 {MAX_FILE_SIZE}")
+                    else:
+                        file_contents[path] = content
             except Exception:
                 # 如果读取失败，尝试从 code_files/test_files 获取
                 for f in all_generated_files:
                     if f.get("file_path") == path:
                         if f.get("content"):
-                            file_contents[path] = f["content"]
+                            content = f["content"]
+                            # 【新增】同样应用大小限制
+                            if len(content) > MAX_FILE_SIZE:
+                                truncated_content = content[:MAX_FILE_SIZE] + "\n\n# ... (文件内容已截断，共 " + str(len(content)) + " 字符)"
+                                file_contents[path] = truncated_content
+                            else:
+                                file_contents[path] = content
                         break
 
         # 提取失败测试列表
@@ -314,17 +530,22 @@ class TestingHandler(StageHandler):
                 stage="UNIT_TESTING"
             )
 
-            # 提取关键文件（含 import 关联）
-            essential_paths = extract_critical_files_with_imports(
+            # 【更新】使用简化版文件选择策略（不再主动包含 import 关联）
+            essential_paths = extract_critical_files(
                 logs=test_logs,
-                all_generated_paths=generated_file_paths,
-                file_contents=file_contents
+                all_generated_paths=generated_file_paths
             )
 
             await push_log(
                 pipeline_id,
                 "info",
-                f"🎯 精选 {len(essential_paths)} 个核心文件进行修复",
+                f"🎯 精选 {len(essential_paths)} 个核心文件进行修复（Traceback 关联）",
+                stage="UNIT_TESTING"
+            )
+            await push_log(
+                pipeline_id,
+                "info",
+                "💡 RepairerAgent 可使用 read_file/glob/grep 等工具探索 import 依赖",
                 stage="UNIT_TESTING"
             )
 

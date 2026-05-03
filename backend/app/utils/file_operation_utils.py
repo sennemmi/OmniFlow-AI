@@ -354,12 +354,13 @@ def build_fix_instruction_with_context(
     if force_full_file:
         instruction += """
 【逃生舱模式 - 极其重要】
-由于前几次修复失败，现在进入强制完整文件覆盖模式：
+由于前几次修复失败，现在进入强制完整文件覆盖模式（如果你需要修改的文件极长，请酌情使用 modify）：
 1. 必须输出 change_type="add" 和完整的 content
 2. 不要输出 search_block 或 replace_block
 3. 仔细检查所有括号是否匹配（每有一个 { 必须有一个 }）
 4. 【关键】确保文件内容以换行符（\n）结尾
 5. 这是最后一次机会，如果仍然失败，工作将被拒绝！
+6. 【重要】如果文件超过 300 行或 6000 字符，不要使用 add 模式输出完整内容，改用 modify 模式分段修复
 
 【修复 checklist】
 □ 所有括号 {} () [] 都正确匹配

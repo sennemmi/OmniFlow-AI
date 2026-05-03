@@ -77,7 +77,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
         user_prompt: str,
         project_path: str,
         pipeline_id: int = 0,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         max_retries: int = 3,
         response_format: Optional[Dict[str, Any]] = None
@@ -112,6 +112,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
         total_output_tokens = 0
         tool_call_count = 0
         tool_results = []  # 记录所有工具执行结果
+        consecutive_code_apply_failures = 0  # code_apply 连续失败计数
+        switched_to_legacy_mode = False  # 是否已切换到 LEGACY 模式
 
         # 【重试机制】空内容重试计数
         empty_content_retries = 0
@@ -223,6 +225,34 @@ class ToolUsingAgent(LangGraphAgent[T]):
                                 "result": result_data,
                                 "success": result_data.get("success", True)
                             })
+
+                            # 【智能回退】检测 code_apply 连续失败
+                            if tool_name == "code_apply":
+                                if not result_data.get("success", False):
+                                    consecutive_code_apply_failures += 1
+                                    logger.warning(
+                                        f"[{self.agent_name}] code_apply 连续失败 {consecutive_code_apply_failures} 次"
+                                    )
+
+                                    if consecutive_code_apply_failures >= 3 and not switched_to_legacy_mode:
+                                        # 自动切换到 LEGACY 模式
+                                        switched_to_legacy_mode = True
+                                        logger.warning(
+                                            f"[{self.agent_name}] code_apply 连续失败 {consecutive_code_apply_failures} 次,"
+                                            f"切换到 LEGACY 模式(生成完整文件)"
+                                        )
+                                        # 注入切换指令到 messages
+                                        messages.append({
+                                            "role": "user",
+                                            "content": (
+                                                "【流程切换通知】由于 code_apply 工具多次失败,"
+                                                "系统已自动切换为 LEGACY 模式。请直接输出完整的 JSON 格式,"
+                                                "包含所有文件的 search_block/replace_block。"
+                                            )
+                                        })
+                                else:
+                                    # 成功后重置计数器
+                                    consecutive_code_apply_failures = 0
                         except:
                             tool_results.append({
                                 "tool": tool_name,
@@ -370,8 +400,9 @@ class ToolUsingAgent(LangGraphAgent[T]):
             final_call_params = {
                 "model": settings.llm_model,
                 "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": max_tokens or 4096,  # 使用较大的 max_tokens 确保输出完整
+                "temperature": 0.0,
+                # 【防截断补丁】在逃生舱模式下，必须给予足够的 Token 输出超长文件
+                "max_tokens": 16384,
                 "api_key": settings.llm_api_key,
                 "api_base": settings.llm_api_base,
                 "custom_llm_provider": "openai"
@@ -455,6 +486,12 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 max_tokens=max_tokens,
                 response_format=response_format
             )
+            
+            # 【调试】记录 _call_llm_with_tools 返回的 tool_results
+            logger.info(f"[{self.agent_name}] _call_llm_with_tools 返回的 tool_calls: {result.get('tool_calls', 0)}")
+            logger.info(f"[{self.agent_name}] _call_llm_with_tools 返回的 tool_results 数量: {len(result.get('tool_results', []))}")
+            if result.get("tool_results"):
+                logger.info(f"[{self.agent_name}] tool_results 第一项: {result.get('tool_results')[0]}")
 
             # 提取本次工具调用中读取过的文件内容（用于传递给下游 Agent）
             injected_files = {}

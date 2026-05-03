@@ -457,7 +457,7 @@ class ContextBuilderService:
         Returns:
             str: 格式化的常驻上下文字符串，包含所有地基文件的内容
         """
-        context_parts = ["【核心基础设施定义 - 禁止修改，仅供参考其签名和用法】\n"]
+        context_parts = ["【核心基础设施定义 - 极其重要 (SSOT)】\n绝对禁止通过自行猜测或查阅过时文档来调用这些基建，必须严格按照以下实际签名使用！\n"]
 
         for rel_path in EVERGREEN_FILES:
             full_path = project_path / "backend" / rel_path

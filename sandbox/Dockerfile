@@ -36,5 +36,3 @@ RUN mkdir -p /workspace/backend/data
 # 工作目录（main.py 在 backend/ 根目录）
 WORKDIR /workspace/backend
 
-# 默认命令：启动后端服务
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"]

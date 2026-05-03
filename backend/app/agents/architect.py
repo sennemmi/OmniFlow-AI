@@ -272,12 +272,12 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 - module: 所在模块（如 "app/service/health_service.py"）
 - signature: 函数签名（可选，如 "async def check_database_status() -> dict"）
 - description: 简短描述（可选）
-- **return_fields_contract: 【新增】返回值字典必须包含的键名列表（极其重要！）**
+- **return_fields: 【契约强制执行】返回值字段规范列表（极其重要！）**
 
-**【P0】return_fields_contract 强制要求**：
-对于返回 dict 的函数，你必须明确列出所有返回键名。这是机器可强制执行的契约，CoderAgent 将据此校验实现。
+**【P0】return_fields 强制要求**：
+对于返回 dict 的函数，你必须明确列出所有返回字段的名称、类型和描述。这是机器可强制执行的契约，CoderAgent 将据此校验实现。
 
-示例：
+示例1 - 健康检查服务：
 ```json
 {{
   "required_symbols": [
@@ -286,14 +286,61 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
       "type": "function",
       "module": "app/service/health_service.py",
       "signature": "async def check_database_status() -> dict",
-      "return_fields_contract": ["status", "response_time_ms"]
+      "return_fields": [
+        {{"name": "status", "type": "str", "description": "数据库状态: up/down"}},
+        {{"name": "response_time_ms", "type": "float", "description": "响应时间(毫秒)"}}
+      ]
+    }}
+  ]
+}}
+```
+
+示例2 - 用户服务：
+```json
+{{
+  "required_symbols": [
+    {{
+      "name": "get_user_profile",
+      "type": "function",
+      "module": "app/service/user_service.py",
+      "signature": "async def get_user_profile(user_id: int) -> dict",
+      "return_fields": [
+        {{"name": "id", "type": "int", "description": "用户ID"}},
+        {{"name": "username", "type": "str", "description": "用户名"}},
+        {{"name": "email", "type": "str", "description": "邮箱地址"}}
+      ]
     }},
     {{
-      "name": "calculate_health_score",
+      "name": "UserService",
+      "type": "class",
+      "module": "app/service/user_service.py",
+      "signature": "class UserService",
+      "return_fields": []
+    }}
+  ]
+}}
+```
+
+示例3 - 时间戳服务：
+```json
+{{
+  "required_symbols": [
+    {{
+      "name": "get_current_timestamp",
       "type": "function",
-      "module": "app/service/health_service.py",
-      "signature": "def calculate_health_score(components: dict) -> tuple[int, str]",
-      "return_fields_contract": []
+      "module": "app/service/timestamp_service.py",
+      "signature": "def get_current_timestamp() -> dict",
+      "return_fields": [
+        {{"name": "timestamp", "type": "float", "description": "Unix时间戳"}},
+        {{"name": "iso_format", "type": "str", "description": "ISO格式时间"}}
+      ]
+    }},
+    {{
+      "name": "timestamp_router",
+      "type": "variable",
+      "module": "app/api/v1/timestamp.py",
+      "signature": "timestamp_router = APIRouter()",
+      "return_fields": []
     }}
   ]
 }}
@@ -302,8 +349,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 **重要规则**：
 1. required_symbols 中的每个符号都必须在 affected_files 中对应的文件里实现
 2. 验收标准中提到的函数/类，必须在 required_symbols 中列出
-3. **如果函数返回 dict，return_fields_contract 必须非空，列出所有键名**
-4. DesignerAgent 会严格对照此清单生成 interface_specs，遗漏任何符号或键名都会导致重试
+3. **如果函数返回 dict，return_fields 必须非空，列出所有字段**
+4. DesignerAgent 会严格对照此清单生成 interface_specs，遗漏任何符号或字段都会导致重试
 5. 【绝对禁止】如果某个功能由类的方法实现（例如 HealthService 类的 get_component_health 方法），你只能将【类名】（HealthService）放入 required_symbols，严禁将类方法名作为独立的符号放入清单！
 
 【注意事项】
@@ -311,15 +358,30 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 - 遵循项目现有的架构分层规范
 - 基于实际读取的代码进行分析，不要假设
 
+【极其重要：防止偷懒规则】
+即便功能已经存在，也请将相关的核心文件放入 affected_files 列表中，以便进行代码质量检查和契约验证。
+不要以"功能已存在"为由返回空的 affected_files！
+
 【硬性规则 - 违反将导致输出被拒绝】
-在输出最终 JSON 之前，你必须至少使用一次 read_file 读取 affected_files 中列出的每一个文件。
-如果你没有读取所有相关文件的内容，你的输出将被系统拒绝并要求重新探索。
+在输出最终 JSON 之前，你必须至少使用一次 read_file 尝试读取 affected_files 中列出的每一个文件。
+
+【⚠️ 新文件处理规则 - 极其重要】
+当 read_file 返回 `{{"exists": false}}` 时，表示该文件不存在（需要新建）。此时：
+1. **不要惊慌**：文件不存在是正常情况，表示需要创建新文件
+2. **继续设计**：在 required_symbols 中指定需要在该新文件中实现的符号
+3. **明确标注**：在 technical_design 中说明"该文件需要新建"
+4. **参考现有代码**：查看项目中类似的文件结构，确保新文件符合项目规范
+
+示例：
+- read_file 返回 `{{"exists": false, "error": "File not found"}}` → 文件不存在，需要新建
+- 你应该在 affected_files 中保留该文件路径，并在 required_symbols 中定义需要实现的符号
 
 读取检查清单（输出前必须完成）：
-□ 是否使用 read_file 读取了所有 affected_files 中的文件？
+□ 是否使用 read_file 尝试读取了所有 affected_files 中的文件？
+□ 对于不存在的文件，是否在 technical_design 中标注"需要新建"？
 □ 是否使用 grep_ast 搜索了关键函数/类的定义？
 □ 是否理解了现有代码的函数签名、返回结构、字典键名？
-□ 输出的 required_symbols 是否与读取的代码一致？
+□ 输出的 required_symbols 是否与读取的代码一致（对于已存在的文件）？
 
 警告：如果你输出的 required_symbols 与现有代码冲突（如要求实现已存在的函数但签名不同），
 或要求返回与现有代码不一致的字典键名，你的设计将被拒绝！
@@ -738,6 +800,20 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         design_tool_calls = design_result.get("tool_calls", 0)
         total_tool_calls = exploration_tool_calls + design_tool_calls
 
+        # 【新增】合并 tool_results
+        exploration_tool_results = exploration_result.get("tool_results", [])
+        design_tool_results = design_result.get("tool_results", [])
+        all_tool_results = exploration_tool_results + design_tool_results
+        
+        # 【调试】记录 tool_results 的详细信息
+        logger.info(f"[ArchitectAgent] exploration_tool_results 数量: {len(exploration_tool_results)}")
+        logger.info(f"[ArchitectAgent] design_tool_results 数量: {len(design_tool_results)}")
+        logger.info(f"[ArchitectAgent] all_tool_results 数量: {len(all_tool_results)}")
+        if exploration_tool_results:
+            logger.info(f"[ArchitectAgent] exploration_tool_results 第一项: {exploration_tool_results[0]}")
+        if design_tool_results:
+            logger.info(f"[ArchitectAgent] design_tool_results 第一项: {design_tool_results[0]}")
+
         # 合并结果
         if design_result.get("success"):
             # 将 injected_files 添加到结果中
@@ -749,6 +825,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             design_result["tool_calls"] = total_tool_calls
             design_result["exploration_tool_calls"] = exploration_tool_calls
             design_result["design_tool_calls"] = design_tool_calls
+            # 【新增】保存合并后的 tool_results
+            design_result["tool_results"] = all_tool_results
 
             logger.info(f"[ArchitectAgent] 两步式分析完成，成功生成设计方案（共使用 {total_tool_calls} 次工具调用）")
             if pipeline_id:
@@ -758,6 +836,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             design_result["tool_calls"] = total_tool_calls
             design_result["exploration_tool_calls"] = exploration_tool_calls
             design_result["design_tool_calls"] = design_tool_calls
+            # 【新增】保存合并后的 tool_results
+            design_result["tool_results"] = all_tool_results
 
         # 【关键】调用工具探索配额检查
         await self._enforce_tool_exploration_quota(design_result, pipeline_id)
@@ -772,10 +852,10 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                 # 【简化】合并 P0-1 日志，只保留一条汇总日志
                 symbols_with_contract = [
                     s for s in required_symbols 
-                    if s.get("return_fields_contract")
+                    if s.get("return_fields")
                 ]
                 if symbols_with_contract:
-                    contract_summary = {s.get("name"): s.get("return_fields_contract") for s in symbols_with_contract}
+                    contract_summary = {s.get("name"): [f.get("name") for f in s.get("return_fields", [])] for s in symbols_with_contract}
                     logger.info(f"[ArchitectAgent] 发现 {len(symbols_with_contract)} 个带契约的符号", extra={
                         "pipeline_id": pipeline_id,
                         "contract_summary": contract_summary
@@ -1086,6 +1166,15 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             
             # 检查是否调用了工具
             tool_call_count = result.get("tool_calls", 0)
+            tool_results_from_execute = result.get("tool_results", [])
+            
+            # 【调试】记录 tool_results 的详细信息
+            logger.info(f"[ArchitectAgent] 探索阶段 result.get('tool_calls'): {tool_call_count}")
+            logger.info(f"[ArchitectAgent] 探索阶段 result.get('tool_results') 数量: {len(tool_results_from_execute)}")
+            if tool_results_from_execute:
+                logger.info(f"[ArchitectAgent] 探索阶段 tool_results 第一项: {tool_results_from_execute[0]}")
+            else:
+                logger.warning(f"[ArchitectAgent] 探索阶段 tool_results 为空！result keys: {result.keys()}")
             
             if tool_call_count > 0:
                 logger.info(f"[ArchitectAgent] 探索阶段成功调用 {tool_call_count} 次工具")
@@ -1157,7 +1246,14 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     full_contents[clean_path] = result.content
                     logger.info(f"[ArchitectAgent] 成功读取文件: {clean_path} ({len(result.content)} 字符)")
                 else:
-                    logger.warning(f"[ArchitectAgent] 无法读取文件: {clean_path}, error={result.error}")
+                    # 【改进】区分"文件不存在"和"读取错误"
+                    error_msg = result.error or ""
+                    if "No such file" in error_msg or "not found" in error_msg.lower():
+                        # 文件不存在，标记为新文件（需要创建）
+                        full_contents[clean_path] = ""  # 空内容表示新文件
+                        logger.info(f"[ArchitectAgent] 文件不存在，将作为新文件创建: {clean_path}")
+                    else:
+                        logger.warning(f"[ArchitectAgent] 无法读取文件: {clean_path}, error={result.error}")
             except Exception as e:
                 logger.error(f"[ArchitectAgent] 读取文件失败: {clean_path} - {e}")
         
@@ -1212,6 +1308,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     "output_tokens": result.get("output_tokens", 0),
                     "duration_ms": result.get("duration_ms", 0),
                     "tool_calls": result.get("tool_calls", 0),
+                    "tool_results": result.get("tool_results", []),
                     "raw_output": result["content"]
                 }
             except Exception as e:
@@ -1223,6 +1320,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                     "output_tokens": result.get("output_tokens", 0),
                     "duration_ms": result.get("duration_ms", 0),
                     "tool_calls": result.get("tool_calls", 0),
+                    "tool_results": result.get("tool_results", []),
                     "raw_output": result.get("content", "")[:500]
                 }
         else:
@@ -1233,6 +1331,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                 "output_tokens": result.get("output_tokens", 0),
                 "duration_ms": result.get("duration_ms", 0),
                 "tool_calls": result.get("tool_calls", 0),
+                "tool_results": result.get("tool_results", []),
                 "raw_output": ""
             }
 
@@ -1253,14 +1352,35 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         
         # 构建文件内容部分
         files_section = []
+        new_files = []  # 新文件列表
         for file_path, content in full_file_contents.items():
-            files_section.append(f"""
+            if content == "":
+                # 空内容表示新文件
+                new_files.append(file_path)
+                files_section.append(f"""
+=== 文件: {file_path} (🆕 新文件，需要创建) ===
+该文件不存在，需要新建。请参考项目现有代码结构设计实现。
+""")
+            else:
+                files_section.append(f"""
 === 文件: {file_path} ===
 ```python
 {content}
 ```
 """)
         files_str = "\n".join(files_section)
+        
+        # 构建新文件提示
+        new_files_hint = ""
+        if new_files:
+            new_files_hint = f"""
+
+【🆕 新文件提示】
+以下文件不存在，需要新建：
+{chr(10).join(f'- {f}' for f in new_files)}
+
+请在 required_symbols 中指定需要在这些新文件中实现的符号。
+"""
         
         # 构建探索阶段的结论
         exploration_summary = f"""
@@ -1274,7 +1394,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 {requirement}
 
 {exploration_summary}
-
+{new_files_hint}
 【受影响文件列表】
 {affected_files}
 
@@ -1288,11 +1408,12 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 1. `feature_description`: 用一句话总结功能（可以基于探索阶段的结论优化）
 2. `affected_files`: 受影响文件列表（与上面列表一致）
 3. `estimated_effort`: 预估工作量
-4. `technical_design`: 详细的技术方案（基于完整代码分析）
+4. `technical_design`: 详细的技术方案（基于完整代码分析，对于新文件说明需要实现的逻辑）
 5. `acceptance_criteria`: 3-5 条可验证的验收标准
 6. `required_symbols`: 必需实现的符号清单（基于代码分析）
    - 每个符号必须包含: name, type, module, signature
    - 只列出需要修改或新增的符号
+   - 对于新文件，列出需要在该文件中实现的所有符号
 
 【输出格式】
 直接输出纯 JSON，不要有任何前缀或后缀。

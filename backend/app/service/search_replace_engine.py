@@ -5,7 +5,9 @@
 """
 
 import difflib
+import json
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -179,6 +181,16 @@ class SearchReplaceEngine:
             return original.replace(search_block, replace_block, 1)
         logger.debug("[SearchReplace] 第1级匹配失败: 精确匹配未找到")
 
+        # 记录第1级失败数据
+        failure_info = {
+            "level": "exact_match_failed",
+            "file_size": len(original),
+            "search_block_size": len(search_block),
+            "first_line_match": search_block.split("\n")[0][:50] in original if search_block else False,
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info(f"[SearchReplace:Failure] {json.dumps(failure_info)}")
+
         # 第2级：换行符归一化匹配
         orig_norm = original.replace('\r\n', '\n')
         search_norm = search_block.replace('\r\n', '\n')
@@ -187,6 +199,15 @@ class SearchReplaceEngine:
             logger.info("[SearchReplace] 第2级匹配成功: 换行符归一化匹配")
             return orig_norm.replace(search_norm, repl_norm, 1)
         logger.debug("[SearchReplace] 第2级匹配失败: 换行符归一化匹配未找到")
+
+        # 记录第2级失败数据
+        failure_info = {
+            "level": "newline_normalization_failed",
+            "file_has_crln": '\r\n' in original,
+            "search_has_crln": '\r\n' in search_block,
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info(f"[SearchReplace:Failure] {json.dumps(failure_info)}")
 
         # 第3级：行级别宽松匹配（忽略首尾空格）
         def clean_lines(text: str) -> List[str]:
@@ -235,8 +256,25 @@ class SearchReplaceEngine:
                     return '\n'.join(new_lines)
             if not match_found:
                 logger.debug(f"[SearchReplace] 第3级匹配失败: 未找到匹配的清洗后代码块")
+                # 记录第3级失败数据
+                failure_info = {
+                    "level": "line_level_relaxed_failed",
+                    "orig_lines_clean_count": len(orig_lines_clean),
+                    "search_lines_clean_count": len(search_lines_clean),
+                    "timestamp": datetime.now().isoformat()
+                }
+                logger.info(f"[SearchReplace:Failure] {json.dumps(failure_info)}")
         else:
             logger.warning(f"[SearchReplace] 第3级匹配跳过: 搜索块为空或比原文件长")
+            # 记录第3级跳过数据
+            failure_info = {
+                "level": "line_level_relaxed_skipped",
+                "reason": "search_empty_or_too_long",
+                "search_len": search_len,
+                "orig_clean_len": len(orig_lines_clean),
+                "timestamp": datetime.now().isoformat()
+            }
+            logger.info(f"[SearchReplace:Failure] {json.dumps(failure_info)}")
 
         # 第4级：行号回退
         if fallback_start and fallback_end:
@@ -251,6 +289,16 @@ class SearchReplaceEngine:
                 logger.warning(f"[SearchReplace] 第4级匹配失败: fallback 行号 {fallback_start}-{fallback_end} 超出范围 (文件共 {total_lines} 行)")
         else:
             logger.debug(f"[SearchReplace] 第4级匹配跳过: 未提供 fallback 行号")
+
+        # 记录最终失败数据
+        failure_info = {
+            "level": "all_levels_failed",
+            "fallback_provided": fallback_start is not None and fallback_end is not None,
+            "fallback_start": fallback_start,
+            "fallback_end": fallback_end,
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info(f"[SearchReplace:Failure] {json.dumps(failure_info)}")
 
         logger.error("[SearchReplace] 所有匹配级别都失败，搜索替换完全失败")
         return None  # 完全失败

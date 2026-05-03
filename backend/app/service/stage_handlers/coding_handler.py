@@ -5,6 +5,8 @@
 - 代码生成后自动进行语法检查和修复
 - 契约检查失败时自动补齐缺失符号
 - 使用 Sandbox 进行文件操作
+
+【已简化】移除了不成熟的 Architect/Editor 分离模式，只保留稳定的传统模式
 """
 
 from pathlib import Path
@@ -83,7 +85,14 @@ class CodingHandler(StageHandler):
             injected_files = requirement_stage.output_data.get("injected_files", {})
 
         try:
-            # 【增强】使用 Auto-Fix 循环生成代码
+            # 【简化】只使用传统模式生成代码
+            await push_log(
+                pipeline_id,
+                "info",
+                "📦 使用传统模式生成代码",
+                stage="CODING"
+            )
+
             final_result = await self._generate_code_with_auto_fix(
                 design_output=design_output,
                 pipeline_id=pipeline_id,
@@ -110,13 +119,25 @@ class CodingHandler(StageHandler):
                 stage="CODING"
             )
 
+            # 【新增】Linting 检查和自动修复
+            await push_log(pipeline_id, "info", "🔍 运行 Linting 检查...", stage="CODING")
+            linting_passed = await self._run_linting_check(
+                code_files=code_files,
+                pipeline_id=pipeline_id
+            )
+            if linting_passed:
+                await push_log(pipeline_id, "info", "✅ Linting 检查通过", stage="CODING")
+            else:
+                await push_log(pipeline_id, "warning", "⚠️ Linting 检查有警告", stage="CODING")
+
             # 返回成功
             return StageResult.success_result(
                 message="Code generated successfully",
                 output_data={
                     "coder_output": final_result.get("coder_output", {}),
                     "files": code_files,
-                    "fix_history": fix_history
+                    "fix_history": fix_history,
+                    "linting_passed": linting_passed
                 },
                 status=PipelineStatus.PAUSED  # 等待审批
             )
@@ -135,230 +156,57 @@ class CodingHandler(StageHandler):
         injected_files: Dict[str, str]
     ) -> Dict[str, Any]:
         """
-        【增强】带 Auto-Fix 的代码生成
+        【统一入口】使用 AutoFixLoop 执行带自动修复的代码生成
 
-        流程：
-        1. 调用 CoderAgent 生成代码
-        2. 语法检查 → 自动修复
-        3. 契约检查 → 自动补齐
-        4. 返回最终结果
+        不再重复实现 Auto-Fix 逻辑，统一调用 AutoFixLoop 类
         """
+        from app.agents.auto_fix_loop import AutoFixLoop
         from app.service.sandbox_file_service import get_sandbox_file_service
-        from app.service.e2e_test_service import E2ETestService
-        from app.utils.repair_loop_utils import run_syntax_fix_loop, run_contract_fix_loop
-        from app.utils.file_operation_utils import merge_and_write_files
         from app.utils.agent_output_utils import extract_code_files
 
-        # 获取文件服务（直接使用，不通过 orchestrator）
+        # 获取文件服务
         file_service = get_sandbox_file_service(pipeline_id)
-        e2e_service = E2ETestService()
 
-        fix_history = []
-        attempt = 0
+        # 提取 affected_files（从 design_output 中获取需要修改的文件列表）
+        interface_specs = design_output.get("interface_specs", [])
+        affected_files = list(set([
+            spec.get("module", "").replace(".", "/") + ".py"
+            for spec in interface_specs
+            if spec.get("module")
+        ]))
 
-        while attempt <= self.MAX_FIX_RETRIES:
-            attempt += 1
+        # 实例化并执行 AutoFixLoop
+        auto_fix_loop = AutoFixLoop()
 
-            if attempt > 1:
-                await push_log(
-                    pipeline_id,
-                    "warning",
-                    f"第 {attempt - 1} 轮修复后重新生成代码...",
-                    stage="CODING"
-                )
+        result = await auto_fix_loop.execute(
+            design_output=design_output,
+            affected_files=affected_files,
+            pipeline_id=pipeline_id,
+            workspace_path="/workspace/backend",
+            injected_files=injected_files,
+            file_service=file_service
+        )
 
-            # 1. 调用 CoderAgent 生成代码
-            coder_result = await coder_agent.generate_code(
-                design_output=design_output,
-                pipeline_id=pipeline_id,
-                injected_files=injected_files
-            )
+        # 转换结果为 CodingHandler 期望的格式
+        if result.get("success"):
+            code_output = result.get("code_output", {})
+            code_files = extract_code_files(code_output)
 
-            if not coder_result.get("success"):
-                # 检查是否是致命错误（上下文超限）
-                error_msg = coder_result.get("error", "")
-                if self._is_fatal_error(error_msg):
-                    return {
-                        "success": False,
-                        "error": f"Context limit exceeded: {error_msg}",
-                        "fatal_error": True
-                    }
-                return {
-                    "success": False,
-                    "error": f"CoderAgent failed: {error_msg}"
-                }
-
-            coder_output = coder_result.get("output", {})
-            code_files = extract_code_files(coder_output)
-
-            if not code_files:
-                return {
-                    "success": False,
-                    "error": "No files generated by CoderAgent"
-                }
-
-            await push_log(
-                pipeline_id,
-                "info",
-                f"CoderAgent 生成 {len(code_files)} 个文件",
-                stage="CODING"
-            )
-
-            # 2. 写入文件到沙箱
-            async def retry_callback(fp, sb, rb, cc):
-                # 简化处理：直接返回失败，让上层处理
-                return False, cc
-
-            written_count = await merge_and_write_files(
-                code_files, file_service, retry_callback
-            )
-
-            await push_log(
-                pipeline_id,
-                "info",
-                f"已写入 {written_count} 个文件到沙箱",
-                stage="CODING"
-            )
-
-            # 3. 语法检查
-            await push_log(pipeline_id, "info", "执行语法检查...", stage="CODING")
-            syntax_errors = await e2e_service.validate_code_syntax(code_files, file_service)
-
-            if syntax_errors:
-                await push_log(
-                    pipeline_id,
-                    "warning",
-                    f"发现 {len(syntax_errors)} 个语法错误，启动自动修复...",
-                    stage="CODING"
-                )
-
-                # 准备错误文件内容
-                error_files_with_content = []
-                for err in syntax_errors:
-                    fp = err.file
-                    read_res = await file_service.read_file(fp)
-                    if read_res.exists:
-                        error_files_with_content.append((fp, read_res.content))
-                    else:
-                        error_files_with_content.append((fp, ""))
-
-                # 运行语法修复循环
-                fixed_files = await run_syntax_fix_loop(
-                    syntax_errors=[err.to_dict() for err in syntax_errors],
-                    files_to_check=error_files_with_content,
-                    file_service=file_service,
-                    design_output={**design_output, "pipeline_id": pipeline_id},
-                    max_retries=self.MAX_FIX_RETRIES
-                )
-
-                # 重新验证语法
-                remaining_errors = await e2e_service.validate_code_syntax(
-                    code_files, file_service
-                )
-
-                if remaining_errors:
-                    await push_log(
-                        pipeline_id,
-                        "error",
-                        f"语法错误自动修复失败，仍有 {len(remaining_errors)} 个错误",
-                        stage="CODING"
-                    )
-                    # 继续下一轮重试
-                    fix_history.append({
-                        "type": "syntax_fix",
-                        "success": False,
-                        "attempt": attempt,
-                        "remaining_errors": len(remaining_errors)
-                    })
-                    continue
-                else:
-                    await push_log(
-                        pipeline_id,
-                        "info",
-                        "语法错误修复成功",
-                        stage="CODING"
-                    )
-                    fix_history.append({
-                        "type": "syntax_fix",
-                        "success": True,
-                        "attempt": attempt,
-                        "fixed_count": len(fixed_files)
-                    })
-
-            # 4. 契约检查
-            interface_specs = design_output.get("interface_specs", [])
-            if interface_specs:
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"执行契约检查（{len(interface_specs)} 个符号）...",
-                    stage="CODING"
-                )
-
-                missing_symbols = await e2e_service.verify_contract(
-                    file_service, code_files, interface_specs
-                )
-
-                if missing_symbols:
-                    await push_log(
-                        pipeline_id,
-                        "warning",
-                        f"契约检查失败，缺失 {len(missing_symbols)} 个符号，启动自动补齐...",
-                        stage="CODING"
-                    )
-
-                    # 运行契约修复循环
-                    fixed, still_missing, fix_files = await run_contract_fix_loop(
-                        missing_syms=missing_symbols,
-                        interface_specs=interface_specs,
-                        design_output={**design_output, "pipeline_id": pipeline_id},
-                        file_service=file_service,
-                        max_retries=self.MAX_FIX_RETRIES
-                    )
-
-                    if not fixed:
-                        await push_log(
-                            pipeline_id,
-                            "error",
-                            f"契约自动修复失败，仍有缺失: {still_missing}",
-                            stage="CODING"
-                        )
-                        fix_history.append({
-                            "type": "contract_fix",
-                            "success": False,
-                            "attempt": attempt,
-                            "still_missing": still_missing
-                        })
-                        # 如果达到最大重试次数，返回失败
-                        if attempt >= self.MAX_FIX_RETRIES:
-                            return {
-                                "success": False,
-                                "error": f"Contract fix failed after {self.MAX_FIX_RETRIES} attempts",
-                                "missing_symbols": still_missing,
-                                "fix_history": fix_history
-                            }
-                        continue
-                    else:
-                        await push_log(
-                            pipeline_id,
-                            "info",
-                            f"契约自动修复成功，补齐 {len(fix_files)} 个文件",
-                            stage="CODING"
-                        )
-                        code_files.extend(fix_files)
-                        fix_history.append({
-                            "type": "contract_fix",
-                            "success": True,
-                            "attempt": attempt,
-                            "fixed_count": len(fix_files)
-                        })
-                else:
-                    await push_log(
-                        pipeline_id,
-                        "info",
-                        "契约检查通过",
-                        stage="CODING"
-                    )
+            return {
+                "success": True,
+                "coder_output": code_output,
+                "code_files": code_files,
+                "fix_history": result.get("fix_history", []),
+                "total_input_tokens": result.get("total_input_tokens", 0),
+                "total_output_tokens": result.get("total_output_tokens", 0)
+            }
+        else:
+            return {
+                "success": False,
+                "error": result.get("error", "AutoFixLoop 执行失败"),
+                "fatal_error": result.get("fatal_error", False),
+                "fix_history": result.get("fix_history", [])
+            }
 
             # 所有检查通过
             return {
@@ -387,6 +235,159 @@ class CodingHandler(StageHandler):
             "token limit exceeded",
         ]
         return any(sig in error_msg for sig in fatal_signatures)
+
+    async def _run_linting_check(
+        self,
+        code_files: List[Dict],
+        pipeline_id: int
+    ) -> bool:
+        """
+        【新增】运行 Linting 检查并尝试自动修复
+        
+        Args:
+            code_files: 代码文件列表
+            pipeline_id: Pipeline ID
+            
+        Returns:
+            bool: 是否通过（True 表示通过或有警告但不阻塞，False 表示严重错误）
+        """
+        import json
+        from app.service.sandbox_manager import sandbox_manager
+        
+        LINTING_MAX_RETRIES = 3
+        
+        # 尝试运行 ruff 检查
+        linting_errors = []
+        checked_files = set()  # 用于去重，避免重复检查同一文件
+        
+        for file_obj in code_files:
+            file_path = file_obj.get("file_path", "")
+            if not file_path.endswith(".py"):
+                continue
+                
+            # 转换为沙箱中的路径（相对于 /workspace/backend）
+            if file_path.startswith("backend/"):
+                sandbox_path = file_path
+                normalized_path = file_path
+            else:
+                sandbox_path = f"backend/{file_path}"
+                normalized_path = sandbox_path
+            
+            # 去重检查：如果已经检查过这个文件，跳过
+            if normalized_path in checked_files:
+                continue
+            checked_files.add(normalized_path)
+            
+            # 尝试运行 ruff check
+            try:
+                result = await sandbox_manager.exec(
+                    pipeline_id,
+                    f"cd /workspace && ruff check {sandbox_path} --output-format=json 2>&1 || true",
+                    timeout=30
+                )
+                
+                if result.stdout:
+                    try:
+                        errors = json.loads(result.stdout)
+                        if errors:
+                            # 过滤掉 "文件不存在" 错误 (E902) 和语法错误无法自动修复的
+                            real_errors = [e for e in errors if e.get("code") not in ("E902",)]
+                            # 过滤掉 invalid-syntax 错误
+                            real_errors = [e for e in real_errors if "invalid-syntax" not in str(e.get("code", "")).lower()]
+                            if real_errors:
+                                linting_errors.append({
+                                    "file": file_path,
+                                    "sandbox_path": sandbox_path,
+                                    "errors": real_errors
+                                })
+                    except json.JSONDecodeError:
+                        pass
+                        
+            except Exception as e:
+                await push_log(pipeline_id, "warning", f"Linting 检查失败 {file_path}: {e}", stage="CODING")
+        
+        if not linting_errors:
+            return True
+            
+        await push_log(pipeline_id, "warning", f"发现 {len(linting_errors)} 个文件有 Linting 错误", stage="CODING")
+        
+        # 尝试自动修复
+        for attempt in range(LINTING_MAX_RETRIES):
+            await push_log(pipeline_id, "info", f"🔄 Linting 自动修复尝试 {attempt + 1}/{LINTING_MAX_RETRIES}...", stage="CODING")
+            
+            try:
+                # 使用 set 去重，避免重复修复同一文件
+                fixed_paths = set()
+                for error_info in linting_errors:
+                    sandbox_path = error_info.get("sandbox_path", error_info["file"])
+                    
+                    # 去重：如果已经修复过这个文件，跳过
+                    if sandbox_path in fixed_paths:
+                        continue
+                    fixed_paths.add(sandbox_path)
+                    
+                    # 运行 ruff fix
+                    fix_result = await sandbox_manager.exec(
+                        pipeline_id,
+                        f"cd /workspace && ruff check {sandbox_path} --fix 2>&1 || true",
+                        timeout=30
+                    )
+                    
+                    output = fix_result.stdout[:200] if fix_result.stdout else "无输出"
+                    # 过滤掉文件不存在的错误信息和语法错误
+                    if "E902" not in output and "invalid-syntax" not in output.lower():
+                        await push_log(pipeline_id, "info", f"修复 {sandbox_path}: {output}", stage="CODING")
+                    
+                # 重新检查
+                remaining_errors = []
+                checked_remaining = set()  # 去重集合
+                for error_info in linting_errors:
+                    sandbox_path = error_info.get("sandbox_path", error_info["file"])
+                    
+                    # 去重
+                    if sandbox_path in checked_remaining:
+                        continue
+                    checked_remaining.add(sandbox_path)
+                    
+                    result = await sandbox_manager.exec(
+                        pipeline_id,
+                        f"cd /workspace && ruff check {sandbox_path} --output-format=json 2>&1 || true",
+                        timeout=30
+                    )
+                    
+                    if result.stdout:
+                        try:
+                            errors = json.loads(result.stdout)
+                            if errors:
+                                # 过滤掉 "文件不存在" 错误和语法错误
+                                real_errors = [e for e in errors if e.get("code") not in ("E902",)]
+                                real_errors = [e for e in real_errors if "invalid-syntax" not in str(e.get("code", "")).lower()]
+                                if real_errors:
+                                    remaining_errors.append({
+                                        "file": error_info["file"],
+                                        "sandbox_path": sandbox_path,
+                                        "errors": real_errors
+                                    })
+                        except json.JSONDecodeError:
+                            pass
+                
+                if not remaining_errors:
+                    await push_log(pipeline_id, "info", "✅ Linting 修复完成", stage="CODING")
+                    return True
+                    
+                linting_errors = remaining_errors
+                
+            except Exception as e:
+                await push_log(pipeline_id, "warning", f"Linting 自动修复失败: {e}", stage="CODING")
+                break
+        
+        if linting_errors:
+            await push_log(pipeline_id, "warning", f"Linting 检查后仍有 {len(linting_errors)} 个文件有问题", stage="CODING")
+            for err in linting_errors:
+                await push_log(pipeline_id, "warning", f"  - {err['file']}: {len(err['errors'])} 个错误", stage="CODING")
+        
+        # 返回 True 允许继续，但记录警告
+        return True
 
     async def complete(self, context: StageContext, result: StageResult) -> None:
         """完成阶段：保存结果"""

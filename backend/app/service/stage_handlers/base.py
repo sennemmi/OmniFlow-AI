@@ -10,7 +10,9 @@ from typing import Any, Dict, Optional
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from app.core.config import settings
 from app.models.pipeline import StageName, PipelineStatus
+from app.utils.agent_debug_utils import AgentDebugger
 
 
 @dataclass
@@ -84,6 +86,13 @@ class StageHandler(ABC):
     
     所有 Pipeline 阶段处理器必须实现此接口
     """
+    
+    def __init__(self):
+        """初始化处理器，创建 AgentDebugger 实例"""
+        self.debugger = AgentDebugger(
+            enabled=settings.AGENT_DEBUG_ENABLED,
+            output_dir=settings.AGENT_DEBUG_OUTPUT_DIR
+        )
     
     @property
     @abstractmethod

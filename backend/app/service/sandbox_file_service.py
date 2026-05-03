@@ -126,99 +126,169 @@ class SandboxFileService:
     async def write_file(self, file_path: str, content: str) -> Dict[str, Any]:
         """
         在 Sandbox 中写入文件内容
-        
+
         Args:
             file_path: 文件路径（相对项目根目录或 backend 目录）
             content: 文件内容
-            
+
         Returns:
             Dict: 写入结果
         """
         import traceback
-        
+
         # 【日志】记录调用栈，追踪是谁调用了 write_file
         stack = traceback.extract_stack()
         caller_info = []
         for frame in stack[-5:-1]:  # 获取最近 4 个调用帧（排除当前函数）
             caller_info.append(f"{frame.filename}:{frame.lineno} in {frame.name}")
-        
+
         logger.info(f"[SandboxFileService] write_file 被调用: {file_path} ({len(content)} 字符)")
         logger.info(f"[SandboxFileService] 调用栈: {' -> '.join(caller_info)}")
-        
+
         # 【改进6】获取文件级锁，防止并发写入
         lock = await self._get_file_lock(file_path)
         async with lock:
             try:
                 clean_path = self._sanitize_path(file_path)
                 full_path = f"/workspace/{clean_path}"
-                
+
                 logger.info(f"[SandboxFileService] 清理后路径: {clean_path}, 完整路径: {full_path}")
-                
+
                 # 创建目录
                 dir_path = "/".join(full_path.split("/")[:-1])
                 logger.info(f"[SandboxFileService] 创建目录: {dir_path}")
-                
+
                 mkdir_result = await sandbox_manager.exec(
                     self.pipeline_id,
                     f"mkdir -p {dir_path}",
                     timeout=10
                 )
-                
+
                 if mkdir_result.exit_code != 0:
                     logger.error(f"[SandboxFileService] 创建目录失败: {dir_path} - {mkdir_result.stderr}")
                     return {"success": False, "error": f"创建目录失败: {mkdir_result.stderr}"}
-                
+
                 logger.info(f"[SandboxFileService] 目录创建成功: {dir_path}")
-                
-                # 【修复】使用分段写入方式，避免 Windows 命令行长度限制
-                # 将内容分块，每块通过 echo 追加到文件
-                chunk_size = 4000  # 每块约 4000 字符，避免命令行过长
-                encoded_content = base64.b64encode(content.encode()).decode()
-                
-                logger.info(f"[SandboxFileService] 内容长度: {len(encoded_content)} 字符，将分块写入")
-                
-                # 先清空文件
-                clear_result = await sandbox_manager.exec(
-                    self.pipeline_id,
-                    f"> {full_path}",
-                    timeout=10
-                )
-                
-                if clear_result.exit_code != 0:
-                    logger.error(f"[SandboxFileService] 清空文件失败: {full_path}")
-                    return {"success": False, "error": f"清空文件失败: {clear_result.stderr}"}
-                
-                # 分块写入
-                chunks = [encoded_content[i:i+chunk_size] for i in range(0, len(encoded_content), chunk_size)]
-                for i, chunk in enumerate(chunks):
-                    write_cmd = f"echo -n '{chunk}' >> {full_path}"
-                    exec_result = await sandbox_manager.exec(
-                        self.pipeline_id,
-                        write_cmd,
-                        timeout=10
-                    )
-                    if exec_result.exit_code != 0:
-                        logger.error(f"[SandboxFileService] 写入块 {i+1}/{len(chunks)} 失败: {exec_result.stderr}")
-                        return {"success": False, "error": f"写入块 {i+1} 失败: {exec_result.stderr}"}
-                
-                # 解码 base64 内容
-                decode_result = await sandbox_manager.exec(
-                    self.pipeline_id,
-                    f"base64 -d {full_path} > {full_path}.tmp && mv {full_path}.tmp {full_path}",
-                    timeout=10
-                )
-                
-                if decode_result.exit_code != 0:
-                    logger.error(f"[SandboxFileService] 解码文件失败: {decode_result.stderr}")
-                    return {"success": False, "error": f"解码文件失败: {decode_result.stderr}"}
-                
-                logger.info(f"[SandboxFileService] 分块写入完成: {len(chunks)} 块")
+
+                # 【改进】使用更安全的写入方式：通过管道传输 cat > file <<'EOF'
+                # 避免 shell 转义问题
+                write_result = await self._write_file_safe(full_path, content)
+
+                if not write_result["success"]:
+                    return write_result
+
+                # 【新增】写入后立即检查 Python 语法（如果是 Python 文件）
+                if file_path.endswith('.py'):
+                    syntax_check = await self._verify_python_syntax(full_path)
+                    if not syntax_check["success"]:
+                        logger.error(f"[SandboxFileService] 文件语法错误: {syntax_check['error']}")
+                        return {"success": False, "error": f"文件语法错误: {syntax_check['error']}"}
+
                 logger.info(f"[SandboxFileService] 写入成功: {file_path} ({len(content)} 字符)")
                 return {"success": True, "file": file_path}
             except Exception as e:
                 logger.error(f"[SandboxFileService] 写入异常: {file_path} - {e}")
                 logger.error(f"[SandboxFileService] 异常堆栈: {traceback.format_exc()}")
                 return {"success": False, "error": str(e)}
+
+    async def _write_file_safe(self, full_path: str, content: str) -> Dict[str, Any]:
+        """
+        【改进】使用更安全的写入方式
+
+        使用 cat > file <<'EOF' 语法，避免 shell 转义问题
+        """
+        try:
+            # 使用 base64 编码 + 管道写入，避免转义问题
+            encoded_content = base64.b64encode(content.encode()).decode()
+
+            # 方案1：使用 printf 和管道（更可靠）
+            write_cmd = f"printf '%s' '{encoded_content}' | base64 -d > {full_path}"
+            exec_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                write_cmd,
+                timeout=30
+            )
+
+            if exec_result.exit_code != 0:
+                logger.error(f"[SandboxFileService] 安全写入失败: {exec_result.stderr}")
+
+                # 方案2：回退到旧的 echo 分块方式（带重试）
+                logger.info(f"[SandboxFileService] 尝试回退写入方式...")
+                return await self._write_file_fallback(full_path, encoded_content)
+
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"[SandboxFileService] 安全写入异常: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _write_file_fallback(self, full_path: str, encoded_content: str) -> Dict[str, Any]:
+        """
+        【回退方案】使用分段 echo 写入
+
+        当安全写入失败时使用，带重试机制
+        """
+        try:
+            chunk_size = 4000
+            chunks = [encoded_content[i:i+chunk_size] for i in range(0, len(encoded_content), chunk_size)]
+
+            # 先清空文件
+            clear_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                f"> {full_path}",
+                timeout=10
+            )
+
+            if clear_result.exit_code != 0:
+                return {"success": False, "error": f"清空文件失败: {clear_result.stderr}"}
+
+            # 分块写入
+            for i, chunk in enumerate(chunks):
+                write_cmd = f"echo -n '{chunk}' >> {full_path}"
+                exec_result = await sandbox_manager.exec(
+                    self.pipeline_id,
+                    write_cmd,
+                    timeout=10
+                )
+                if exec_result.exit_code != 0:
+                    return {"success": False, "error": f"写入块 {i+1}/{len(chunks)} 失败: {exec_result.stderr}"}
+
+            # 解码
+            decode_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                f"base64 -d {full_path} > {full_path}.tmp && mv {full_path}.tmp {full_path}",
+                timeout=10
+            )
+
+            if decode_result.exit_code != 0:
+                return {"success": False, "error": f"解码失败: {decode_result.stderr}"}
+
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def _verify_python_syntax(self, full_path: str) -> Dict[str, Any]:
+        """
+        【新增】验证 Python 文件语法
+
+        写入后立即检查，发现 SyntaxError 时返回错误
+        """
+        try:
+            check_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                f"python -m py_compile {full_path} 2>&1",
+                timeout=10
+            )
+
+            if check_result.exit_code != 0:
+                error_msg = check_result.stderr.strip() if check_result.stderr else "未知语法错误"
+                logger.error(f"[SandboxFileService] Python 语法错误: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+            return {"success": True}
+        except Exception as e:
+            logger.error(f"[SandboxFileService] 语法检查异常: {e}")
+            # 语法检查失败不阻断写入，只是记录日志
+            return {"success": True, "warning": f"语法检查异常: {e}"}
     
     async def file_exists(self, file_path: str) -> bool:
         """

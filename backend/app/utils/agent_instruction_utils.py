@@ -196,11 +196,39 @@ def build_contract_fix_instruction(missing_specs: List[Dict]) -> str:
     Returns:
         修复指令字符串
     """
-    return (
-        f"以下 {len(missing_specs)} 个接口契约条目在代码中缺失，"
-        f"请仅生成补全这些条目的代码变更，不要修改已有正确实现的代码。\n"
-        f"缺失条目: {json.dumps(missing_specs, indent=2, ensure_ascii=False)}"
-    )
+    symbol_details = []
+    for spec in missing_specs:
+        symbol_name = spec.get("symbol_name", "")
+        module = spec.get("module", "")
+        signature = spec.get("signature", "")
+        symbol_type = spec.get("type", "")
+        
+        detail = f"  - 符号名: {symbol_name}"
+        if module:
+            detail += f"\n    所在文件: {module}"
+        if symbol_type:
+            detail += f"\n    类型: {symbol_type}"
+        if signature:
+            detail += f"\n    签名: {signature}"
+        symbol_details.append(detail)
+    
+    symbol_list = "\n".join(symbol_details)
+    
+    return f"""【契约修复任务】以下 {len(missing_specs)} 个接口契约符号在代码中未定义，必须补全：
+
+{symbol_list}
+
+【关键要求】
+1. 必须在指定文件中定义上述符号（函数、类或变量）
+2. 符号名称必须与上述"符号名"完全一致，不能使用其他名称
+3. 如果是变量（如 router），必须使用赋值语句定义，例如: `timestamp_router = APIRouter()`
+4. 如果是函数，必须定义完整的函数体
+5. 如果是类，必须定义完整的类
+
+【完整契约详情】
+{json.dumps(missing_specs, indent=2, ensure_ascii=False)}
+
+请仅生成补全这些符号的代码变更，不要修改已有正确实现的代码。"""
 
 
 def build_search_block_retry_instruction(

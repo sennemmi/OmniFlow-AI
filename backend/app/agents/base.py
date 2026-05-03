@@ -282,7 +282,7 @@ class LangGraphAgent(ABC, Generic[T]):
         self,
         system_prompt: str,
         user_prompt: str,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         max_tokens: Optional[int] = None,
         retry_count: int = 3,
         response_format: Optional[Dict[str, Any]] = None
@@ -364,50 +364,74 @@ class LangGraphAgent(ABC, Generic[T]):
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
         """
         解析 LLM 返回的 JSON（工具方法）
-        
+
         剥离 Markdown 代码块和前后文本，提取纯 JSON
-        支持修复截断的不完整 JSON
-        
+        强力修复截断的不完整 JSON
+
         Args:
             response: LLM 响应字符串
-            
+
         Returns:
             Dict: 解析后的 JSON
-            
+
         Raises:
             JSONParseError: 解析失败
         """
-        # 首先尝试提取 ```json ... ``` 或 ``` ... ``` 代码块中的内容
-        code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
-        match = re.search(code_block_pattern, response, re.DOTALL)
-        if match:
-            json_str = match.group(1).strip()
-        else:
-            # 如果没有代码块，尝试查找 JSON 对象（以 { 开头，以 } 结尾）
-            json_pattern = r'\{[\s\S]*\}'
-            match = re.search(json_pattern, response)
-            if match:
-                json_str = match.group(0).strip()
-            else:
-                # 最后尝试直接解析整个响应（去除前后空白）
-                json_str = response.strip()
-        
-        # 尝试解析 JSON
+        # 1. 强力剥离 Markdown 代码块标记
+        clean_response = response.strip()
+
+        # 1.1 先尝试提取 ```json 或 ``` 代码块中的内容
+        # 匹配 ```json...``` 或 ```...``` 包裹的内容
+        code_block_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', clean_response, re.DOTALL)
+        if code_block_match:
+            clean_response = code_block_match.group(1).strip()
+        elif clean_response.startswith("```"):
+            # 移除开头的 ```json 或 ```
+            clean_response = re.sub(r'^```(?:json)?\s*', '', clean_response)
+            # 移除结尾的 ```
+            clean_response = re.sub(r'\s*```$', '', clean_response)
+
+        clean_response = clean_response.strip()
+
+        # 2. 尝试直接解析
         try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            # 【修复】尝试修复截断的 JSON
-            logger.warning(f"[{self.agent_name}] JSON 解析失败，尝试修复截断的 JSON: {e}")
-            fixed_json = self._try_fix_truncated_json(json_str)
-            if fixed_json:
-                try:
-                    result = json.loads(fixed_json)
-                    logger.info(f"[{self.agent_name}] 成功修复截断的 JSON")
-                    return result
-                except json.JSONDecodeError:
-                    pass  # 修复失败，继续抛出原始错误
-            
-            raise JSONParseError(f"JSON 解析失败: {e}\n响应内容: {response[:500]}")
+            return json.loads(clean_response)
+        except json.JSONDecodeError:
+            pass  # 继续尝试修复
+
+        # 3. 如果解析失败，尝试修复常见的截断问题
+        # 统计大括号和中括号
+        brace_count = clean_response.count('{') - clean_response.count('}')
+        bracket_count = clean_response.count('[') - clean_response.count(']')
+
+        fixed_response = clean_response
+
+        # 如果还在字符串里（引号不匹配），先补个引号
+        if fixed_response.count('"') % 2 != 0:
+            fixed_response += '"'
+
+        # 补全缺少的闭合符号
+        fixed_response += '}' * brace_count
+        fixed_response += ']' * bracket_count
+
+        try:
+            return json.loads(fixed_response)
+        except json.JSONDecodeError:
+            pass  # 继续尝试更激进的修复
+
+        # 4. 【增强】尝试使用 _try_fix_truncated_json 进行深度修复
+        logger.warning(f"[{self.agent_name}] JSON 解析失败，尝试深度修复截断的 JSON")
+        fixed_json = self._try_fix_truncated_json(clean_response)
+        if fixed_json:
+            try:
+                result = json.loads(fixed_json)
+                logger.info(f"[{self.agent_name}] 成功修复截断的 JSON")
+                return result
+            except json.JSONDecodeError:
+                pass  # 修复失败，继续抛出原始错误
+
+        # 5. 如果还不行，报错原始信息
+        raise JSONParseError(f"JSON 解析完全失败，内容截断严重。原始开头: {clean_response[:200]}")
     
     def _try_fix_truncated_json(self, json_str: str) -> Optional[str]:
         """
@@ -560,8 +584,9 @@ class LangGraphAgent(ABC, Generic[T]):
                 metrics.output_tokens = total_output_tokens
                 metrics.retry_count = result.get("retry_count", 0)
                 
-                # 【关键修复】从结果中提取工具调用计数
+                # 【关键修复】从结果中提取工具调用计数和工具结果
                 tool_calls = result.get("tool_calls", 0)
+                tool_results = result.get("tool_results", [])
                 
                 if result.get("error"):
                     # 执行失败
@@ -588,6 +613,7 @@ class LangGraphAgent(ABC, Generic[T]):
                         "output_tokens": total_output_tokens,
                         "duration_ms": duration_ms,
                         "tool_calls": tool_calls,
+                        "tool_results": tool_results,
                         "reasoning": reasoning_content
                     }
                 
@@ -611,6 +637,7 @@ class LangGraphAgent(ABC, Generic[T]):
                     "output_tokens": total_output_tokens,
                     "duration_ms": duration_ms,
                     "tool_calls": tool_calls,
+                    "tool_results": tool_results,
                     "reasoning": reasoning_content
                 }
                 
@@ -644,7 +671,8 @@ class LangGraphAgent(ABC, Generic[T]):
                     "input_tokens": total_input_tokens,
                     "output_tokens": total_output_tokens,
                     "duration_ms": duration_ms,
-                    "tool_calls": result.get("tool_calls", 0),
+                    "tool_calls": result.get("tool_calls", 0) if result else 0,
+                    "tool_results": result.get("tool_results", []) if result else [],
                     "reasoning": reasoning_content
                 }
 

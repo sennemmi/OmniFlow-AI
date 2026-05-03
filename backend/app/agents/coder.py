@@ -99,17 +99,54 @@ class CoderAgent(LangGraphAgent[CoderOutput]):
 【错误处理铁律 - 强制使用统一响应函数】
 所有 API 端点必须使用 `success_response` 和 `error_response` 函数返回响应，禁止手动构建字典！
 
-正确示例：
+正确示例1 - 健康检查 API：
 ```python
+from fastapi import Request
 from app.core.response import success_response, error_response
 
 @router.get("/health")
-async def health_check():
+async def health_check(request: Request):  # 【必须引入 request 以获取 request_id】
+    request_id = getattr(request.state, "request_id", "")
     try:
         status = await check_system()
-        return success_response(data=status)
+        return success_response(data=status, request_id=request_id)
     except Exception as e:
-        return error_response(message=f"健康检查失败: {str(e)}", code="HEALTH_CHECK_ERROR")
+        return error_response(error=f"健康检查失败: {str(e)}", request_id=request_id)
+```
+
+正确示例2 - 用户 API：
+```python
+from fastapi import Request
+from app.core.response import success_response, error_response
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: int, request: Request):  # 【必须引入 request 以获取 request_id】
+    request_id = getattr(request.state, "request_id", "")
+    try:
+        user = await user_service.get_by_id(user_id)
+        if not user:
+            return error_response(error="用户不存在", request_id=request_id)
+        return success_response(data=user, request_id=request_id)
+    except Exception as e:
+        return error_response(error=f"获取用户失败: {str(e)}", request_id=request_id)
+```
+
+正确示例3 - 时间戳 API：
+```python
+from fastapi import Request
+from app.core.response import success_response, error_response
+from datetime import datetime
+
+@router.get("/timestamp")
+async def get_timestamp(request: Request):  # 【必须引入 request 以获取 request_id】
+    request_id = getattr(request.state, "request_id", "")
+    try:
+        return success_response(data={
+            "timestamp": datetime.now().timestamp(),
+            "iso_format": datetime.now().isoformat()
+        }, request_id=request_id)
+    except Exception as e:
+        return error_response(error=f"获取时间戳失败: {str(e)}", request_id=request_id)
 ```
 
 错误示例（绝对禁止）：
@@ -117,7 +154,7 @@ async def health_check():
 # ❌ 错误！手动构建响应字典
 @router.get("/health")
 async def health_check():
-    return {"success": True, "data": status}  # 禁止！
+    return {{"success": True, "data": status}}  # 禁止！
 
 # ❌ 错误！直接返回原始数据
 @router.get("/health")
@@ -143,7 +180,7 @@ async def health_check():
 【依赖注入铁律 - 强制使用 FastAPI Depends】
 所有服务依赖必须通过 FastAPI 的 Depends 注入，绝对禁止使用全局变量或手动实例化！
 
-正确示例：
+正确示例1 - 健康检查服务：
 ```python
 from fastapi import Depends
 from app.service.health import HealthService
@@ -155,6 +192,35 @@ async def health_check(
     session: AsyncSession = Depends(get_session)
 ):
     return await health_service.check()
+```
+
+正确示例2 - 用户服务：
+```python
+from fastapi import Depends
+from app.service.user import UserService
+from app.core.database import get_session
+
+@router.get("/users/{{user_id}}")
+async def get_user(
+    user_id: int,
+    user_service: UserService = Depends(),
+    session: AsyncSession = Depends(get_session)
+):
+    return await user_service.get_by_id(user_id)
+```
+
+正确示例3 - 时间戳服务：
+```python
+from fastapi import APIRouter, Depends
+from app.service.timestamp import TimestampService
+
+timestamp_router = APIRouter()
+
+@timestamp_router.get("/timestamp")
+async def get_timestamp(
+    ts_service: TimestampService = Depends()
+):
+    return await ts_service.get_current()
 ```
 
 错误示例（绝对禁止）：
@@ -344,6 +410,8 @@ return {
 1. 优先使用 modify (search_block + replace_block) 进行精准修改
 2. 如果修改涉及多个不连续的地方，或难以找到唯一的 search_block，使用 add 类型返回完整文件内容
 3. 对于小文件（<200行），如果 modify 复杂，直接用 add 返回完整内容更可靠
+4. **【重要限制】如果文件超过 300 行，禁止使用 add 模式输出完整内容**（会导致 Token 溢出和 JSON 截断）
+5. 对于长文件（>300行），必须使用 modify 模式，将修改拆分成多个小片段，每次只修改 20-50 行
 
 正确示例（modify - 精准替换）：
 ```json
@@ -354,6 +422,26 @@ return {
 ```json
 {"files": [{"file_path": "app/utils/system_monitor.py", "change_type": "add", "content": "# 完整文件内容...", "description": "完整更新系统监控模块"}]}
 ```
+
+【新增工具 - code_apply(用于验证 search_block 精确性)】
+在输出最终的 JSON 之前,你可以先调用 `code_apply` 工具验证 search_block 是否能精确匹配:
+
+使用流程:
+1. read_file 读取目标文件内容
+2. 调用 code_apply(file_path, search_block, replace_block) 进行试替换
+3. 如果 code_apply 返回 success: true,说明 search_block 精确,可以输出 JSON
+4. 如果 code_apply 返回错误,根据错误信息修正 search_block,再次尝试
+
+【重要】code_apply 工具仅用于验证,不会实际修改文件！
+验证成功后,你仍然必须输出完整的 JSON 格式,包含所有 files。
+E2E 测试脚本会读取你的 JSON 输出并调用 _apply_coder_result 来实际写入文件。
+
+【注意】code_apply 只做精确匹配,不做模糊匹配！
+如果 search_block 与文件内容不完全一致,它会告诉你原因和建议。
+
+【最终输出要求】
+无论是否使用了 code_apply 工具验证,最后都必须输出标准 JSON 格式:
+{"files": [...], "summary": "..."}
 """
         
         return base_prompt
@@ -707,11 +795,43 @@ def hello():
             if pipeline_id:
                 await push_log(pipeline_id, "info", f"代码生成完成，共 {len(output_files)} 个文件", stage="CODING")
             
-            # 【简化】静态键名比对：只检查 interface_specs 的 return_fields
-            # 移除 required_symbols 的双重校验，因为 interface_specs 已经包含了契约信息
             interface_specs = design_output.get("interface_specs", [])
-            
+
             if interface_specs and not design_output.get("force_full_file"):
+                # 【新增】验证符号是否存在
+                logger.info(f"[CoderAgent] 开始符号存在性校验: {len(interface_specs)} 个 interface_specs")
+
+                # 【修复模式】syntax_fix_mode 下仅检查本次实际输出的文件
+                if design_output.get("fix_mode") and design_output.get("syntax_fix_mode"):
+                    # 只提取 output_files 中涉及的文件，对其中的符号进行校验
+                    files_to_check = set()
+                    for f in output_files:
+                        fp = f.get("file_path", "")
+                        if fp:
+                            files_to_check.add(fp)
+                    if files_to_check:
+                        missing_symbols = self._validate_symbols_exist(
+                            output_files, interface_specs, injected_files or {},
+                            restrict_files=files_to_check  # 新增参数，仅检查指定文件
+                        )
+                    else:
+                        missing_symbols = []
+                else:
+                    missing_symbols = self._validate_symbols_exist(output_files, interface_specs, injected_files or {})
+
+                if missing_symbols:
+                    error_msg = f"生成的代码缺少契约要求的符号: {missing_symbols}"
+                    logger.error(f"[CoderAgent] {error_msg}")
+                    if pipeline_id:
+                        await push_log(pipeline_id, "error", error_msg, stage="CODING")
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "output": result.get("output")
+                    }
+                logger.info("[CoderAgent] 符号存在性验证通过")
+                
+                # 验证返回键名
                 logger.info(f"[CoderAgent] 开始键名校验: {len(interface_specs)} 个 interface_specs")
                 key_mismatches = self._validate_return_keys(output_files, interface_specs, injected_files or {})
                 
@@ -1019,6 +1139,155 @@ def hello():
         elif isinstance(key_node, ast.Str):
             return key_node.s
         return None
+
+    def _validate_symbols_exist(
+        self,
+        output_files: List[Dict],
+        interface_specs: List[Dict],
+        injected_files: Dict[str, str] = None,
+        restrict_files: Optional[set] = None  # 【新增】仅检查指定文件
+    ) -> List[str]:
+        """
+        【新增】验证生成的代码是否定义了 interface_specs 中的所有符号
+
+        使用 AST 解析生成的代码，检查所有 symbol_name 是否已定义。
+
+        Args:
+            output_files: 生成的文件列表
+            interface_specs: 接口契约列表
+            injected_files: 注入的原始文件内容 {file_path: content}
+            restrict_files: 【新增】仅检查这些文件中的符号（用于修复模式）
+
+        Returns:
+            List[str]: 缺失的符号列表
+        """
+        import ast
+        from typing import Set
+        missing_symbols = []
+        injected_files = injected_files or {}
+
+        def normalize_path(p: str) -> str:
+            p = p.replace("\\", "/")
+            if p.startswith("backend/"):
+                p = p[8:]
+            return p.lstrip("/")
+        
+        # 构建文件路径到内容的映射
+        file_contents = {}
+        normalized_injected_files = {normalize_path(p): c for p, c in injected_files.items()}
+        
+        for f in output_files:
+            fp = f.get("file_path", "")
+            content = f.get("content", "")
+            change_type = f.get("change_type", "")
+            search_block = f.get("search_block", "")
+            replace_block = f.get("replace_block", "")
+            
+            if change_type == "add" and content:
+                file_contents[fp] = content
+            elif change_type == "modify":
+                normalized_fp = normalize_path(fp)
+                original_content = normalized_injected_files.get(normalized_fp, "")
+                
+                # 【修复】处理各种 modify 情况
+                if search_block and replace_block:
+                    # 标准 search-replace 模式
+                    if original_content:
+                        modified_content = original_content.replace(search_block, replace_block, 1)
+                        file_contents[fp] = modified_content
+                    else:
+                        # 原始文件为空，但 replace_block 有内容，使用 replace_block
+                        file_contents[fp] = replace_block
+                elif replace_block and not search_block:
+                    # search_block 为空但 replace_block 有内容 -> 视为新文件内容
+                    file_contents[fp] = replace_block
+                elif content:
+                    # 使用 content 字段
+                    file_contents[fp] = content
+        
+        # 构建模块到文件的映射
+        module_to_file = {}
+        for spec in interface_specs:
+            if hasattr(spec, 'symbol_name'):
+                symbol_name = spec.symbol_name
+                module = spec.module if hasattr(spec, 'module') else ""
+            else:
+                symbol_name = spec.get("symbol_name", "")
+                module = spec.get("module", "")
+            
+            if symbol_name and module:
+                module_to_file[symbol_name] = module
+        
+        # 检查每个符号是否已定义
+        for spec in interface_specs:
+            if hasattr(spec, 'symbol_name'):
+                symbol_name = spec.symbol_name
+                module = spec.module if hasattr(spec, 'module') else ""
+            else:
+                symbol_name = spec.get("symbol_name", "")
+                module = spec.get("module", "")
+
+            if not symbol_name:
+                continue
+
+            # 标准化模块路径
+            normalized_module = normalize_path(module)
+            if not normalized_module.endswith(".py"):
+                normalized_module += ".py"
+
+            # 【新增】如果指定了 restrict_files，只检查这些文件
+            if restrict_files is not None:
+                # 将 restrict_files 中的路径标准化后比较
+                normalized_restrict_files = {normalize_path(f) for f in restrict_files}
+                if normalized_module not in normalized_restrict_files:
+                    continue  # 跳过不在此次修复范围内的文件
+
+            # 查找对应的文件内容
+            content = None
+            for fp, fc in file_contents.items():
+                if normalize_path(fp) == normalized_module:
+                    content = fc
+                    break
+            
+            if not content:
+                # 文件未生成，符号缺失
+                missing_symbols.append(f"{symbol_name} in {module} (文件未生成)")
+                continue
+            
+            # 使用 AST 解析检查符号是否定义
+            try:
+                tree = ast.parse(content)
+                defined_symbols = set()
+                
+                for node in ast.walk(tree):
+                    # 函数定义
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if not node.name.startswith("_"):
+                            defined_symbols.add(node.name)
+                    # 类定义
+                    elif isinstance(node, ast.ClassDef):
+                        if not node.name.startswith("_"):
+                            defined_symbols.add(node.name)
+                    # 模块级变量赋值
+                    elif isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                if not target.id.startswith("_"):
+                                    defined_symbols.add(target.id)
+                    # 带类型注解的变量
+                    elif isinstance(node, ast.AnnAssign):
+                        if isinstance(node.target, ast.Name):
+                            if not node.target.id.startswith("_"):
+                                defined_symbols.add(node.target.id)
+                
+                if symbol_name not in defined_symbols:
+                    missing_symbols.append(f"{symbol_name} in {module}")
+                    
+            except SyntaxError as e:
+                logger.warning(f"[CoderAgent] 语法错误，无法验证符号: {module} - {e}")
+                # 语法错误时不添加到缺失列表，让后续的语法检查处理
+        
+        return missing_symbols
 
 # 单例实例
 coder_agent = CoderAgent()

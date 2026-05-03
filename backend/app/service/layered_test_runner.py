@@ -398,7 +398,8 @@ class LayeredTestRunner:
         file_service: SandboxFileService,
         test_path: str,
         timeout: int = 120,
-        ignore_patterns: Optional[List[str]] = None
+        ignore_patterns: Optional[List[str]] = None,
+        specific_tests: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         在 Docker 容器中执行 pytest 测试
@@ -408,6 +409,8 @@ class LayeredTestRunner:
             test_path: 测试路径（如 "backend/tests/unit/defense"）
             timeout: 超时时间（秒）
             ignore_patterns: 要忽略的路径模式列表（如 ["defense"]）
+            specific_tests: 指定要运行的具体测试文件列表（如 ["test_timestamp.py"]）
+                           如果提供，则只运行这些文件，避免无关文件干扰
 
         Returns:
             Dict: 测试结果
@@ -433,9 +436,16 @@ class LayeredTestRunner:
                 ignore_path = f"{test_path}/{pattern}"
                 ignore_args += f"--ignore={ignore_path} "
 
+        # 【方案二】如果指定了具体测试文件，只运行这些文件，避免无关文件干扰
+        if specific_tests:
+            # 构建具体的测试文件路径
+            test_targets = " ".join([f"{test_path}/{t}" for t in specific_tests])
+        else:
+            test_targets = test_path
+
         cmd = (
             f"cd /workspace && "
-            f"PYTHONPATH=/workspace/backend python -m pytest {test_path} "
+            f"PYTHONPATH=/workspace/backend python -m pytest {test_targets} "
             f"{ignore_args}"
             f"-v --tb=short --color=no "
             f"2>&1"

@@ -21,6 +21,7 @@ from app.service.file_write_handler import file_write_handler
 from app.service.file_writer import FileWriterService
 from app.service.import_sanitizer import ImportSanitizer
 from app.service.error_context_parser import parse_error_context
+from app.service.snapshot_service import get_snapshot_service
 from app.core.code_validator import code_validator
 from app.core.event_bus import emit_log
 from app.core.sse_log_buffer import push_log
@@ -118,6 +119,12 @@ class AutoFixLoop:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         start_time = time.time()
+
+        # 初始化 Snapshot 服务
+        snapshot = get_snapshot_service(pipeline_id)
+
+        # CoderAgent 开始前保存快照
+        await snapshot.checkpoint("before_coder")
 
         # ★ 读取测试文件（供参考，不强制 AI 使用）
         test_files = await self._read_test_files(pipeline_id, affected_files)
@@ -298,6 +305,82 @@ class AutoFixLoop:
                 stage="CODING"
             )
 
+            # === 新增: Lint-修复 Hook ===
+            await push_log(pipeline_id, "info", "🔍 执行 Lint 检查...", stage="CODING")
+
+            lint_errors = await self._run_lint_check(all_files, pipeline_id)
+            if lint_errors:
+                await push_log(
+                    pipeline_id, "warning",
+                    f"⚠️ 发现 {len(lint_errors)} 个 Lint 问题,启动自动修复...",
+                    stage="CODING"
+                )
+
+                # 将 Lint 错误作为上下文注入,让 CoderAgent 修复
+                lint_error_context = self._format_lint_errors_for_agent(lint_errors)
+                current_error_context = (
+                    f"【Lint 修复】代码存在以下格式/语法问题,请修复:\n{lint_error_context}\n\n"
+                    f"请确保修复后的代码符合 PEP 8 规范。"
+                )
+
+                # 进入现有修复循环(CoderAgent 会基于 error_context 重新生成代码)
+                attempt += 1
+                continue  # 重新进入循环,让 CoderAgent 修复 Lint 问题
+
+            await push_log(
+                pipeline_id, "success",
+                "✅ Lint 检查通过",
+                stage="CODING"
+            )
+
+            # 应用修改前保存快照
+            await snapshot.checkpoint("before_apply")
+
+            # 【静态确定性检查】使用 code_validator 进行后置钩子验证
+            await push_log(
+                pipeline_id, "info",
+                "🔍 执行静态确定性检查...",
+                stage="CODING"
+            )
+
+            hook_errors = []
+            for file_change in all_files:
+                file_path = file_change.get("file_path", "")
+                content = file_change.get("content", "")
+                if file_path and content:
+                    # 调用 code_validator 的 post_write_hook
+                    hook_error = code_validator.post_write_hook(file_path, content)
+                    if hook_error:
+                        hook_errors.append({
+                            "file": file_path,
+                            "error": hook_error
+                        })
+
+            if hook_errors:
+                await push_log(
+                    pipeline_id, "warning",
+                    f"⚠️ 发现 {len(hook_errors)} 个静态检查问题，启动修复...",
+                    stage="CODING"
+                )
+
+                # 合并 hook 错误和 lint 错误
+                error_details = "\n".join([
+                    f"- {err.get('file', 'unknown')}: {err.get('error', 'unknown error')}"
+                    for err in hook_errors[:5]
+                ])
+                current_error_context = (
+                    f"【静态检查错误】代码存在以下结构问题，请修复:\n{error_details}\n\n"
+                    f"请确保代码结构完整，特别是 FastAPI 路由定义和导入语句。"
+                )
+                attempt += 1
+                continue
+
+            await push_log(
+                pipeline_id, "success",
+                "✅ 静态确定性检查通过",
+                stage="CODING"
+            )
+
             # 【语法验证】在契约检查前验证代码语法（同步 E2E 测试脚本的 Step 5）
             await push_log(
                 pipeline_id, "info",
@@ -383,6 +466,9 @@ class AutoFixLoop:
                 "✅ 契约检查通过",
                 stage="CODING"
             )
+
+            # 测试运行前保存快照
+            await snapshot.checkpoint("before_test_run")
 
             # 3. 【阶段二：独立验证步骤】使用 VerifyAgent 进行验证
             verify_result = await self._verify_fixes(pipeline_id, all_files)
@@ -822,6 +908,57 @@ class AutoFixLoop:
                     pass
 
         return syntax_errors
+
+    async def _run_lint_check(
+        self,
+        all_files: List[Dict],
+        pipeline_id: int
+    ) -> List[Dict]:
+        """
+        在 Sandbox 中运行 ruff check,返回格式化的错误列表
+        """
+        from app.service.sandbox_manager import sandbox_manager
+
+        errors = []
+
+        # 构建需要检查的文件列表(只检查 .py 文件)
+        py_files = [
+            f.get("file_path", "").replace("backend/", "")
+            for f in all_files if f.get("file_path", "").endswith(".py")
+        ]
+
+        if not py_files:
+            return errors
+
+        # 在 Sandbox 中运行 ruff(只检查,不自动修复)
+        files_str = " ".join(f"/workspace/backend/{f}" for f in py_files)
+        result = await sandbox_manager.exec(
+            pipeline_id,
+            f"cd /workspace && ruff check {files_str} --output-format=json 2>/dev/null || true",
+            timeout=30
+        )
+
+        if result.stdout.strip():
+            try:
+                import json
+                errors = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                pass
+
+        return errors
+
+    def _format_lint_errors_for_agent(self, lint_errors: List[Dict]) -> str:
+        """
+        将 ruff 输出格式化为 CoderAgent 能理解的错误描述
+        """
+        lines = []
+        for err in lint_errors:
+            file_path = err.get("filename", "").replace("/workspace/backend/", "")
+            line_no = err.get("location", {}).get("row", "?")
+            code = err.get("code", "?")
+            message = err.get("message", "?")
+            lines.append(f"  - {file_path}:{line_no} [{code}] {message}")
+        return "\n".join(lines)
 
     async def _verify_fixes(
         self,
