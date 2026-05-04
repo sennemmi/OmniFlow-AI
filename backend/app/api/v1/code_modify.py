@@ -230,25 +230,125 @@ async def modify_code_directly(
         
         info(f"生成文件数: {len(files)}")
 
-        # 7. 应用变更（如果 auto_apply 为 True）
+        # 7. 执行搜索替换（带重试机制）
+        max_retries = 3
+        retry_count = 0
+        new_content = None
+        
+        while retry_count < max_retries and new_content is None:
+            if retry_count > 0:
+                info(f"第 {retry_count} 次重试：重新调用 QuickCoderAgent...")
+                try:
+                    # 在重试时添加提示，告诉 AI 之前的搜索块匹配失败
+                    retry_instruction = data.user_instruction + f"\n\n【重要提示】之前的代码定位失败，请尝试使用更精确的搜索块。原始文件第 {data.source_context.line} 行附近的内容是：\n{surrounding[:500]}"
+                    result = await quick_coder_agent.generate_code(
+                        user_instruction=retry_instruction,
+                        file_path=file_path,
+                        file_content=content,
+                        surrounding_code=surrounding,
+                        element_context=element_ctx,
+                        line=data.source_context.line,
+                    )
+                    if not result.get("success"):
+                        error(f"重试 {retry_count} 代码生成失败: {result.get('error')}")
+                        break
+                    output = result.get("output", {})
+                    files = output.get("files", [])
+                except Exception as e:
+                    error(f"重试 {retry_count} 调用失败: {e}")
+                    break
+            
+            file_change = files[0]
+            change_type = file_change.get("change_type", "modify")
+            search_block = file_change.get("search_block", "")
+            replace_block = file_change.get("replace_block", "")
+            provided_content = file_change.get("content", "")
+            
+            info(f"尝试搜索替换 (尝试 {retry_count + 1}/{max_retries})", 
+                 change_type=change_type, 
+                 has_search_block=bool(search_block),
+                 has_replace_block=bool(replace_block))
+            
+            # 如果是 modify 模式且提供了搜索块，使用引擎进行替换
+            if change_type == "modify" and search_block and replace_block:
+                from app.service.search_replace_engine import search_replace_engine
+                new_content = search_replace_engine.apply_search_replace(
+                    original=content,
+                    search_block=search_block,
+                    replace_block=replace_block,
+                    fallback_start=file_change.get("fallback_start_line"),
+                    fallback_end=file_change.get("fallback_end_line")
+                )
+                
+                if new_content is None:
+                    error(f"第 {retry_count + 1} 次搜索替换失败，search_block 匹配失败")
+                    retry_count += 1
+                else:
+                    info(f"搜索替换成功")
+                    break
+            else:
+                # 回退到全量替换
+                new_content = provided_content or content
+                info(f"使用全量替换模式")
+                break
+        
+        # 如果所有重试都失败，使用原始内容
+        if new_content is None:
+            error(f"所有 {max_retries} 次重试都失败，使用原始内容")
+            new_content = content
+
+        # 8. 应用变更（如果 auto_apply 为 True）
         info(f"检查 auto_apply: {data.auto_apply}")
         if data.auto_apply:
             try:
                 executor = CodeExecutorService(str(workspace))
-                changes = {f["file_path"]: f["content"] for f in files}
-                info(f"准备应用变更", changes_count=len(changes), files=list(changes.keys()))
+                files_list = files  # 文件列表
+                info(f"准备应用变更", changes_count=len(files_list), files=[f.get("file_path") for f in files_list])
                 info(f"工作目录: {workspace}")
-                
-                result = executor.apply_changes(changes, create_if_missing=False)
+
+                # 批量写入文件：先读取获取 read_token，再应用变更
+                from app.service.file_safe_io import FileChangeResult
+                changes_results = []
+                for f in files_list:
+                    file_path = f.get("file_path", "")
+                    content = f.get("content", "")
+                    if file_path and content:
+                        read_result = executor.read_file(file_path)
+                        change_result = executor.apply_file_change(
+                            relative_path=file_path,
+                            new_content=content,
+                            read_token=read_result.read_token,
+                            create_if_missing=False
+                        )
+                        changes_results.append(change_result)
+
+                # 构造批量变更结果
+                success_count = sum(1 for c in changes_results if c.success)
+                failed_count = len(changes_results) - success_count
+                class SimpleBatchResult:
+                    def __init__(self, success, changes, success_count, failed_count):
+                        self.success = success
+                        self.changes = changes
+                        self.success_count = success_count
+                        self.failed_count = failed_count
+                        self.errors = [c.error for c in changes if not c.success]
+                        self.summary = f"成功: {success_count}, 失败: {failed_count}"
+
+                result = SimpleBatchResult(
+                    success=failed_count == 0,
+                    changes=changes_results,
+                    success_count=success_count,
+                    failed_count=failed_count
+                )
                 info(f"变更结果: success={result.success}, summary={result.summary}")
-                
+
                 if not result.success:
                     error(f"变更失败: {result.errors}")
                     for change in result.changes:
                         if not change.success:
                             error(f"  - {change.file_path}: {change.error}")
                 else:
-                    info("代码变更已应用", files=list(changes.keys()))
+                    info("代码变更已应用", files=[f.get("file_path") for f in files_list])
             except Exception as e:
                 error(f"应用变更失败: {e}")
                 import traceback
@@ -260,23 +360,27 @@ async def modify_code_directly(
         else:
             info("跳过应用变更（auto_apply=False）")
 
-        # 8. 生成 diff
+        # 9. 生成 diff
         try:
-            new_content = files[0]["content"] if files else ""
-            diff = generate_diff(content, new_content, file_path)
+            diff = generate_diff(content, new_content, str(file_path))
             info(f"Diff 生成完成: {len(diff)} 字符")
         except Exception as e:
-            error(f"生成 diff 失败: {e}")
+            error(f"生成 diff 失败: {e}", exc_info=True)
             diff = ""
 
-        # 9. 构建响应（使用字典，不是 Pydantic 模型）
+        # 10. 构建响应（使用字典，不是 Pydantic 模型）
         try:
+            # 获取 search_block 和 replace_block 用于前端搜索替换
+            file_change = files[0] if files else {}
             response_data = {
                 "summary": output.get("summary", ""),
                 "files_changed": [f["file_path"] for f in files],
                 "new_content": new_content,
                 "original_content": content,
                 "diff": diff,
+                "search_block": file_change.get("search_block", ""),
+                "replace_block": file_change.get("replace_block", ""),
+                "change_type": file_change.get("change_type", "modify"),
             }
             info(f"响应数据构建完成: {len(response_data)} 个字段")
         except Exception as e:
@@ -393,5 +497,100 @@ async def update_file_content(
         error(f"写入文件内容失败: {e}", exc_info=True)
         return error_response(
             error=f"写入文件失败: {str(e)}",
+            request_id=request_id
+        )
+
+
+# ============================================
+# 轻量 MR 创建接口
+# ============================================
+
+class LightweightMRRequest(BaseModel):
+    """轻量 MR 创建请求"""
+    file_path: str = Field(..., description="修改的文件路径")
+    instruction: str = Field(..., description="用户的修改指令")
+    summary: str = Field(default="", description="变更摘要（由AI生成）")
+
+
+@router.post(
+    "/code/create-mr",
+    response_model=ResponseModel,
+    summary="创建轻量 MR",
+    description="圈选确认后自动创建 MR，包含分支创建、提交、推送和 PR 创建"
+)
+async def create_lightweight_mr(
+    request: Request,
+    data: LightweightMRRequest,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    轻量 MR 创建 - 圈选确认后自动触发
+    """
+    request_id = getattr(request.state, "request_id", "")
+
+    try:
+        from app.service.git_provider import GitProviderService
+        from app.service.platform_provider import GitHubProviderService
+        from app.core.config import settings
+        import asyncio
+
+        # 1. 创建新分支（基于 main）
+        project_path = str(Path(settings.TARGET_PROJECT_PATH))
+        git = GitProviderService(project_path)
+        branch_name = f"feat/injector-{request_id[:8]}"
+
+        # 创建并切换到新分支
+        await asyncio.to_thread(git.create_branch, branch_name)
+        info(f"创建分支: {branch_name}")
+
+        # 2. 添加变更并提交
+        await asyncio.to_thread(git.add_files, [data.file_path])
+
+        # 提交信息包含用户指令
+        commit_msg = f"injector: {data.instruction[:80]}"
+        await asyncio.to_thread(git.commit_changes, commit_msg)
+        info(f"提交变更: {commit_msg}")
+
+        # 3. 推送分支
+        await asyncio.to_thread(git.push_branch, branch_name)
+        info(f"推送分支: {branch_name}")
+
+        # 4. 生成 PR 描述
+        pr_description = f"""## 来自圈选修改
+{data.summary or data.instruction}
+
+修改文件：`{data.file_path}`
+"""
+
+        # 5. 创建 PR
+        async with GitHubProviderService() as gh:
+            pr_result = await gh.create_pull_request(
+                head_branch=branch_name,
+                title=f"OmniFlowAI: {data.instruction[:50]}",
+                body=pr_description,
+                base_branch="main"
+            )
+
+        if pr_result.success:
+            info(f"PR 创建成功: {pr_result.pr_url}")
+            return success_response(
+                data={
+                    "pr_url": pr_result.pr_url,
+                    "pr_number": pr_result.pr_number,
+                    "branch": branch_name
+                },
+                request_id=request_id
+            )
+        else:
+            error(f"PR 创建失败: {pr_result.error}")
+            return error_response(
+                error=f"PR创建失败: {pr_result.error}",
+                request_id=request_id
+            )
+
+    except Exception as e:
+        error(f"创建 MR 失败: {e}", exc_info=True)
+        return error_response(
+            error=f"创建 MR 失败: {str(e)}",
             request_id=request_id
         )

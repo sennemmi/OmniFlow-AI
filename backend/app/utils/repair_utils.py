@@ -234,25 +234,6 @@ async def collect_target_files_async(
     return target_files
 
 
-def extract_file_paths(all_generated_files: List[Dict]) -> List[str]:
-    """
-    从生成的文件列表中提取路径
-
-    Args:
-        all_generated_files: 所有生成的文件列表
-
-    Returns:
-        文件路径列表
-    """
-    file_paths = []
-    for file_info in all_generated_files:
-        fp = file_info.get("file_path", "")
-        if fp:
-            clean_fp = clean_backend_prefix(fp)
-            file_paths.append(clean_fp)
-    return file_paths
-
-
 def print_fix_result(repair_result: Dict, output: Dict) -> None:
     """
     打印修复结果

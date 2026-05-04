@@ -1,292 +1,200 @@
 """
-Agent 调试工具模块
+Agent 调试工具 (AgentDebugUtils)
 
-提供 Agent 输入输出保存功能，用于调试和分析
+统一 E2E 测试和 Pipeline 中的 Agent 调试记录。
+提供全局 AgentDebugger 实例。
 """
 
-import json
+import logging
 import os
+import uuid
+from typing import Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-import uuid
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class AgentDebugger:
     """
-    Agent 调试器
-    
-    用于保存每个 Agent 的输入输出到 JSON 文件，便于调试和分析
-    
-    Usage:
-        debugger = AgentDebugger(enabled=True, output_dir="./debug_output")
-        
-        # 保存 Agent 输入输出
-        debugger.save_agent_io(
-            agent_name="ArchitectAgent",
-            stage="analyze",
-            input_data={"requirement": "...", "file_tree": {...}},
-            output_data={"success": True, "output": {...}},
-            metadata={"duration_ms": 1500, "tokens": 2000}
-        )
+    统一的 Agent 调试器
+
+    职责：
+    1. 记录 Agent 输入输出
+    2. 记录 Agent 调用链
+    3. 保存调试信息到文件
+    4. 提供统一的日志格式
+
+    使用场景：
+    - E2E 测试脚本
+    - Pipeline 各 StageHandler
+    - 任何需要调试 Agent 的地方
     """
-    
-    def __init__(
-        self,
-        enabled: bool = False,
-        output_dir: str = "./agent_debug_output",
-        session_id: Optional[str] = None
-    ):
-        """
-        初始化调试器
-        
-        Args:
-            enabled: 是否启用调试输出
-            output_dir: 输出目录
-            session_id: 会话 ID，用于区分不同的测试运行
-        """
+
+    def __init__(self, enabled: bool = True, output_dir: str = "./debug_output", session_id: Optional[str] = None):
         self.enabled = enabled
+        # 确保 output_dir 是 Path 对象（兼容旧 E2E 测试脚本）
         self.output_dir = Path(output_dir)
-        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.call_counter = 0
-        
-        if self.enabled:
-            self._ensure_output_dir()
-            self._save_session_info()
-    
-    def _ensure_output_dir(self):
-        """确保输出目录存在"""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        session_dir = self.output_dir / self.session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-    
-    def _save_session_info(self):
-        """保存会话信息"""
-        session_info = {
-            "session_id": self.session_id,
-            "start_time": datetime.now().isoformat(),
-            "output_dir": str(self.output_dir / self.session_id)
-        }
-        
-        info_file = self.output_dir / self.session_id / "_session_info.json"
-        with open(info_file, "w", encoding="utf-8") as f:
-            json.dump(session_info, f, indent=2, ensure_ascii=False)
-    
-    def _serialize(self, obj: Any, max_depth: int = 10) -> Any:
-        """
-        序列化对象为 JSON 兼容格式
-        
-        处理 Pydantic 模型、Path、datetime 等类型
-        """
-        if max_depth <= 0:
-            return str(obj)
-        
-        if obj is None:
-            return None
-        elif isinstance(obj, (str, int, float, bool)):
-            return obj
-        elif isinstance(obj, dict):
-            return {k: self._serialize(v, max_depth - 1) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [self._serialize(item, max_depth - 1) for item in obj]
-        elif hasattr(obj, "model_dump"):
-            return self._serialize(obj.model_dump(), max_depth - 1)
-        elif hasattr(obj, "to_dict"):
-            return self._serialize(obj.to_dict(), max_depth - 1)
-        elif hasattr(obj, "__dict__"):
-            return self._serialize(obj.__dict__, max_depth - 1)
-        elif isinstance(obj, Path):
-            return str(obj)
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        else:
-            return str(obj)
-    
-    def _truncate_content(self, content: str, max_chars: int = 50000) -> str:
-        """
-        截断过长的内容
-        
-        Args:
-            content: 原始内容
-            max_chars: 最大字符数
-            
-        Returns:
-            str: 截断后的内容
-        """
-        if len(content) <= max_chars:
-            return content
-        return content[:max_chars] + f"\n... [已截断，原内容共 {len(content)} 字符]"
-    
+        # 兼容旧 E2E 测试脚本，添加 session_id
+        self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+        self._call_chain: list = []
+
+        # 创建带 session_id 的子目录
+        self.session_output_dir = self.output_dir / self.session_id
+        if enabled and not self.session_output_dir.exists():
+            try:
+                self.session_output_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Failed to create debug output directory: {e}")
+                self.session_output_dir = Path(output_dir)
+
     def save_agent_io(
         self,
         agent_name: str,
         stage: str,
-        input_data: Any,
-        output_data: Any,
-        metadata: Optional[Dict] = None,
-        success: bool = True,
+        input_data: Dict[str, Any],
+        output_data: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        success: bool = False,
         error: Optional[str] = None,
-        tool_calls: Optional[List[Dict]] = None,
-        system_prompt: Optional[str] = None
-    ) -> Optional[str]:
+        tool_calls: Optional[list] = None,
+        system_prompt: Optional[str] = None,
+    ) -> None:
         """
         保存 Agent 输入输出
-        
-        Args:
-            agent_name: Agent 名称（如 ArchitectAgent, CoderAgent）
-            stage: 阶段名称（如 analyze, design, generate_code）
-            input_data: 输入数据
-            output_data: 输出数据
-            metadata: 元数据（如耗时、Token 数等）
-            success: 是否成功
-            error: 错误信息（如果有）
-            tool_calls: 工具调用列表（包含工具名、参数、结果）
-            system_prompt: Agent 的系统提示（包含 CONVENTIONS.md 等）
-            
-        Returns:
-            str: 保存的文件路径，如果未启用则返回 None
-        """
-        if not self.enabled:
-            return None
-        
-        self.call_counter += 1
-        
-        # 序列化并截断过长的内容
-        serialized_input = self._serialize(input_data)
-        serialized_output = self._serialize(output_data)
-        
-        # 截断 output_data 中的长字符串
-        if isinstance(serialized_output, dict):
-            serialized_output = self._truncate_dict_strings(serialized_output)
-        
-        # 截断 system_prompt（如果过长）
-        truncated_system_prompt = None
-        if system_prompt:
-            truncated_system_prompt = self._truncate_content(system_prompt, max_chars=20000)
-        
-        record = {
-            "seq": self.call_counter,
-            "timestamp": datetime.now().isoformat(),
-            "agent_name": agent_name,
-            "stage": stage,
-            "success": success,
-            "error": error,
-            "system_prompt": truncated_system_prompt,
-            "input": serialized_input,
-            "output": serialized_output,
-            "tool_calls": self._serialize(tool_calls) if tool_calls else [],
-            "metadata": metadata or {}
-        }
-        
-        filename = f"{self.call_counter:03d}_{agent_name}_{stage}.json"
-        filepath = self.output_dir / self.session_id / filename
-        
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2, ensure_ascii=False)
-        
-        return str(filepath)
-    
-    def _truncate_dict_strings(self, d: Any, max_chars: int = 50000) -> Any:
-        """
-        递归截断字典中的长字符串
-        """
-        if isinstance(d, dict):
-            return {k: self._truncate_dict_strings(v, max_chars) for k, v in d.items()}
-        elif isinstance(d, list):
-            return [self._truncate_dict_strings(item, max_chars) for item in d]
-        elif isinstance(d, str):
-            return self._truncate_content(d, max_chars)
-        else:
-            return d
-    
-    def save_tool_call(
-        self,
-        agent_name: str,
-        tool_name: str,
-        tool_args: Dict,
-        tool_result: Any,
-        success: bool = True
-    ) -> Optional[str]:
-        """
-        保存单个工具调用（可选，用于细粒度调试）
-        
+
         Args:
             agent_name: Agent 名称
-            tool_name: 工具名称
-            tool_args: 工具参数
-            tool_result: 工具返回结果
+            stage: 阶段名称
+            input_data: 输入数据
+            output_data: 输出数据
+            metadata: 元数据（token 数、耗时等）
             success: 是否成功
-            
-        Returns:
-            str: 保存的文件路径
+            error: 错误信息
+            tool_calls: 工具调用记录
+            system_prompt: 系统提示词
         """
         if not self.enabled:
-            return None
-        
-        tool_record = {
-            "timestamp": datetime.now().isoformat(),
-            "agent_name": agent_name,
-            "tool_name": tool_name,
-            "tool_args": self._serialize(tool_args),
-            "tool_result": self._serialize(tool_result),
-            "success": success
+            return
+
+        try:
+            timestamp = datetime.now().isoformat()
+
+            debug_entry = {
+                "timestamp": timestamp,
+                "agent_name": agent_name,
+                "stage": stage,
+                "success": success,
+                "error": error,
+                "input": input_data,
+                "output": output_data,
+                "metadata": metadata or {},
+                "tool_calls": tool_calls or [],
+                "system_prompt": system_prompt,
+            }
+
+            # 添加到调用链
+            self._call_chain.append({
+                "timestamp": timestamp,
+                "agent_name": agent_name,
+                "stage": stage,
+                "success": success,
+            })
+
+            # 保存到文件（使用 session_output_dir）
+            filename = f"{agent_name}_{stage}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = self.session_output_dir / filename
+
+            import json
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(debug_entry, f, ensure_ascii=False, indent=2, default=str)
+
+            logger.debug(f"Saved agent debug info to {filepath}")
+
+        except Exception as e:
+            logger.warning(f"Failed to save agent debug info: {e}")
+
+    def get_call_chain(self) -> list:
+        """获取 Agent 调用链"""
+        return self._call_chain.copy()
+
+    def clear_call_chain(self) -> None:
+        """清空调用链"""
+        self._call_chain.clear()
+
+    def log_summary(self) -> Dict[str, Any]:
+        """
+        生成调试摘要
+
+        Returns:
+            Dict: 调试摘要信息
+        """
+        if not self._call_chain:
+            return {"total_calls": 0, "success_rate": 0}
+
+        total = len(self._call_chain)
+        successful = sum(1 for call in self._call_chain if call.get("success"))
+
+        return {
+            "total_calls": total,
+            "successful_calls": successful,
+            "failed_calls": total - successful,
+            "success_rate": successful / total if total > 0 else 0,
+            "call_chain": self._call_chain,
         }
-        
-        filename = f"tool_{self.call_counter:03d}_{tool_name}.json"
-        filepath = self.output_dir / self.session_id / filename
-        
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(tool_record, f, indent=2, ensure_ascii=False)
-        
-        return str(filepath)
-    
+
     def save_summary(self) -> Optional[str]:
         """
-        保存会话摘要
-        
+        保存调试摘要到文件（兼容旧 E2E 测试脚本）
+
         Returns:
-            str: 摘要文件路径
+            Optional[str]: 摘要文件路径
         """
         if not self.enabled:
             return None
-        
-        summary = {
-            "session_id": self.session_id,
-            "end_time": datetime.now().isoformat(),
-            "total_calls": self.call_counter,
-            "agents_called": []
-        }
-        
-        session_dir = self.output_dir / self.session_id
-        for f in session_dir.glob("*.json"):
-            if f.name.startswith("_"):
-                continue
-            with open(f, "r", encoding="utf-8") as fp:
-                record = json.load(fp)
-                summary["agents_called"].append({
-                    "seq": record.get("seq"),
-                    "agent": record.get("agent_name"),
-                    "stage": record.get("stage"),
-                    "success": record.get("success"),
-                    "tool_calls_count": len(record.get("tool_calls", []))
-                })
-        
-        summary_file = session_dir / "_summary.json"
-        with open(summary_file, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        
-        return str(summary_file)
+
+        try:
+            summary = self.log_summary()
+            summary["session_id"] = self.session_id
+            summary["saved_at"] = datetime.now().isoformat()
+
+            filename = f"summary_{self.session_id}.json"
+            filepath = self.session_output_dir / filename
+
+            import json
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+
+            return str(filepath)
+        except Exception as e:
+            logger.warning(f"Failed to save summary: {e}")
+            return None
 
 
-def create_debugger_from_env() -> AgentDebugger:
+# 全局单例实例（从环境变量读取配置）
+_global_debugger: Optional[AgentDebugger] = None
+
+
+def get_agent_debugger() -> AgentDebugger:
     """
-    从环境变量创建调试器
-    
-    环境变量:
-        AGENT_DEBUG_ENABLED: 是否启用调试（默认 False）
-        AGENT_DEBUG_OUTPUT_DIR: 输出目录（默认 ./agent_debug_output）
+    获取全局 AgentDebugger 实例
+
+    Returns:
+        AgentDebugger: 全局调试器实例
     """
-    enabled = os.environ.get("AGENT_DEBUG_ENABLED", "false").lower() in ("true", "1", "yes")
-    output_dir = os.environ.get("AGENT_DEBUG_OUTPUT_DIR", "./agent_debug_output")
-    
-    return AgentDebugger(enabled=enabled, output_dir=output_dir)
+    global _global_debugger
+
+    if _global_debugger is None:
+        enabled = getattr(settings, 'AGENT_DEBUG_ENABLED', True)
+        output_dir = getattr(settings, 'AGENT_DEBUG_OUTPUT_DIR', './debug_output')
+        _global_debugger = AgentDebugger(enabled=enabled, output_dir=output_dir)
+
+    return _global_debugger
+
+
+def reset_agent_debugger() -> None:
+    """重置全局调试器实例"""
+    global _global_debugger
+    _global_debugger = None

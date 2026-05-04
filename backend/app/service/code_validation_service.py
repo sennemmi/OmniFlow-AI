@@ -2,17 +2,16 @@
 代码验证服务
 
 提供代码语法检查、测试导入验证、测试语法修复等功能
+所有语法检查均在 Docker 沙箱内执行，避免宿主机编码问题
 """
 
 import ast
 import logging
 import re
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set
 
 from app.service.sandbox_file_service import SandboxFileService
+from app.service.sandbox_manager import sandbox_manager
 
 logger = logging.getLogger(__name__)
 
@@ -39,86 +38,73 @@ class CodeValidationService:
     代码验证服务
 
     职责：
-    1. 使用 py_compile 检查代码语法
+    1. 在 Docker 沙箱内使用 py_compile 检查代码语法
     2. 验证测试文件的导入有效性
     3. 修复测试文件语法错误
+
+    注意：所有语法检查均在沙箱内执行，避免宿主机编码问题
     """
 
     def __init__(self):
         pass
 
-    async def check_syntax_with_py_compile(
+    async def check_syntax_in_sandbox(
         self,
-        code_files: List[Dict],
-        file_service: SandboxFileService
-    ) -> List[SyntaxErrorInfo]:
+        file_path: str,
+        pipeline_id: int,
+        content: Optional[str] = None
+    ) -> Optional[SyntaxErrorInfo]:
         """
-        使用 python -m py_compile 检查代码语法错误
+        在沙箱内检查单个文件的语法
 
         Args:
-            code_files: 代码文件列表
-            file_service: 文件服务
+            file_path: 文件路径（相对于 backend/ 的路径）
+            pipeline_id: Pipeline ID
+            content: 可选，如果提供则先写入沙箱再检查
 
         Returns:
-            语法错误列表
+            None 表示语法正确，否则返回 SyntaxErrorInfo
         """
-        syntax_errors = []
-
-        for fc in code_files:
-            fp = fc.get("file_path", "").replace("backend/", "").replace("backend\\", "")
-            change_type = fc.get("change_type")
-
-            content_to_check = None
-            if change_type == "add":
-                content_to_check = fc.get("content", "")
-            elif change_type == "modify":
-                search_block = fc.get("search_block", "")
-                replace_block = fc.get("replace_block", "")
-                if search_block:
-                    read_r = await file_service.read_file(fp)
-                    if read_r.exists:
-                        content_to_check = read_r.content.replace(search_block, replace_block, 1)
-
-            if not content_to_check:
-                continue
-
-            error_info = self._check_single_file_syntax(fp, content_to_check)
-            if error_info:
-                syntax_errors.append(error_info)
-
-        return syntax_errors
-
-    def _check_single_file_syntax(self, file_path: str, content: str) -> Optional[SyntaxErrorInfo]:
-        """检查单个文件的语法"""
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
-                tmp.write(content)
-                tmp_path = tmp.name
+            clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            full_path = f"/workspace/backend/{clean_path}"
 
-            result = subprocess.run(
-                ['python', '-m', 'py_compile', tmp_path],
-                capture_output=True,
-                text=True
+            # 如果提供了内容，先写入沙箱
+            if content is not None:
+                file_service = SandboxFileService(pipeline_id=pipeline_id)
+                write_result = await file_service.write_file(clean_path, content)
+                if not write_result.get("success"):
+                    return SyntaxErrorInfo(
+                        file=clean_path,
+                        error=write_result.get("error", "写入沙箱失败"),
+                        line=0
+                    )
+
+            # 在沙箱内执行语法检查
+            result = await sandbox_manager.exec(
+                pipeline_id,
+                f"python -m py_compile {full_path} 2>&1",
+                timeout=10
             )
 
-            if result.returncode != 0:
-                error_msg = result.stderr or "Syntax error"
+            if result.exit_code != 0:
+                error_msg = result.stderr.strip() or result.stdout.strip() or "Syntax error"
                 line_no = 0
-                line_match = re.search(r'line (\d+)', error_msg)
+
+                # 尝试从错误信息中提取行号
+                line_match = re.search(r'line\s+(\d+)', error_msg, re.IGNORECASE)
                 if line_match:
                     line_no = int(line_match.group(1))
 
-                lines = content.splitlines()
-                context_start = max(0, line_no - 3)
-                context_end = min(len(lines), line_no + 2)
-                context = "\n".join(lines[context_start:context_end])
-
                 return SyntaxErrorInfo(
-                    file=file_path,
+                    file=clean_path,
                     error=error_msg,
                     line=line_no,
-                    context=context
+                    context=""
                 )
+
+            return None  # 语法正确
+
         except Exception as e:
             return SyntaxErrorInfo(
                 file=file_path,
@@ -126,15 +112,63 @@ class CodeValidationService:
                 line=0,
                 context=""
             )
-        finally:
-            try:
-                if 'tmp_path' in locals():
-                    import os
-                    os.unlink(tmp_path)
-            except:
-                pass
 
-        return None
+    async def batch_check_syntax_in_sandbox(
+        self,
+        code_files: List[Dict],
+        pipeline_id: int
+    ) -> List[SyntaxErrorInfo]:
+        """
+        批量检查代码文件语法（在沙箱内）
+
+        Args:
+            code_files: 代码文件列表，每个文件包含 file_path 和 content
+            pipeline_id: Pipeline ID
+
+        Returns:
+            语法错误列表
+        """
+        errors = []
+
+        for fc in code_files:
+            fp = fc.get("file_path", "")
+            content = fc.get("content", "")
+
+            if not fp or not content or not fp.endswith(".py"):
+                continue
+
+            error_info = await self.check_syntax_in_sandbox(fp, pipeline_id, content)
+            if error_info:
+                errors.append(error_info)
+
+        return errors
+
+    async def check_syntax_in_sandbox_by_paths(
+        self,
+        file_paths: List[str],
+        pipeline_id: int
+    ) -> List[SyntaxErrorInfo]:
+        """
+        根据文件路径列表检查语法（文件已在沙箱中）
+
+        Args:
+            file_paths: 文件路径列表（相对于 backend/ 的路径）
+            pipeline_id: Pipeline ID
+
+        Returns:
+            语法错误列表
+        """
+        errors = []
+
+        for fp in file_paths:
+            if not fp.endswith(".py"):
+                continue
+
+            error_info = await self.check_syntax_in_sandbox(fp, pipeline_id)
+            if error_info:
+                errors.append(error_info)
+
+        return errors
 
     # Python 标准库模块名（可能与 app 模块冲突）
     STDLIB_MODULES = {

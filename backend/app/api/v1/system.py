@@ -4,6 +4,7 @@
 """
 
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Request, Depends
@@ -12,12 +13,40 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy import func, select
 
 from app.service.system_stats import SystemStatsService
-from app.core.response import ResponseModel, success_response
+from app.service.health_service import HealthService
+from app.core.response import ResponseModel, success_response, error_response
 from app.core.database import get_session, get_db_status
 from app.models.pipeline import Pipeline, PipelineStage, PipelineStatus
 from app.core.config import settings
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+# ============================================
+# 基础健康检查端点（兼容旧版 /health）
+# ============================================
+
+@router.get("/health", summary="基础健康检查 (兼容端点)")
+async def basic_health_check(request: Request):
+    """供内部服务和探针使用的轻量级健康检查"""
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    try:
+        health_data = await HealthService.get_component_health()
+        overall_health = health_data.get("overall_health", "unhealthy")
+        return success_response(
+            data={
+                "status": overall_health,
+                "overall_health": overall_health,
+                "components": health_data.get("components", {}),
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            request_id=request_id
+        )
+    except Exception as e:
+        return error_response(error=str(e), request_id=request_id)
 
 
 class SystemStatsData(BaseModel):
@@ -118,6 +147,105 @@ async def get_system_stats(
             success=False,
             data=None,
             error=str(e),
+            request_id=request_id
+        )
+
+
+@router.get(
+    "/system/health",
+    response_model=ResponseModel,
+    summary="获取系统健康状态",
+    description="""
+    获取系统整体健康状态和各组件健康状态。
+
+    返回数据说明：
+    - **status**: 整体健康状态 (healthy/degraded/unhealthy)
+    - **components**: 各组件健康状态详情
+    - **overall_health**: 整体健康状态
+
+    适用于：
+    - 系统健康监控
+    - 告警阈值判断
+    - 运维巡检
+    """,
+    response_description="系统健康状态和组件详情"
+)
+async def get_system_health(request: Request) -> ResponseModel:
+    """
+    获取系统健康状态，返回包含status、components、overall_health字段的响应
+    """
+    request_id = getattr(request.state, "request_id", "")
+    try:
+        health_data = await HealthService.get_component_health()
+        components = health_data.get("components", {})
+        overall_health = health_data.get("overall_health", "unhealthy")
+        
+        # 根据 overall_health 确定 status
+        status = overall_health
+        
+        return success_response(
+            data={
+                "status": status,
+                "components": components,
+                "overall_health": overall_health
+            },
+            request_id=request_id
+        )
+    except Exception as e:
+        logger.error("健康检查失败", error=str(e))
+        return error_response(
+            error=f"Health check failed: {str(e)}",
+            request_id=request_id
+        )
+
+
+@router.get(
+    "/system/metrics",
+    response_model=ResponseModel,
+    summary="获取系统资源使用指标",
+    description="""
+    获取系统资源使用指标，包含CPU、内存、磁盘使用率和运行时间。
+
+    返回数据说明：
+    - **cpu_usage**: CPU使用率百分比
+    - **memory_usage**: 内存使用率百分比
+    - **disk_usage**: 磁盘使用率百分比
+    - **uptime_seconds**: 服务运行时间(秒)
+
+    适用于：
+    - 系统资源监控
+    - 性能分析
+    - 容量规划
+    """,
+    response_description="系统资源使用指标"
+)
+async def get_system_metrics(request: Request) -> ResponseModel:
+    """
+    获取系统资源使用指标，返回包含cpu_usage、memory_usage、disk_usage、uptime_seconds字段的响应
+    """
+    request_id = getattr(request.state, "request_id", "")
+    try:
+        resource_stats = await SystemStatsService.get_resource_stats()
+        
+        # 映射字段名到契约要求的字段
+        cpu_usage = resource_stats.get("cpu_percent", 0.0)
+        memory_usage = resource_stats.get("memory_percent", 0.0)
+        disk_usage = resource_stats.get("disk_percent", 0.0)
+        uptime_seconds = resource_stats.get("uptime_seconds", 0)
+        
+        return success_response(
+            data={
+                "cpu_usage": cpu_usage,
+                "memory_usage": memory_usage,
+                "disk_usage": disk_usage,
+                "uptime_seconds": uptime_seconds
+            },
+            request_id=request_id
+        )
+    except Exception as e:
+        logger.error("系统指标收集失败", error=str(e))
+        return error_response(
+            error=f"Metrics collection failed: {str(e)}",
             request_id=request_id
         )
 

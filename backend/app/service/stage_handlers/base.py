@@ -12,7 +12,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
 from app.models.pipeline import StageName, PipelineStatus
-from app.utils.agent_debug_utils import AgentDebugger
+from app.utils.agent_debug_utils import get_agent_debugger
 
 
 @dataclass
@@ -88,10 +88,51 @@ class StageHandler(ABC):
     """
     
     def __init__(self):
-        """初始化处理器，创建 AgentDebugger 实例"""
-        self.debugger = AgentDebugger(
-            enabled=settings.AGENT_DEBUG_ENABLED,
-            output_dir=settings.AGENT_DEBUG_OUTPUT_DIR
+        """初始化处理器，使用全局 AgentDebugger 实例"""
+        self.debugger = get_agent_debugger()
+
+    def _save_agent_log(
+        self,
+        agent_name: str,
+        stage: str,
+        input_data: Dict[str, Any],
+        output_data: Dict[str, Any],
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> None:
+        """
+        【封装】保存 Agent 调用日志
+
+        简化子类中的 Agent 调试记录，减少样板代码
+
+        Args:
+            agent_name: Agent 名称
+            stage: 阶段标识
+            input_data: 输入数据
+            output_data: 输出数据
+            system_prompt: 系统提示词
+            **kwargs: 额外的元数据
+        """
+        if not self.debugger:
+            return
+
+        metadata = {
+            "input_tokens": output_data.get("input_tokens", 0),
+            "output_tokens": output_data.get("output_tokens", 0),
+            "duration_ms": output_data.get("duration_ms", 0),
+        }
+        metadata.update(kwargs)
+
+        self.debugger.save_agent_io(
+            agent_name=agent_name,
+            stage=stage,
+            input_data=input_data,
+            output_data=output_data,
+            metadata=metadata,
+            success=output_data.get("success", False),
+            error=output_data.get("error"),
+            tool_calls=output_data.get("tool_results", []),
+            system_prompt=system_prompt
         )
     
     @property

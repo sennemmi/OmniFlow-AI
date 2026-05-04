@@ -194,8 +194,13 @@ class LangGraphAgent(ABC, Generic[T]):
                 response_format=response_format
             )
 
+            # 【DEBUG】记录 LLM 原始返回
+            raw_content = response.get("content", "")
+            logger.info(f"[{self.agent_name}] LLM 原始返回 (前 500 字符): {raw_content[:500]}")
+            logger.info(f"[{self.agent_name}] LLM 原始返回长度: {len(raw_content)}")
+
             # 尝试解析输出
-            parsed_output = self.parse_output(response["content"])
+            parsed_output = self.parse_output(raw_content)
 
             return {
                 **state,
@@ -205,6 +210,7 @@ class LangGraphAgent(ABC, Generic[T]):
                 "output_tokens": response.get("output_tokens", 0)
             }
         except Exception as e:
+            logger.error(f"[{self.agent_name}] _process_node 异常: {e}", exc_info=True)
             return {
                 **state,
                 "output": None,

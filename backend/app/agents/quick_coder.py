@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.base import BaseAgent
 from app.core.logging import logger, info, error
+from app.utils.prompt_builder import AgentPromptBuilder
 
 
 class QuickCoderOutput(BaseModel):
@@ -26,51 +27,40 @@ class QuickCoderOutput(BaseModel):
 class QuickCoderAgent(BaseAgent[QuickCoderOutput]):
     """轻量级代码修改 Agent"""
 
+    # 启用结构化输出，让 LLM 输出更规范的 JSON
+    USE_JSON_FORMAT = True
+    # 减少重试次数，JSON 解析失败这类错误重试意义不大
+    MAX_RETRIES = 2
+
     def __init__(self):
         super().__init__(agent_name="QuickCoder")
 
     @property
     def system_prompt(self) -> str:
-        return """你是一个专业的前端代码修改助手。
+        return f"""你是一个专业的前端代码修改助手。
 
 你的任务是根据用户指令和源码上下文，直接生成代码变更。
 
-## 输出格式
-必须返回 JSON 格式：
-{
-    "files": [
-        {
-            "file_path": "src/components/Button.tsx",
-            "content": "完整的文件内容"
-        }
-    ],
-    "summary": "变更摘要"
-}
+{AgentPromptBuilder.CODE_CHANGE_FORMAT}
 
 ## 核心规则
 1. **只修改与选中元素相关的代码** - 根据提供的 HTML 片段定位要修改的组件/元素
 2. **保持原有代码风格** - 不要改变未涉及部分的格式
-3. **返回完整的文件内容** - 不是 diff，是完整文件
-4. **样式修改优先用 Tailwind 类名** - 不是内联样式
-5. **确保代码语法正确**
-6. **重要**: 无论是否能确定具体修改位置，都必须返回 files 数组
+3. **样式修改优先用 Tailwind 类名** - 不是内联样式
+4. **确保代码语法正确**
+5. **重要**: 必须返回 files 数组，并且使用 modify 模式（search_block 和 replace_block 精确替换代码）。
+6. **删除操作**: 如果要删除代码，设置 `replace_block` 为空字符串 `""`，`search_block` 为要删除的代码
 
+## JSON 格式要求（极其重要）
+- **字符串内的换行必须使用 \\n 转义**，严禁在 JSON 字符串中直接出现原始换行符
+- search_block 和 replace_block 中的多行代码必须将换行符转义为 \\n
 ## 定位策略
-- 使用元素的 tag、id、class、text 内容来定位
+- 使用元素的 tag、id、class、text 内容定位
 - 如果提供了 outerHTML，优先匹配这个结构
-- 在周围代码(surrounding_code)中查找匹配的元素
 - 如果找不到精确匹配，修改最可能相关的部分
 
 ## 示例
-用户指令：将按钮颜色改为蓝色
-选中元素：`<button class="bg-red-500">提交</button>`
-周围代码包含：`className="bg-red-500"`
-输出：将 `className="bg-red-500"` 改为 `className="bg-blue-500"`
-
-用户指令：将"研发"改为"开发"
-选中元素文本："研发流程引擎"
-周围代码包含：`<h1>研发流程引擎</h1>`
-输出：`<h1>开发流程引擎</h1>`
+输出：应生成 modify 类型的 file 变更，search_block 包含原始代码（如 `className="bg-red-500"`），replace_block 包含新代码（如 `className="bg-blue-500"`）。
 """
 
     def build_user_prompt(self, state: Dict[str, Any]) -> str:
@@ -88,6 +78,18 @@ class QuickCoderAgent(BaseAgent[QuickCoderOutput]):
         logger.info(f"[QuickCoder] file_path: {file_path}")
         logger.info(f"[QuickCoder] file_content length: {len(file_content)}")
         logger.info(f"[QuickCoder] surrounding_code length: {len(surrounding_code)}")
+        
+        # 【DEBUG】检查 file_content 中是否包含 Background gradient
+        if "Background gradient" in file_content:
+            logger.info(f"[QuickCoder] file_content 包含 'Background gradient'")
+        else:
+            logger.info(f"[QuickCoder] file_content 不包含 'Background gradient'")
+        
+        # 【DEBUG】检查 surrounding_code 中是否包含 Background gradient
+        if "Background gradient" in surrounding_code:
+            logger.info(f"[QuickCoder] surrounding_code 包含 'Background gradient'")
+        else:
+            logger.info(f"[QuickCoder] surrounding_code 不包含 'Background gradient'")
 
         element_info = f"""
 【选中元素信息 - 这是你要修改的目标】
@@ -132,18 +134,12 @@ class QuickCoderAgent(BaseAgent[QuickCoderOutput]):
         return prompt
 
     def parse_output(self, response: str) -> Dict[str, Any]:
-        """解析 LLM 输出"""
+        """解析 LLM 输出 – 只清理 Markdown 标记，不额外处理换行符"""
         import re
-        # 去除 Markdown 代码块标记
-        json_str = re.sub(r'^```json\s*', '', response.strip())
-        json_str = re.sub(r'^```\s*', '', json_str)
-        json_str = re.sub(r'```\s*$', '', json_str)
-        json_str = json_str.strip()
-        
-        # 【调试】打印原始响应
-        logger.info(f"[QuickCoder] LLM 原始响应: {response[:500]}...")
-        logger.info(f"[QuickCoder] 解析后 JSON: {json_str[:500]}...")
-        
+        json_str = response.strip()
+        # 去掉可能的 ```json ... ``` 包裹
+        json_str = re.sub(r'^```(?:json)?\s*\n?', '', json_str)
+        json_str = re.sub(r'\n?```$', '', json_str)
         return json.loads(json_str)
 
     def validate_output(self, output: Dict[str, Any]) -> QuickCoderOutput:

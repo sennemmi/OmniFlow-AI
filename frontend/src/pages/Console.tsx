@@ -86,6 +86,14 @@ export function Console() {
   // 计算平均耗时
   const avgDuration = stats?.avg_duration ? Number(stats.avg_duration.toFixed(2)) : 0;
 
+  // 计算成功率
+  const completedPipelines = stats?.completed_pipelines || 0;
+  const failedPipelines = stats?.failed_pipelines || 0;
+  const totalCompleted = completedPipelines + failedPipelines;
+  const successRate = totalCompleted > 0
+    ? ((completedPipelines / totalCompleted) * 100).toFixed(1)
+    : '0.0';
+
   // 先按创建时间倒序排列（最新的在前），再取前 5 条
   const recentPipelines = [...pipelines]
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
@@ -185,9 +193,9 @@ export function Console() {
         />
         <MetricCard
           title="成功率"
-          value="98.5%"
-          subtitle="较上月 +2.3%"
-          trend="up"
+          value={`${successRate}%`}
+          subtitle="基于已完成流水线计算"
+          trend="neutral"
           icon={CheckCircle2}
           color="emerald"
         />

@@ -115,7 +115,7 @@ export function usePipelineNotification(
 
             // 浏览器通知
             sendBrowserNotification(
-              '✨ AI 已完成修改！',
+              '[完成] AI 已完成修改！',
               `Pipeline #${data.id} 所有阶段已执行完成。代码已自动同步并 Push 到 GitHub。`,
               '/assets/omniflow-icon.png'
             );
@@ -136,7 +136,7 @@ export function usePipelineNotification(
             });
 
             sendBrowserNotification(
-              '❌ Pipeline 执行失败',
+              '[错误] Pipeline 执行失败',
               `Pipeline #${data.id} 执行过程中出现错误，请查看详情。`,
               '/assets/omniflow-icon.png'
             );
@@ -153,7 +153,7 @@ export function usePipelineNotification(
   // 手动触发通知（用于测试）
   const triggerTestNotification = useCallback(() => {
     sendBrowserNotification(
-      '🔔 测试通知',
+      '[通知] 测试通知',
       '这是一条测试通知，用于验证通知系统是否正常工作。'
     );
     addToast({

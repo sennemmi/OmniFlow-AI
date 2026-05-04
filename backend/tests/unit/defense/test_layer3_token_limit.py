@@ -14,7 +14,8 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from typing import Dict, Any
 
-from app.agents.multi_agent_coordinator import MultiAgentCoordinator
+# 注意：MultiAgentCoordinator 已废弃，使用 AutoFixLoop 替代
+from app.agents.auto_fix_loop import AutoFixLoop
 from app.agents.base import LangGraphAgent, BaseAgentState
 
 pytestmark = [pytest.mark.defense, pytest.mark.layer3]
@@ -33,58 +34,58 @@ class TestTokenLimitEnforcement:
 
     def test_max_retries_limit_respected(self):
         """测试最大重试次数限制被尊重"""
-        coordinator = MultiAgentCoordinator()
+        auto_fix = AutoFixLoop()
 
         # 验证 MAX_FIX_RETRIES 常量存在且合理
-        assert hasattr(coordinator, 'MAX_FIX_RETRIES')
-        assert coordinator.MAX_FIX_RETRIES <= 5, "最大重试次数不应超过 5 次"
-        assert coordinator.MAX_FIX_RETRIES >= 1, "最大重试次数至少为 1 次"
+        assert hasattr(auto_fix, 'MAX_FIX_RETRIES')
+        assert auto_fix.MAX_FIX_RETRIES <= 5, "最大重试次数不应超过 5 次"
+        assert auto_fix.MAX_FIX_RETRIES >= 1, "最大重试次数至少为 1 次"
 
     def test_token_counter_initialized(self):
         """测试 Token 计数器正确初始化"""
-        coordinator = MultiAgentCoordinator()
+        auto_fix = AutoFixLoop()
 
         # 验证 Token 计数器存在
-        assert hasattr(coordinator, 'total_input_tokens')
-        assert hasattr(coordinator, 'total_output_tokens')
+        assert hasattr(auto_fix, 'total_input_tokens')
+        assert hasattr(auto_fix, 'total_output_tokens')
 
         # 初始值应该为 0
-        assert coordinator.total_input_tokens == 0
-        assert coordinator.total_output_tokens == 0
+        assert auto_fix.total_input_tokens == 0
+        assert auto_fix.total_output_tokens == 0
 
     def test_token_accumulation_tracked(self):
         """测试 Token 累积被追踪"""
-        coordinator = MultiAgentCoordinator()
+        auto_fix = AutoFixLoop()
 
         # 模拟累积 Token
-        coordinator.total_input_tokens += 1000
-        coordinator.total_output_tokens += 500
+        auto_fix.total_input_tokens += 1000
+        auto_fix.total_output_tokens += 500
 
         # 验证累积正确
-        assert coordinator.total_input_tokens == 1000
-        assert coordinator.total_output_tokens == 500
-        assert coordinator.total_input_tokens + coordinator.total_output_tokens == 1500
+        assert auto_fix.total_input_tokens == 1000
+        assert auto_fix.total_output_tokens == 500
+        assert auto_fix.total_input_tokens + auto_fix.total_output_tokens == 1500
 
     def test_excessive_input_tokens_should_stop(self):
         """测试过量输入 Token 应该停止"""
-        coordinator = MultiAgentCoordinator()
+        auto_fix = AutoFixLoop()
 
         # 模拟过量 Token
-        coordinator.total_input_tokens = MAX_INPUT_TOKENS + 1000
+        auto_fix.total_input_tokens = MAX_INPUT_TOKENS + 1000
 
         # 验证系统应该识别出超过限制
-        total = coordinator.total_input_tokens + coordinator.total_output_tokens
+        total = auto_fix.total_input_tokens + auto_fix.total_output_tokens
         assert total > MAX_INPUT_TOKENS, "总 Token 数应该超过限制"
 
     def test_excessive_output_tokens_should_stop(self):
         """测试过量输出 Token 应该停止"""
-        coordinator = MultiAgentCoordinator()
+        auto_fix = AutoFixLoop()
 
         # 模拟过量 Token
-        coordinator.total_output_tokens = MAX_OUTPUT_TOKENS + 1000
+        auto_fix.total_output_tokens = MAX_OUTPUT_TOKENS + 1000
 
         # 验证系统应该识别出超过限制
-        total = coordinator.total_input_tokens + coordinator.total_output_tokens
+        total = auto_fix.total_input_tokens + auto_fix.total_output_tokens
         assert total > MAX_OUTPUT_TOKENS, "总 Token 数应该超过限制"
 
 
@@ -108,8 +109,8 @@ class TestRetryLimitEnforcement:
 
     def test_max_retries_not_exceeded(self):
         """测试不超过最大重试次数"""
-        coordinator = MultiAgentCoordinator()
-        max_retries = coordinator.MAX_FIX_RETRIES
+        auto_fix = AutoFixLoop()
+        max_retries = auto_fix.MAX_FIX_RETRIES
 
         attempts = []
         for i in range(max_retries + 5):  # 尝试超过限制的次数
@@ -124,8 +125,8 @@ class TestRetryLimitEnforcement:
 
     def test_final_attempt_reports_failure(self):
         """测试最终尝试报告失败"""
-        coordinator = MultiAgentCoordinator()
-        max_retries = coordinator.MAX_FIX_RETRIES
+        auto_fix = AutoFixLoop()
+        max_retries = auto_fix.MAX_FIX_RETRIES
 
         # 模拟达到最大重试次数
         attempt = max_retries

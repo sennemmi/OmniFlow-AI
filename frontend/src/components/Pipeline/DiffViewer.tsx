@@ -100,7 +100,7 @@ export function DiffViewer({
             onClick={() => setTheme(theme === 'vs' ? 'vs-dark' : 'vs')}
             className="p-2 rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-tertiary transition-colors"
           >
-            {theme === 'vs' ? '🌙' : '☀️'}
+            {theme === 'vs' ? '[深色]' : '[浅色]'}
           </button>
 
           {/* 复制按钮 */}

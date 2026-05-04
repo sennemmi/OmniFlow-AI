@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from pydantic import BaseModel, ValidationError
 
 from app.agents.base import LangGraphAgent, MockAgent, BaseAgentState
-from app.agents.multi_agent_coordinator import MultiAgentCoordinator
+# 注意：MultiAgentCoordinator 已废弃，使用 AutoFixLoop 替代
 
 
 class FakeOutput(BaseModel):
@@ -169,7 +169,7 @@ class TestMaxRetriesLimitTerminatesLoop:
                     }
 
                     # 模拟 RepairerAgent 修复（但仍然失败）
-                    with patch('app.agents.repairer.RepairerAgent.execute_with_files') as mock_repair:
+                    with patch('app.agents.repairer_with_tools.RepairerAgentWithTools.execute_with_tools') as mock_repair:
                         mock_repair.return_value = {
                             "success": True,
                             "output": {
@@ -208,13 +208,14 @@ class TestMaxRetriesLimitTerminatesLoop:
 
     def test_should_retry_logic(self):
         """测试重试判断逻辑"""
-        coordinator = MultiAgentCoordinator()
+        from app.agents.auto_fix_loop import AutoFixLoop
+        auto_fix = AutoFixLoop()
 
         # 验证 MAX_FIX_RETRIES 常量
-        assert coordinator.MAX_FIX_RETRIES == 3
+        assert auto_fix.MAX_FIX_RETRIES == 3
 
         # 测试在达到最大重试次数后不再重试
-        assert coordinator.MAX_FIX_RETRIES == 3
+        assert auto_fix.MAX_FIX_RETRIES == 3
 
 
 class TestJsonStripMarkdown:

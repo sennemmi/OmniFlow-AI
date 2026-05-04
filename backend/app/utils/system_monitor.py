@@ -78,7 +78,7 @@ class SystemMonitor:
         try:
             async for session in get_session():
                 await session.execute(text("SELECT 1"))
-                await session.close()
+                # 注意：不需要手动调用 session.close()，get_session() 上下文管理器会自动处理
                 break
 
             response_time = int((time.time() - start_time) * 1000)

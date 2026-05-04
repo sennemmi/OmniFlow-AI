@@ -173,10 +173,10 @@ from app.utils.repair_utils import (
     build_fix_order,
     collect_target_files_async,
     extract_critical_files,
-    extract_file_paths,
     extract_pytest_failures,
     print_fix_result,
 )
+from app.utils.file_utils import extract_file_paths
 
 
 def add_agent_tokens(agent_result: Dict, tester: "ContractE2ETester") -> None:
@@ -848,7 +848,7 @@ class ContractE2ETester:
 
             # ========== Step 5: 语法验证 ==========
             print(f"\n   🔍 验证代码语法...")
-            syntax_errors = await self.e2e_service.validate_code_syntax(code_files, file_service)
+            syntax_errors = await self.e2e_service.validate_code_syntax(code_files, file_service, PIPELINE_ID)
 
             if syntax_errors:
                 print(f"   ❌ 发现 {len(syntax_errors)} 个语法错误，启动修复...")
@@ -870,11 +870,12 @@ class ContractE2ETester:
                     design_output=build_design_output_with_pipeline(design_output, PIPELINE_ID),
                     max_retries=DEFAULT_MAX_RETRIES,
                     debugger=self.debugger,
-                    coder_system_prompt=coder_agent.system_prompt
+                    coder_system_prompt=coder_agent.system_prompt,
+                    pipeline_id=PIPELINE_ID,
                 )
 
                 # 【修复】重新验证语法错误是否已修复，而不是仅检查 fixed_files
-                remaining_syntax_errors = await self.e2e_service.validate_code_syntax(code_files, file_service)
+                remaining_syntax_errors = await self.e2e_service.validate_code_syntax(code_files, file_service, PIPELINE_ID)
                 if remaining_syntax_errors:
                     print(f"   ❌ 修复后仍有 {len(remaining_syntax_errors)} 个语法错误")
                     for err in remaining_syntax_errors:
@@ -922,7 +923,8 @@ class ContractE2ETester:
             test_syntax_errors = await self.e2e_service.validate_code_syntax(
                 [{"file_path": tf.get("file_path", ""), "change_type": "add", "content": tf.get("content", "")}
                  for tf in test_files],
-                file_service
+                file_service,
+                PIPELINE_ID
             )
             if test_syntax_errors:
                 print(f"   ❌ 发现 {len(test_syntax_errors)} 个测试语法错误")

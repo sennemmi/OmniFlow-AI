@@ -57,7 +57,7 @@ export function Hero() {
                 to="/console"
                 className="group inline-flex items-center gap-2 px-8 py-4 bg-blue-500 text-white rounded-xl font-semibold text-lg hover:bg-blue-600 hover:shadow-lg hover:shadow-blue-500/25 hover:-translate-y-0.5 transition-all duration-300"
               >
-                免费开始使用
+                开始使用
                 <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
               </Link>
               <button className="group inline-flex items-center gap-2 px-6 py-4 text-white/80 hover:text-white border border-white/20 hover:border-white/40 rounded-xl backdrop-blur-sm transition-all duration-300">
@@ -93,7 +93,7 @@ export function Hero() {
                     </div>
                     <div>
                       <div className="text-white font-semibold">AI 正在生成代码...</div>
-                      <div className="text-white/40 text-sm">预计剩余 2 分钟</div>
+                      <div className="text-white/40 text-sm">预计剩余 3 分钟</div>
                     </div>
                   </div>
                   {/* 代码预览 */}
@@ -167,8 +167,6 @@ export function Hero() {
           </div>
         </div>
 
-        {/* 背景光晕：让提示区域在深色背景下更突出 */}
-        <div className="absolute -inset-4 bg-blue-500/5 blur-xl rounded-full -z-10 opacity-0 group-hover:opacity-100 transition-opacity" />
       </button>
     </section>
   );

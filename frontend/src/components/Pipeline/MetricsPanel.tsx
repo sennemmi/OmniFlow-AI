@@ -135,7 +135,7 @@ export function MetricsPanel({ stage }: MetricsPanelProps) {
         <MetricCard
           title="阶段状态"
           value={stage.status}
-          icon={<div className="w-5 h-5 flex items-center justify-center text-xs">●</div>}
+          icon={<div className="w-5 h-5 flex items-center justify-center text-xs">[运行中]</div>}
           color={
             stage.status === 'success' ? 'text-green-500' :
             stage.status === 'failed' ? 'text-red-500' :

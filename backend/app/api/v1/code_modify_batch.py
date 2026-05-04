@@ -72,6 +72,10 @@ class FileChangeResult(BaseModel):
     success: bool = Field(..., description="是否成功")
     error: Optional[str] = Field(default=None, description="错误信息")
     diff: Optional[str] = Field(default=None, description="代码 diff")
+    search_block: Optional[str] = Field(default=None, description="待搜索的原始代码块")
+    replace_block: Optional[str] = Field(default=None, description="替换后的新代码块")
+    change_type: Optional[str] = Field(default=None, description="变更类型: modify/create/delete")
+    new_content: Optional[str] = Field(default=None, description="完整的新文件内容")
 
 
 class BatchCodeModifyResponse(BaseModel):
@@ -152,7 +156,9 @@ async def modify_code_batch(
         for i, file_ctx in enumerate(data.files, 1):
             info(f"\n处理文件 {i}/{len(data.files)}: {file_ctx.file}")
 
-            file_path = process_file_path(file_ctx.file)
+            # 使用原始相对路径，让 read_file_context 基于 workspace 解析
+            # 避免 process_file_path 使用不同的 base 路径导致问题
+            file_path = file_ctx.file
 
             try:
                 # 1. 读取文件
@@ -196,7 +202,7 @@ async def modify_code_batch(
                     ))
                     continue
                 
-                # 4. 提取变更
+                # 4. 提取变更 (替换原有直接读取 content 的逻辑)
                 output = result.get("output", {})
                 files = output.get("files", [])
                 
@@ -209,16 +215,56 @@ async def modify_code_batch(
                     ))
                     continue
                 
-                new_content = files[0]["content"]
-                diff = generate_diff(content, new_content, file_path)
+                file_change = files[0]
+                change_type = file_change.get("change_type", "modify")
+                search_block = file_change.get("search_block", "")
+                replace_block = file_change.get("replace_block", "")
+                provided_content = file_change.get("content", "")
+                
+                new_content = ""
+                # 使用搜索块引擎进行精确替换
+                # 注意：replace_block 可以为空字符串（表示删除）
+                if change_type == "modify" and search_block is not None and replace_block is not None:
+                    from app.service.search_replace_engine import search_replace_engine
+                    new_content = search_replace_engine.apply_search_replace(
+                        original=content,
+                        search_block=search_block,
+                        replace_block=replace_block,
+                        fallback_start=file_change.get("fallback_start_line"),
+                        fallback_end=file_change.get("fallback_end_line")
+                    )
+                    if new_content is None:
+                        error(f"  ❌ search_block 匹配失败")
+                        results.append(FileChangeResult(
+                            file=file_ctx.file,
+                            success=False,
+                            error="search_block 匹配失败"
+                        ))
+                        continue
+                else:
+                    new_content = provided_content or content
+                
+                if not new_content:
+                    results.append(FileChangeResult(
+                        file=file_ctx.file,
+                        success=False,
+                        error="生成的代码内容为空"
+                    ))
+                    continue
+                
+                diff = generate_diff(content, new_content, str(file_path))
                 
                 info(f"  ✅ 代码生成成功")
                 
-                # 记录变更
+                # 记录变更（包含搜索替换块信息供前端使用）
                 results.append(FileChangeResult(
                     file=file_ctx.file,
                     success=True,
-                    diff=diff
+                    diff=diff,
+                    search_block=search_block if change_type == "modify" else None,
+                    replace_block=replace_block if change_type == "modify" else None,
+                    change_type=change_type,
+                    new_content=new_content
                 ))
                 
                 # 保存变更以便批量应用
@@ -246,7 +292,19 @@ async def modify_code_batch(
             info(f"\n应用 {len(changes_to_apply)} 个文件的变更...")
             try:
                 executor = CodeExecutorService(str(workspace))
-                executor.apply_changes(changes_to_apply, create_if_missing=False)
+                # 批量写入文件：先读取获取 read_token，再应用变更
+                for file_path, new_content in changes_to_apply.items():
+                    read_result = executor.read_file(file_path)
+                    change_result = executor.apply_file_change(
+                        relative_path=file_path,
+                        new_content=new_content,
+                        read_token=read_result.read_token,
+                        create_if_missing=False
+                    )
+                    if not change_result.success:
+                        error(f"❌ 文件 {file_path} 变更失败: {change_result.error}")
+                    else:
+                        info(f"✅ 文件 {file_path} 变更已应用")
                 info("✅ 所有变更已应用")
             except Exception as e:
                 error(f"应用变更失败: {e}")

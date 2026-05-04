@@ -150,8 +150,10 @@ class GitProviderService:
         Returns:
             GitResult: 操作结果
         """
+        # 使用 origin/base_branch 明确指定远程分支，避免歧义
+        remote_base = f"origin/{base_branch}"
         # 先切换到基础分支
-        self._run_git_command(["checkout", base_branch])
+        self._run_git_command(["checkout", remote_base])
         # 拉取最新代码
         self._run_git_command(["pull", "origin", base_branch], check=False)
         # 创建新分支

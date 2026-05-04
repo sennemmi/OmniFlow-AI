@@ -17,8 +17,7 @@ from app.agents.tester import test_agent
 from app.agents.repairer_with_tools import RepairerAgentWithTools
 from app.service.sandbox_manager import sandbox_manager
 from app.service.code_executor import CodeExecutorService
-from app.service.file_write_handler import file_write_handler
-from app.service.file_writer import FileWriterService
+from app.service.sandbox_file_service import SandboxFileService
 from app.service.import_sanitizer import ImportSanitizer
 from app.service.error_context_parser import parse_error_context
 from app.service.snapshot_service import get_snapshot_service
@@ -28,6 +27,7 @@ from app.core.sse_log_buffer import push_log
 from app.core.config import settings
 from app.core.resilience import ResilienceManager, RetryConfig, CircuitBreakerOpenError
 from app.core.contract_checker import check_contract_before_test, ContractViolationError
+from app.utils.file_operation_utils import merge_and_write_files
 
 
 def extract_missing_symbols(logs: str) -> List[str]:
@@ -103,7 +103,8 @@ class AutoFixLoop:
         sandbox_port: Optional[int] = None,
         error_context: Optional[str] = None,
         injected_files: Optional[Dict[str, str]] = None,
-        file_service: Optional[Any] = None
+        file_service: Optional[Any] = None,
+        debugger: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         执行带自动修复的多 Agent 代码生成
@@ -160,7 +161,8 @@ class AutoFixLoop:
                 test_files,
                 pipeline_id=pipeline_id,
                 error_context=current_error_context,
-                injected_files=injected_files  # 【核心】透传上游注入的文件内容
+                injected_files=injected_files,  # 【核心】透传上游注入的文件内容
+                debugger=debugger
             )
 
             self.total_input_tokens += code_result.get("input_tokens", 0) or 0
@@ -198,22 +200,108 @@ class AutoFixLoop:
                         "fatal_error": True
                     }
 
-                logger.error(f"AutoFixLoop: CoderAgent 执行失败", extra={
-                    "pipeline_id": pipeline_id,
-                    "attempt": attempt,
-                    "error": error_msg,
-                    "total_input_tokens": self.total_input_tokens,
-                    "total_output_tokens": self.total_output_tokens
-                })
-                return {
-                    "success": False,
-                    "error": f"Code generation failed: {error_msg}",
-                    "output": None,
-                    "attempt": attempt,
-                    "input_tokens": self.total_input_tokens,
-                    "output_tokens": self.total_output_tokens,
-                    "duration_ms": int((time.time() - start_time) * 1000)
-                }
+                # 【新增】处理键名不匹配重试（与 E2E 脚本保持一致）
+                if "返回键名与契约不一致" in error_msg:
+                    from app.utils.agent_output_utils import extract_key_mismatches
+                    key_mismatches = extract_key_mismatches(code_result.get("output", {}))
+                    
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"检测到返回键名不匹配，启动重试...",
+                        stage="CODING"
+                    )
+                    
+                    retry_result = await self._handle_key_mismatch_retry(
+                        pipeline_id=pipeline_id,
+                        key_mismatches=key_mismatches,
+                        design_output=design_output,
+                        injected_files=injected_files,
+                        debugger=debugger
+                    )
+                    
+                    if retry_result:
+                        code_result = retry_result
+                        # 更新 token 计数
+                        self.total_input_tokens += retry_result.get("input_tokens", 0) or 0
+                        self.total_output_tokens += retry_result.get("output_tokens", 0) or 0
+                        # 继续执行后续流程
+                        if code_result.get("success"):
+                            last_code_output = code_result.get("output", {})
+                    
+                    if not code_result.get("success"):
+                        logger.error(f"AutoFixLoop: 键名不匹配重试后仍然失败", extra={
+                            "pipeline_id": pipeline_id,
+                            "attempt": attempt
+                        })
+                        return {
+                            "success": False,
+                            "error": f"Code generation failed after key mismatch retry: {code_result.get('error', 'Unknown error')}",
+                            "output": None,
+                            "attempt": attempt,
+                            "input_tokens": self.total_input_tokens,
+                            "output_tokens": self.total_output_tokens,
+                            "duration_ms": int((time.time() - start_time) * 1000)
+                        }
+                
+                # 【新增】处理符号缺失重试（与 E2E 脚本保持一致）
+                elif "缺少契约要求的符号" in error_msg:
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"检测到符号缺失，启动重试...",
+                        stage="CODING"
+                    )
+                    
+                    retry_result = await self._handle_missing_symbols_retry(
+                        pipeline_id=pipeline_id,
+                        error_message=error_msg,
+                        design_output=design_output,
+                        injected_files=injected_files,
+                        debugger=debugger
+                    )
+                    
+                    if retry_result:
+                        code_result = retry_result
+                        # 更新 token 计数
+                        self.total_input_tokens += retry_result.get("input_tokens", 0) or 0
+                        self.total_output_tokens += retry_result.get("output_tokens", 0) or 0
+                        # 继续执行后续流程
+                        if code_result.get("success"):
+                            last_code_output = code_result.get("output", {})
+                    
+                    if not code_result.get("success"):
+                        logger.error(f"AutoFixLoop: 符号缺失重试后仍然失败", extra={
+                            "pipeline_id": pipeline_id,
+                            "attempt": attempt
+                        })
+                        return {
+                            "success": False,
+                            "error": f"Code generation failed after missing symbols retry: {code_result.get('error', 'Unknown error')}",
+                            "output": None,
+                            "attempt": attempt,
+                            "input_tokens": self.total_input_tokens,
+                            "output_tokens": self.total_output_tokens,
+                            "duration_ms": int((time.time() - start_time) * 1000)
+                        }
+                else:
+                    # 其他错误，直接返回
+                    logger.error(f"AutoFixLoop: CoderAgent 执行失败", extra={
+                        "pipeline_id": pipeline_id,
+                        "attempt": attempt,
+                        "error": error_msg,
+                        "total_input_tokens": self.total_input_tokens,
+                        "total_output_tokens": self.total_output_tokens
+                    })
+                    return {
+                        "success": False,
+                        "error": f"Code generation failed: {error_msg}",
+                        "output": None,
+                        "attempt": attempt,
+                        "input_tokens": self.total_input_tokens,
+                        "output_tokens": self.total_output_tokens,
+                        "duration_ms": int((time.time() - start_time) * 1000)
+                    }
 
             # 2. 处理生成的文件
             code_output = code_result.get("code_output", {})
@@ -272,36 +360,37 @@ class AutoFixLoop:
                 code_output["files"] = all_files
                 code_output["import_fixes"] = fix_report
 
-            # 【改造后】使用 FileWriterService 写入文件（CoderAgent 已不再使用工具）
-            file_writer = FileWriterService(settings.TARGET_PROJECT_PATH)
-            write_results = file_writer.apply_changes(all_files)
+            # 【架构优化】使用 SandboxFileService 直接写入 Docker Sandbox
+            # 不再写入宿主机，所有文件操作都在 Sandbox 中进行
+            file_service = SandboxFileService(pipeline_id)
 
-            # 检查写入结果
-            failed_writes = [r for r in write_results if not r.get("success")]
-            if failed_writes:
-                failed_files = [r.get("file") for r in failed_writes]
-                error_msgs = [f"{r.get('file')}: {r.get('error')}" for r in failed_writes]
-                logger.error(f"[Pipeline {pipeline_id}] 文件写入失败: {failed_files}")
+            # 创建重试回调函数
+            async def retry_callback(fp, sb, rb, cc):
+                return await self._handle_search_block_retry(
+                    pipeline_id, fp, sb, rb, cc, all_files
+                )
+
+            # 使用 merge_and_write_files 合并写入文件
+            written_count = await merge_and_write_files(all_files, file_service, retry_callback)
+
+            if written_count == 0 and all_files:
+                logger.error(f"[Pipeline {pipeline_id}] 文件写入失败: 没有成功写入任何文件")
                 await push_log(
                     pipeline_id, "error",
-                    f"❌ 文件写入失败 ({len(failed_writes)} 个): {', '.join(failed_files[:3])}",
+                    f"❌ 文件写入失败: 没有成功写入任何文件",
                     stage="CODING"
                 )
 
                 # 构建错误上下文，让 CoderAgent 在下次重试时修复
                 current_error_context = (
-                    f"文件写入失败，请检查 search_block 是否精确匹配文件内容。\n"
-                    f"失败文件:\n" + "\n".join(error_msgs[:5])
+                    f"文件写入失败，请检查 search_block 是否精确匹配文件内容。"
                 )
                 attempt += 1
                 continue
 
-            # 写入成功，同步到 sandbox
-            await self._sync_files_to_sandbox(all_files, pipeline_id)
-
             await push_log(
                 pipeline_id, "info",
-                f"✅ 文件写入成功 ({len(all_files)} 个文件)",
+                f"✅ 文件写入成功 ({written_count} 个文件)",
                 stage="CODING"
             )
 
@@ -641,13 +730,223 @@ class AutoFixLoop:
             "duration_ms": int((time.time() - start_time) * 1000)
         }
 
+    async def _handle_key_mismatch_retry(
+        self,
+        pipeline_id: int,
+        key_mismatches: List[Dict],
+        design_output: Dict,
+        injected_files: Dict[str, str],
+        debugger: Optional[Any] = None
+    ) -> Optional[Dict]:
+        """
+        处理返回键名不匹配的重试逻辑（与 E2E 脚本保持一致）
+        
+        Args:
+            pipeline_id: Pipeline ID
+            key_mismatches: 键名不匹配列表
+            design_output: 设计输出
+            injected_files: 注入的文件内容
+            debugger: AgentDebugger 实例
+            
+        Returns:
+            重试结果，如果重试失败返回 None
+        """
+        from app.agents.coder import coder_agent
+        from app.utils.agent_instruction_utils import (
+            build_key_mismatch_fix_instruction,
+            build_retry_fix_instruction
+        )
+        
+        max_retries = 3
+        key_mismatch_instruction = build_key_mismatch_fix_instruction(
+            key_mismatches, injected_files
+        )
+
+        for retry_attempt in range(max_retries):
+            await push_log(
+                pipeline_id,
+                "warning",
+                f"返回键名不匹配，第 {retry_attempt + 1}/{max_retries} 次重试...",
+                stage="CODING"
+            )
+
+            instruction, force_full_file = build_retry_fix_instruction(
+                retry_attempt, max_retries, key_mismatch_instruction
+            )
+
+            retry_design_output = {
+                **design_output,
+                "fix_mode": True,
+                "force_full_file": force_full_file,
+                "fix_instruction": instruction,
+                "affected_files": list(injected_files.keys())
+            }
+
+            retry_input = {
+                "design_output": retry_design_output,
+                "pipeline_id": pipeline_id,
+                "injected_files": injected_files
+            }
+            retry_result = await coder_agent.generate_code(**retry_input)
+
+            # 保存调试信息
+            if debugger:
+                debugger.save_agent_io(
+                    agent_name="CoderAgent",
+                    stage=f"key_mismatch_retry_{retry_attempt + 1}",
+                    input_data=retry_input,
+                    output_data=retry_result,
+                    metadata={
+                        "attempt": retry_attempt + 1,
+                        "max_retries": max_retries,
+                        "key_mismatches": key_mismatches
+                    },
+                    success=retry_result.get("success", False),
+                    error=retry_result.get("error"),
+                    tool_calls=retry_result.get("tool_results", []),
+                    system_prompt=coder_agent.system_prompt
+                )
+
+            if retry_result.get("success"):
+                await push_log(
+                    pipeline_id,
+                    "success",
+                    f"第 {retry_attempt + 1} 次重试成功",
+                    stage="CODING"
+                )
+                return retry_result
+            else:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"第 {retry_attempt + 1} 次重试失败: {retry_result.get('error', 'Unknown error')}",
+                    stage="CODING"
+                )
+
+        return None
+
+    async def _handle_missing_symbols_retry(
+        self,
+        pipeline_id: int,
+        error_message: str,
+        design_output: Dict,
+        injected_files: Dict[str, str],
+        debugger: Optional[Any] = None
+    ) -> Optional[Dict]:
+        """
+        处理符号缺失的重试逻辑（与 E2E 脚本保持一致）
+        
+        Args:
+            pipeline_id: Pipeline ID
+            error_message: 错误消息
+            design_output: 设计输出
+            injected_files: 注入的文件内容
+            debugger: AgentDebugger 实例
+            
+        Returns:
+            重试结果，如果重试失败返回 None
+        """
+        import re
+        from app.agents.coder import coder_agent
+        from app.utils.agent_instruction_utils import (
+            build_contract_fix_instruction,
+            build_retry_fix_instruction
+        )
+
+        max_retries = 3
+
+        # 从错误消息中提取缺失的符号信息
+        missing_symbols = re.findall(r"'([^']+)'", error_message)
+
+        # 构建 interface_specs 中缺失符号的详细信息
+        interface_specs = design_output.get("interface_specs", [])
+        missing_specs = []
+        for spec in interface_specs:
+            symbol_name = spec.get("symbol_name", "")
+            module = spec.get("module", "")
+            key = f"{symbol_name} in {module}"
+            if any(key in m for m in missing_symbols):
+                missing_specs.append(spec)
+
+        fix_instruction = build_contract_fix_instruction(missing_specs)
+
+        for retry_attempt in range(max_retries):
+            await push_log(
+                pipeline_id,
+                "warning",
+                f"符号缺失，第 {retry_attempt + 1}/{max_retries} 次重试...",
+                stage="CODING"
+            )
+
+            instruction, force_full_file = build_retry_fix_instruction(
+                retry_attempt, max_retries, fix_instruction
+            )
+
+            retry_design_output = {
+                **design_output,
+                "fix_mode": True,
+                "force_full_file": True,  # 符号缺失时强制完整文件
+                "fix_instruction": instruction,
+                "affected_files": list(set(
+                    [s.get("module", "").replace(".", "/") + ".py" for s in missing_specs if s.get("module")]
+                    + list(injected_files.keys())
+                ))
+            }
+
+            retry_input = {
+                "design_output": retry_design_output,
+                "pipeline_id": pipeline_id,
+                "injected_files": injected_files
+            }
+            retry_result = await coder_agent.generate_code(**retry_input)
+
+            # 保存调试信息
+            if debugger:
+                debugger.save_agent_io(
+                    agent_name="CoderAgent",
+                    stage=f"missing_symbols_retry_{retry_attempt + 1}",
+                    input_data=retry_input,
+                    output_data=retry_result,
+                    metadata={
+                        "attempt": retry_attempt + 1,
+                        "max_retries": max_retries,
+                        "missing_specs": [
+                            {"symbol_name": s.get("symbol_name"), "module": s.get("module")}
+                            for s in missing_specs
+                        ]
+                    },
+                    success=retry_result.get("success", False),
+                    error=retry_result.get("error"),
+                    tool_calls=retry_result.get("tool_results", []),
+                    system_prompt=coder_agent.system_prompt
+                )
+
+            if retry_result.get("success"):
+                await push_log(
+                    pipeline_id,
+                    "success",
+                    f"第 {retry_attempt + 1} 次重试成功",
+                    stage="CODING"
+                )
+                return retry_result
+            else:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"第 {retry_attempt + 1} 次重试失败: {retry_result.get('error', 'Unknown error')}",
+                    stage="CODING"
+                )
+
+        return None
+
     async def _execute_code_agent(
         self,
         design_output: Dict[str, Any],
         test_files: Dict[str, str],
         pipeline_id: Optional[int] = None,
         error_context: Optional[str] = None,
-        injected_files: Optional[Dict[str, str]] = None
+        injected_files: Optional[Dict[str, str]] = None,
+        debugger: Optional[Any] = None
     ) -> Dict[str, Any]:
         """执行 CoderAgent"""
         from app.agents.coder import coder_agent
@@ -662,13 +961,34 @@ class AutoFixLoop:
         # 构建增强的 design_output（包含测试文件参考）
         enhanced_design = self._build_coder_prompt_with_tests(design_output, {}, test_files)
 
+        # 构建输入数据
+        coder_input = {
+            "design_output": enhanced_design,
+            "pipeline_id": pipeline_id,
+            "error_context": error_context,
+            "injected_files": injected_files
+        }
+
         try:
-            code_result = await coder_agent.generate_code(
-                design_output=enhanced_design,
-                pipeline_id=pipeline_id,
-                error_context=error_context,
-                injected_files=injected_files  # 【核心】透传上游注入的文件内容
-            )
+            code_result = await coder_agent.generate_code(**coder_input)
+
+            # 【新增】保存 Agent 输入输出到 debugger
+            if debugger:
+                debugger.save_agent_io(
+                    agent_name="CoderAgent",
+                    stage="generate_code",
+                    input_data=coder_input,
+                    output_data=code_result,
+                    metadata={
+                        "input_tokens": code_result.get("input_tokens", 0),
+                        "output_tokens": code_result.get("output_tokens", 0),
+                        "duration_ms": code_result.get("duration_ms", 0)
+                    },
+                    success=code_result.get("success", False),
+                    error=code_result.get("error"),
+                    tool_calls=code_result.get("tool_results", []),
+                    system_prompt=coder_agent.system_prompt
+                )
 
             if code_result["success"]:
                 return {
@@ -760,90 +1080,70 @@ class AutoFixLoop:
 
         return enhanced_design
 
-    async def _write_files_to_sandbox(
+    async def _handle_search_block_retry(
         self,
-        all_files: List[Dict[str, Any]],
-        pipeline_id: int
-    ) -> None:
-        """写入文件到容器（用于实时预览）"""
-        for file_change in all_files:
-            await sandbox_manager.write_file(
-                pipeline_id=pipeline_id,
-                path=file_change["file_path"],
-                content=file_change["content"]
+        pipeline_id: int,
+        file_path: str,
+        search_block: str,
+        replace_block: str,
+        current_content: str,
+        all_files: List[Dict[str, Any]]
+    ) -> tuple[bool, str]:
+        """
+        处理 search_block 不匹配的重试
+        返回 (success, new_content)
+        
+        【架构优化】复用 E2E 测试脚本的实现
+        """
+        from app.utils.agent_instruction_utils import build_search_block_retry_instruction
+
+        max_retries = 3
+        for retry_attempt in range(max_retries):
+            logger.info(f"[Pipeline {pipeline_id}] 重新请求 CoderAgent 修复 {file_path} (第 {retry_attempt + 1}/{max_retries} 次)...")
+            await push_log(
+                pipeline_id, "info",
+                f"🔄 修复 search_block 不匹配: {file_path} (第 {retry_attempt + 1}/{max_retries} 次)",
+                stage="CODING"
             )
 
-    async def _sync_files_to_sandbox(
-        self,
-        all_files: List[Dict[str, Any]],
-        pipeline_id: int
-    ) -> None:
-        """
-        同步已修改的文件到 sandbox（工具驱动模式）
+            retry_input = {
+                "design_output": {
+                    "fix_mode": True,
+                    "fix_instruction": build_search_block_retry_instruction(
+                        file_path, current_content, replace_block
+                    ),
+                    "affected_files": [file_path]
+                },
+                "pipeline_id": pipeline_id,
+                "injected_files": {file_path: current_content}
+            }
+            retry_result = await coder_agent.generate_code(**retry_input)
 
-        在工具驱动模式下，文件已通过 replace_lines 工具写入项目目录，
-        此方法将文件同步到 sandbox 容器用于预览。
-        
-        【P3】对于没有 content 的文件，从宿主机项目目录读取最新内容再同步。
-        """
-        from app.core.config import settings
-        from pathlib import Path
+            if retry_result.get("success"):
+                retry_output = retry_result.get("output", {})
+                retry_files = retry_output.get("files", [])
 
-        target_path = Path(settings.TARGET_PROJECT_PATH)
-        if not target_path.is_absolute():
-            backend_dir = Path(__file__).parent.parent
-            target_path = backend_dir.parent / settings.TARGET_PROJECT_PATH
+                for rfc in retry_files:
+                    rfp = normalize_file_path(rfc.get("file_path", ""))
+                    if rfp == file_path:
+                        r_search = rfc.get("search_block", "")
+                        r_replace = rfc.get("replace_block", "")
+                        r_content = rfc.get("content", "")
 
-        logger.info(f"[Pipeline {pipeline_id}] 【P3】开始同步 {len(all_files)} 个文件到 sandbox")
-        
-        files_read_from_host = 0
-        files_with_content = 0
-        sync_success = 0
-        sync_failed = 0
-
-        for file_change in all_files:
-            file_path = file_change.get("file_path", "")
-            content = file_change.get("content", "")
-            
-            if not file_path:
-                logger.warning(f"[Pipeline {pipeline_id}] 【P3】跳过没有 file_path 的文件变更")
-                continue
-
-            # 【P3】如果没有 content，从宿主机项目目录读取
-            if not content:
-                relative_path = file_path.replace("backend/", "").replace("backend\\", "")
-                full_path = target_path / relative_path
-                
-                try:
-                    if full_path.exists():
-                        content = full_path.read_text(encoding='utf-8')
-                        files_read_from_host += 1
-                        logger.info(f"[Pipeline {pipeline_id}] 【P3】从宿主机读取文件内容: {full_path} ({len(content)} 字符)")
-                    else:
-                        logger.warning(f"[Pipeline {pipeline_id}] 【P3】文件不存在，跳过同步: {full_path}")
-                        continue
-                except Exception as e:
-                    logger.error(f"[Pipeline {pipeline_id}] 【P3】读取文件失败 {file_path}: {e}")
-                    sync_failed += 1
-                    continue
+                        if r_search and r_search in current_content:
+                            new_content = current_content.replace(r_search, r_replace, 1)
+                            logger.info(f"[Pipeline {pipeline_id}] modify(重试成功): {file_path}")
+                            return True, new_content
+                        elif r_content:
+                            logger.info(f"[Pipeline {pipeline_id}] modify(重试-完整覆盖): {file_path}")
+                            return True, r_content
+                        else:
+                            logger.warning(f"[Pipeline {pipeline_id}] modify(重试 {retry_attempt + 1} 无法应用): {file_path}")
             else:
-                files_with_content += 1
-            
-            # 同步到 sandbox
-            try:
-                await sandbox_manager.write_file(
-                    pipeline_id=pipeline_id,
-                    path=file_path,
-                    content=content
-                )
-                sync_success += 1
-                logger.debug(f"[Pipeline {pipeline_id}] 【P3】同步文件到 sandbox: {file_path}")
-            except Exception as e:
-                sync_failed += 1
-                logger.error(f"[Pipeline {pipeline_id}] 【P3】同步文件失败 {file_path}: {e}")
-        
-        logger.info(f"[Pipeline {pipeline_id}] 【P3】同步完成: {sync_success} 成功, {sync_failed} 失败, "
-                   f"{files_read_from_host} 从宿主机读取, {files_with_content} 已有 content")
+                logger.warning(f"[Pipeline {pipeline_id}] modify(重试 {retry_attempt + 1} 失败): {file_path} - {retry_result.get('error', '未知错误')}")
+
+        logger.error(f"[Pipeline {pipeline_id}] modify(所有重试均失败): {file_path} - 跳过此修改")
+        return False, current_content
 
     async def _validate_code_syntax(
         self,
@@ -859,6 +1159,42 @@ class AutoFixLoop:
 
         Returns:
             语法错误列表，如果没有错误返回空列表
+        """
+        # 提取文件路径列表
+        file_paths = [
+            f.get("file_path", "") for f in all_files
+            if f.get("file_path") and f.get("content") and f.get("file_path", "").endswith(".py")
+        ]
+
+        if not file_paths:
+            return []
+
+        # 优先使用沙箱内语法检查（避免 Windows 编码问题）
+        try:
+            from app.service.code_validation_service import code_validation_service
+            sandbox_errors = await code_validation_service.check_syntax_in_sandbox(
+                file_paths=file_paths,
+                pipeline_id=pipeline_id
+            )
+            return [
+                {
+                    "file": err.file,
+                    "error": err.error,
+                    "line": err.line
+                }
+                for err in sandbox_errors
+            ]
+        except Exception as e:
+            logger.warning(f"[Pipeline {pipeline_id}] 沙箱内语法检查失败，回退到宿主机检查: {e}")
+            return await self._validate_syntax_host(all_files, pipeline_id)
+
+    async def _validate_syntax_host(
+        self,
+        all_files: List[Dict],
+        pipeline_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        在宿主机上验证代码语法（使用 UTF-8 编码）
         """
         import py_compile
         import tempfile
@@ -877,8 +1213,8 @@ class AutoFixLoop:
             if not file_path.endswith(".py"):
                 continue
 
-            # 创建临时文件进行语法检查
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+            # 创建临时文件进行语法检查（强制 UTF-8 编码）
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
                 tmp.write(content)
                 tmp_path = tmp.name
 
@@ -1070,12 +1406,31 @@ class AutoFixLoop:
             stage="CODING"
         )
 
+        # 构建测试路径
+        if test_files:
+            test_paths = []
+            for tf in test_files:
+                fp = tf.get("file_path", "")
+                if fp:
+                    if "tests/ai_generated" in fp:
+                        test_paths.append(fp)
+                    elif "tests/" in fp:
+                        test_paths.append(fp)
+                    else:
+                        test_paths.append(f"backend/tests/ai_generated/{fp.split('/')[-1]}")
+            if test_paths:
+                test_path_str = " ".join(test_paths)
+            else:
+                test_path_str = "backend/tests/ai_generated"
+        else:
+            test_path_str = "backend/tests/ai_generated"
+
         async def _do_run_tests():
             # 【优化】移除 -x 参数，让 pytest 跑完全部测试，一次性收集所有失败
             # 【重要】不再使用 tail 截断日志，确保获取所有错误信息
             test_result_cmd = await sandbox_manager.exec_command(
                 pipeline_id=pipeline_id,
-                cmd="cd /workspace/backend && python -m pytest tests/ -v --tb=short --color=no 2>&1",
+                cmd=f"cd /workspace && PYTHONPATH=/workspace/backend python -m pytest {test_path_str} -v --tb=short --color=no 2>&1",
                 timeout=120
             )
             return test_result_cmd
@@ -1124,9 +1479,14 @@ class AutoFixLoop:
         # 分析错误类型
         error_type = None
         failed_tests = []
+        error_tests = []
 
         if not test_success:
             import re
+
+            # 提取失败的测试 (FAILED) 和错误的测试 (ERROR)
+            failed_tests = re.findall(r'FAILED\s+(\S+::\S+)', test_logs)
+            error_tests = re.findall(r'ERROR\s+(\S+)', test_logs)
 
             if "SyntaxError" in test_logs and "test_" in test_logs:
                 error_type = "test_syntax_error"
@@ -1137,12 +1497,10 @@ class AutoFixLoop:
                     error_type = "import_error"
             elif "collection error" in test_logs.lower() or "ImportError while loading" in test_logs:
                 error_type = "test_collection_error"
-            elif "FAILED" in test_logs or "failed" in test_logs.lower():
+            elif failed_tests:
                 error_type = "test_failure"
-                # 【修复】修正正则表达式，匹配 pytest 的 FAILED 格式
-                # pytest 格式: FAILED tests/test_file.py::test_func
-                failed_matches = re.findall(r'FAILED\s+(\S+::\S+)', test_logs)
-                failed_tests = failed_matches
+            elif error_tests:
+                error_type = "test_error"
             elif "timeout" in test_logs.lower():
                 error_type = "timeout"
             else:
@@ -1156,7 +1514,8 @@ class AutoFixLoop:
             "error": None if test_success else test_logs[:500],
             "error_type": error_type,
             "failed_tests": failed_tests,
-            "is_test_file_error": error_type in ["test_syntax_error", "test_import_error", "test_collection_error"] if error_type else False
+            "error_tests": error_tests,
+            "is_test_file_error": error_type in ["test_syntax_error", "test_import_error", "test_collection_error", "test_error"] if error_type else False
         }
 
     async def _start_preview_server(

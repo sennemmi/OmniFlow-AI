@@ -55,7 +55,11 @@ class ImportSanitizer:
             Tuple[str, List[str]]: (修正后的内容, 修正记录列表)
         """
         if not file_path.endswith('.py'):
-            return content, []
+            return content or '', []
+
+        # 处理 None 或空内容
+        if content is None:
+            return '', []
 
         fixes_applied = []
         lines = content.split('\n')
@@ -88,7 +92,7 @@ class ImportSanitizer:
         sanitized: List[Dict[str, Any]] = []
 
         for f in files:
-            content = f.get('content', '')
+            content = f.get('content') or ''
             file_path = f.get('file_path', '')
 
             fixed_content, fixes = cls.sanitize_file(content, file_path)

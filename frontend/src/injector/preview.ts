@@ -18,7 +18,11 @@ class PreviewManager {
     modifiedContent: null,
     previewBanner: null,
     escHandler: null,
+    isBatch: false,
+    successCount: 0,
+    failedCount: 0,
   };
+  private scrollHandler: (() => void) | null = null;
 
   /**
    * 初始化预览模块
@@ -31,34 +35,96 @@ class PreviewManager {
    * 绑定事件监听
    */
   private bindEvents(): void {
-    bus.on('ui:preview-controls:show', ({ filePath, originalContent }) => {
-      this.createPreviewControls(filePath, originalContent);
+    console.log('[PreviewManager] 绑定事件监听');
+    
+    bus.on('ui:preview-controls:show', ({ filePath, originalContent, isBatch, successCount, failedCount }) => {
+      console.log('[PreviewManager] 收到显示预览控制事件:', { filePath, originalContentLength: originalContent?.length, isBatch, successCount, failedCount });
+      this.createPreviewControls(filePath, originalContent, isBatch, successCount, failedCount);
     });
 
     bus.on('ui:preview-controls:hide', () => {
+      console.log('[PreviewManager] 收到隐藏预览控制事件');
       this.clearPreviewUI();
     });
+    
+    console.log('[PreviewManager] 事件监听绑定完成');
   }
 
   /**
    * 创建预览控制浮层
    */
-  private createPreviewControls(filePath: string, originalContent: string): void {
-    // 清除之前的预览 UI
-    this.clearPreviewUI();
+  private createPreviewControls(
+    filePath: string,
+    originalContent: string,
+    isBatch = false,
+    successCount = 0,
+    failedCount = 0
+  ): void {
+    console.log('[PreviewManager] 创建预览控制浮层:', { filePath, originalContentLength: originalContent?.length, isBatch });
 
-    // 保存状态
-    this.state.filePath = filePath;
-    this.state.originalContent = originalContent;
-    this.state.isPreviewing = true;
+    try {
+      // 清除之前的预览 UI
+      this.clearPreviewUI();
 
-    // 添加毛玻璃样式
-    this.injectStyles();
+      // 保存状态
+      this.state.filePath = filePath;
+      this.state.originalContent = originalContent;
+      this.state.isPreviewing = true;
+      this.state.isBatch = isBatch;
+      this.state.successCount = successCount;
+      this.state.failedCount = failedCount;
 
-    // 创建预览中提示条
-    const banner = this.createBanner(filePath, originalContent);
-    document.body.appendChild(banner);
-    this.state.previewBanner = banner;
+      // 添加毛玻璃样式
+      this.injectStyles();
+
+      // 创建预览中提示条
+      const banner = this.createBanner(filePath, originalContent, isBatch, successCount, failedCount);
+      
+      // 检查 document.body 是否存在
+      if (!document.body) {
+        console.error('[PreviewManager] document.body 不存在，无法添加预览横幅');
+        bus.emit('ui:toast', { message: '预览界面创建失败：页面未加载完成', type: 'error' });
+        return;
+      }
+      
+      document.body.appendChild(banner);
+      this.state.previewBanner = banner;
+
+      // 绑定滚动事件，让横幅跟随页面
+      this.bindScrollHandler();
+
+      console.log('[PreviewManager] 预览横幅已添加到 DOM');
+    } catch (error) {
+      console.error('[PreviewManager] 创建预览控制浮层失败:', error);
+      bus.emit('ui:toast', { message: '预览界面创建失败', type: 'error' });
+    }
+  }
+
+  /**
+   * 绑定滚动事件处理器
+   */
+  private bindScrollHandler(): void {
+    // 移除旧的处理器
+    if (this.scrollHandler) {
+      window.removeEventListener('scroll', this.scrollHandler);
+    }
+
+    // 保存横幅的初始位置
+    const banner = this.state.previewBanner;
+    if (!banner) return;
+
+    const initialTop = 16; // 固定距离顶部的距离
+
+    // 创建新的滚动处理器
+    this.scrollHandler = () => {
+      if (banner && this.state.isPreviewing) {
+        // 横幅保持固定在顶部，不随页面滚动
+        banner.style.position = 'fixed';
+        banner.style.top = `${initialTop}px`;
+      }
+    };
+
+    window.addEventListener('scroll', this.scrollHandler, { passive: true });
   }
 
   /**
@@ -86,15 +152,31 @@ class PreviewManager {
         to { transform: rotate(360deg); }
       }
     `;
+    
+    // 检查 document.head 是否存在
+    if (!document.head) {
+      console.error('[PreviewManager] document.head 不存在，无法添加样式');
+      return;
+    }
+    
     document.head.appendChild(style);
   }
 
   /**
    * 创建预览横幅
    */
-  private createBanner(filePath: string, originalContent: string): HTMLElement {
+  private createBanner(
+    filePath: string,
+    originalContent: string,
+    isBatch = false,
+    successCount = 0,
+    failedCount = 0
+  ): HTMLElement {
+    console.log('[PreviewManager] createBanner 开始:', { filePath, originalContentLength: originalContent?.length, isBatch, successCount, failedCount });
+    
     const banner = document.createElement('div');
     banner.id = 'omni-preview-banner';
+    console.log('[PreviewManager] banner 元素创建成功');
     banner.style.cssText = `
       position: fixed;
       top: 16px;
@@ -122,12 +204,18 @@ class PreviewManager {
     const closeIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`;
     const checkIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 
+    // 批量修改显示不同的文案
+    const title = isBatch ? '批量预览模式' : '预览模式';
+    const subtitle = isBatch
+      ? `${successCount} 个文件已更新，${failedCount > 0 ? `${failedCount} 个失败，` : ''}查看效果后确认或取消`
+      : 'Vite 热更新已应用变更，查看效果后确认或取消';
+
     banner.innerHTML = `
       <div style="display: flex; align-items: center; gap: 16px;">
         <div style="width: 44px; height: 44px; background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(147, 51, 234, 0.2)); border-radius: 12px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(96, 165, 250, 0.3); animation: omni-pulse 2s infinite;">${eyeIcon}</div>
         <div>
-          <div style="font-weight: 600; font-size: 15px; letter-spacing: -0.01em; color: #f8fafc;">预览模式</div>
-          <div style="font-size: 13px; color: #94a3b8; margin-top: 2px;">Vite 热更新已应用变更，查看效果后确认或取消</div>
+          <div style="font-weight: 600; font-size: 15px; letter-spacing: -0.01em; color: #f8fafc;">${title}</div>
+          <div style="font-size: 13px; color: #94a3b8; margin-top: 2px;">${subtitle}</div>
         </div>
       </div>
       <div style="display: flex; gap: 10px;">
@@ -139,24 +227,29 @@ class PreviewManager {
     // 绑定事件
     const cancelBtn = banner.querySelector<HTMLButtonElement>('#omni-preview-cancel-btn');
     const confirmBtn = banner.querySelector<HTMLButtonElement>('#omni-preview-confirm-btn');
+    console.log('[PreviewManager] 按钮元素查询:', { cancelBtn: !!cancelBtn, confirmBtn: !!confirmBtn });
 
     cancelBtn?.addEventListener('click', () => {
+      console.log('[PreviewManager] 取消按钮点击');
       this.handleCancel(filePath, originalContent);
     });
 
     confirmBtn?.addEventListener('click', () => {
+      console.log('[PreviewManager] 确认按钮点击');
       this.handleConfirm(filePath);
     });
 
     // ESC 取消
     const escHandler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        console.log('[PreviewManager] ESC 按下');
         this.handleCancel(filePath, originalContent);
       }
     };
     document.addEventListener('keydown', escHandler);
     this.state.escHandler = escHandler;
 
+    console.log('[PreviewManager] createBanner 完成');
     return banner;
   }
 
@@ -212,6 +305,11 @@ class PreviewManager {
       document.removeEventListener('keydown', this.state.escHandler);
     }
 
+    if (this.scrollHandler) {
+      window.removeEventListener('scroll', this.scrollHandler);
+      this.scrollHandler = null;
+    }
+
     this.state.previewBanner = null;
     this.state.escHandler = null;
   }
@@ -220,6 +318,12 @@ class PreviewManager {
    * 重置状态
    */
   private resetState(): void {
+    // 清理滚动事件处理器
+    if (this.scrollHandler) {
+      window.removeEventListener('scroll', this.scrollHandler);
+      this.scrollHandler = null;
+    }
+    
     this.state = {
       isPreviewing: false,
       filePath: null,
@@ -227,6 +331,9 @@ class PreviewManager {
       modifiedContent: null,
       previewBanner: null,
       escHandler: null,
+      isBatch: false,
+      successCount: 0,
+      failedCount: 0,
     };
   }
 

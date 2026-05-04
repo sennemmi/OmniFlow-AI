@@ -151,42 +151,58 @@ class DOMClass implements IDOMUtils {
   getElementInfo(el: HTMLElement): ElementInfo {
     const rect = el.getBoundingClientRect();
 
-    let dataSource =
-      el.getAttribute('data-source-id') || el.getAttribute('data-source') || '';
+    // 首先尝试读取 vite-plugin-component-debugger 注入的属性
+    let sourceFile = el.getAttribute('data-source-file') || '';
+    let sourceLine = parseInt(el.getAttribute('data-source-line') || '0') || 0;
+    let sourceColumn = parseInt(el.getAttribute('data-source-column') || '0') || 0;
     let sourceElement: HTMLElement = el;
+    let dataSource = ''; // 用于兼容旧格式
 
-    if (!dataSource) {
-      const closestWithSource = el.closest<HTMLElement>('[data-source-id], [data-source]');
+    // 如果没有直接找到，尝试从父元素查找
+    if (!sourceFile) {
+      const closestWithSource = el.closest<HTMLElement>('[data-source-file]');
       if (closestWithSource) {
-        dataSource =
-          closestWithSource.getAttribute('data-source-id') ||
-          closestWithSource.getAttribute('data-source') ||
-          '';
+        sourceFile = closestWithSource.getAttribute('data-source-file') || '';
+        sourceLine = parseInt(closestWithSource.getAttribute('data-source-line') || '0') || 0;
+        sourceColumn = parseInt(closestWithSource.getAttribute('data-source-column') || '0') || 0;
         sourceElement = closestWithSource;
+      }
+    }
+
+    // 兼容旧的 data-source-id/data-source 格式
+    if (!sourceFile) {
+      dataSource =
+        el.getAttribute('data-source-id') || el.getAttribute('data-source') || '';
+
+      if (!dataSource) {
+        const closestWithSource = el.closest<HTMLElement>('[data-source-id], [data-source]');
+        if (closestWithSource) {
+          dataSource =
+            closestWithSource.getAttribute('data-source-id') ||
+            closestWithSource.getAttribute('data-source') ||
+            '';
+          sourceElement = closestWithSource;
+        }
+      }
+
+      if (dataSource) {
+        const parts = dataSource.split(':');
+        if (parts.length >= 2) {
+          if (parts[0].length === 1 && parts[1].startsWith('\\')) {
+            sourceFile = parts[0] + ':' + parts[1];
+            sourceLine = parseInt(parts[2]) || 0;
+            sourceColumn = parseInt(parts[3]) || 0;
+          } else {
+            sourceFile = parts[0];
+            sourceLine = parseInt(parts[1]) || 0;
+            sourceColumn = parseInt(parts[2]) || 0;
+          }
+        }
       }
     }
 
     const reactInfo = reactSourceMapper.getComponentInfo(el) ||
                      reactSourceMapper.getComponentInfo(sourceElement);
-
-    let sourceFile = '';
-    let sourceLine = 0;
-    let sourceColumn = 0;
-
-    if (dataSource) {
-      const parts = dataSource.split(':');
-      if (parts.length >= 2) {
-        if (parts[0].length === 1 && parts[1].startsWith('\\')) {
-          sourceFile = parts[0] + ':' + parts[1];
-          sourceLine = parseInt(parts[2]) || 0;
-          sourceColumn = parseInt(parts[3]) || 0;
-        } else {
-          sourceFile = parts[0];
-          sourceLine = parseInt(parts[1]) || 0;
-          sourceColumn = parseInt(parts[2]) || 0;
-        }
-      }
-    }
 
     let finalSourceFile = sourceFile;
     let finalSourceLine = sourceLine;

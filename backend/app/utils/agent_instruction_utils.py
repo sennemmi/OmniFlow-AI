@@ -293,3 +293,37 @@ def build_key_mismatch_repair_instruction(key_mismatches: List[Dict]) -> str:
 4. 确保所有缺失字段都已添加
 """
     return instruction
+
+
+def build_designer_alignment_fix_instruction(missing_criteria: List[str]) -> str:
+    """
+    构建 DesignerAgent 契约对齐修复指令
+
+    Args:
+        missing_criteria: 缺失的验收标准列表
+
+    Returns:
+        修复指令字符串
+    """
+    criteria_list = "\n".join([f"  - {c}" for c in missing_criteria])
+
+    return f"""【契约对齐修复任务】
+
+以下 {len(missing_criteria)} 条验收标准未被映射到接口契约：
+
+{criteria_list}
+
+【修复要求】
+1. 在 contract_alignment 列表中，为每条缺失的验收标准添加对应的映射项
+2. 每个映射项必须包含：
+   - acceptance_criteria: 验收标准的原文（必须完全匹配）
+   - interface_spec: 对应的接口规范（包含 symbol_name, module, signature 等）
+3. 确保 interface_specs 中定义的符号能够实现对应的验收标准
+4. 验收标准与接口契约的映射必须是 1:1 的，不能遗漏
+
+【重要】
+- contract_alignment 列表的长度必须等于验收标准的总数
+- 每条验收标准必须在 contract_alignment 中有且仅有一个对应项
+- 不要修改已经正确映射的验收标准
+
+请重新生成完整的设计输出，确保所有验收标准都被正确映射。"""

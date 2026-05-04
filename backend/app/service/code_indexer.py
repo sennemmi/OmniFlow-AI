@@ -22,9 +22,11 @@ import json
 import hashlib
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
+from collections import OrderedDict
 
 import litellm
 from app.core.config import settings
@@ -849,15 +851,108 @@ class CodeIndexerService:
         self.file_cache.clear()
 
 
-# 全局索引服务实例缓存
-_indexer_cache: Dict[str, CodeIndexerService] = {}
-_indexer_locks: Dict[str, asyncio.Lock] = {}  # 每个索引器一个锁，防止并发更新
-_global_lock = asyncio.Lock()  # 用于保护缓存操作的全局锁
+class IndexerCache:
+    """
+    带 LRU 淘汰机制的索引器缓存
+    
+    特性：
+    - 最大缓存数量限制（默认 10 个）
+    - LRU 淘汰策略
+    - 自动清理被移除索引器的资源
+    - 线程安全
+    """
+    
+    def __init__(self, max_size: int = 10):
+        self._cache: OrderedDict[str, CodeIndexerService] = OrderedDict()
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._max_size = max_size
+        self._global_lock = asyncio.Lock()
+        self._last_access_time: Dict[str, float] = {}
+    
+    async def get(self, cache_key: str) -> Optional[CodeIndexerService]:
+        """获取索引器，更新访问时间"""
+        async with self._global_lock:
+            if cache_key in self._cache:
+                # 移动到末尾（最近使用）
+                self._cache.move_to_end(cache_key)
+                self._last_access_time[cache_key] = time.time()
+                return self._cache[cache_key]
+            return None
+    
+    async def set(self, cache_key: str, indexer: CodeIndexerService) -> asyncio.Lock:
+        """设置索引器，如果超出限制则淘汰最久未使用的"""
+        async with self._global_lock:
+            if cache_key in self._cache:
+                # 已存在，更新并移动到末尾
+                self._cache.move_to_end(cache_key)
+                self._cache[cache_key] = indexer
+                self._last_access_time[cache_key] = time.time()
+                return self._locks[cache_key]
+            
+            # 检查是否需要淘汰
+            while len(self._cache) >= self._max_size:
+                await self._evict_oldest()
+            
+            # 添加新索引器
+            self._cache[cache_key] = indexer
+            self._locks[cache_key] = asyncio.Lock()
+            self._last_access_time[cache_key] = time.time()
+            return self._locks[cache_key]
+    
+    async def _evict_oldest(self):
+        """淘汰最久未使用的索引器"""
+        if not self._cache:
+            return
+        
+        # 获取最久未使用的 key
+        oldest_key = next(iter(self._cache))
+        oldest_indexer = self._cache[oldest_key]
+        
+        # 清理资源
+        try:
+            oldest_indexer.clear_cache()
+            logger.info(f"[IndexerCache] 淘汰缓存: {oldest_key}")
+        except Exception as e:
+            logger.warning(f"[IndexerCache] 清理缓存失败 {oldest_key}: {e}")
+        
+        # 从缓存中移除
+        self._cache.pop(oldest_key)
+        self._locks.pop(oldest_key, None)
+        self._last_access_time.pop(oldest_key, None)
+    
+    def get_lock(self, cache_key: str) -> asyncio.Lock:
+        """获取指定索引器的锁，如果不存在返回新锁"""
+        return self._locks.get(cache_key, asyncio.Lock())
+    
+    async def clear(self):
+        """清除所有缓存"""
+        async with self._global_lock:
+            for indexer in self._cache.values():
+                try:
+                    indexer.clear_cache()
+                except Exception as e:
+                    logger.warning(f"[IndexerCache] 清理缓存失败: {e}")
+            self._cache.clear()
+            self._locks.clear()
+            self._last_access_time.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        return {
+            "size": len(self._cache),
+            "max_size": self._max_size,
+            "keys": list(self._cache.keys()),
+            "last_access_times": self._last_access_time.copy()
+        }
+
+
+# 全局索引器缓存实例（最大缓存 10 个项目）
+_indexer_cache_manager = IndexerCache(max_size=10)
 
 
 async def get_indexer(project_path: str, include_tests: bool = False) -> CodeIndexerService:
     """
-    获取或创建索引服务实例（带缓存，线程安全）
+    获取或创建索引服务实例（带 LRU 缓存，线程安全）
 
     Args:
         project_path: 项目路径
@@ -868,11 +963,15 @@ async def get_indexer(project_path: str, include_tests: bool = False) -> CodeInd
     """
     cache_key = f"{project_path}:{include_tests}"
     
-    async with _global_lock:
-        if cache_key not in _indexer_cache:
-            _indexer_cache[cache_key] = CodeIndexerService(project_path, include_tests=include_tests)
-            _indexer_locks[cache_key] = asyncio.Lock()
-        return _indexer_cache[cache_key]
+    # 尝试从缓存获取
+    indexer = await _indexer_cache_manager.get(cache_key)
+    if indexer is not None:
+        return indexer
+    
+    # 创建新索引器并加入缓存
+    indexer = CodeIndexerService(project_path, include_tests=include_tests)
+    await _indexer_cache_manager.set(cache_key, indexer)
+    return indexer
 
 
 def get_indexer_lock(project_path: str, include_tests: bool = False) -> asyncio.Lock:
@@ -887,16 +986,24 @@ def get_indexer_lock(project_path: str, include_tests: bool = False) -> asyncio.
         asyncio.Lock: 锁对象
     """
     cache_key = f"{project_path}:{include_tests}"
-    return _indexer_locks.get(cache_key, asyncio.Lock())
+    return _indexer_cache_manager.get_lock(cache_key)
 
 
 def clear_indexer_cache():
     """清除所有索引器缓存"""
-    global _indexer_cache, _indexer_locks
-    for indexer in _indexer_cache.values():
-        indexer.clear_cache()
-    _indexer_cache.clear()
-    _indexer_locks.clear()
+    # 使用 asyncio.run_coroutine_threadsafe 或确保在事件循环中运行
+    try:
+        loop = asyncio.get_running_loop()
+        # 如果在事件循环中，创建任务
+        asyncio.create_task(_indexer_cache_manager.clear())
+    except RuntimeError:
+        # 不在事件循环中，使用新的事件循环
+        asyncio.run(_indexer_cache_manager.clear())
+
+
+def get_indexer_cache_stats() -> Dict[str, Any]:
+    """获取索引器缓存统计信息"""
+    return _indexer_cache_manager.get_stats()
 
 
 # ==================== 【新增】RAG 目标文件获取函数 ====================

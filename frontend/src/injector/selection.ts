@@ -142,6 +142,7 @@ class VisualFeedbackClass {
   clearAll(): void {
     this.clearHighlight();
     this.clearMultiHighlight();
+    stateManager.clearAllHighlights();
     stateManager.clearFloatingPanel();
     stateManager.closeEditDialog();
   }
@@ -173,7 +174,7 @@ class PanelManagerClass {
       <div style="padding: 16px 20px; border-bottom: 1px solid #E8E9EB;">
         <h4 style="margin: 0; font-size: 16px; font-weight: 600; color: #1F2329;">已圈选 ${elements.length} 个元素</h4>
         <p style="margin: 4px 0 0; font-size: 12px; color: #646A73;">
-          ${hasPreciseSource ? '✅ 包含可定位源码的元素' : '⚠️ 部分元素可能无法精确定位'}
+          ${hasPreciseSource ? '[成功] 包含可定位源码的元素' : '[警告] 部分元素可能无法精确定位'}
         </p>
       </div>
       <div style="padding: 12px 20px; max-height: 200px; overflow-y: auto;">
@@ -183,8 +184,8 @@ class PanelManagerClass {
             const info = dom.getElementInfo(el);
             const sourceHint =
               info.sourceFile && info.sourceLine > 0
-                ? `<span style="color: #00B42A;">📍</span>`
-                : `<span style="color: #8F959E;">📄</span>`;
+                ? `<span style="color: #00B42A;">[定位]</span>`
+                : `<span style="color: #8F959E;">[文件]</span>`;
             const componentBadge = info.componentName
               ? `<span style="background: #3370FF20; color: #3370FF; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 6px;">${info.componentName}</span>`
               : '';

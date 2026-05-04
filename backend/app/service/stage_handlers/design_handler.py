@@ -1,9 +1,8 @@
 """
-技术设计阶段处理器（简化版）
+技术设计阶段处理器（使用 AgentCoordinatorService）
 
-与测试脚本 test_e2e_with_contract_v2.py 保持一致：
-- 直接调用 designer_agent.design()
-- 只保留审批阶段的功能
+使用统一的 AgentCoordinatorService 构建 Agent 上下文
+与 E2E 测试脚本保持一致
 """
 
 import logging
@@ -12,15 +11,16 @@ from typing import Optional
 from app.core.logging import info, error
 from app.core.sse_log_buffer import push_log
 from app.agents.designer import designer_agent
-
-logger = logging.getLogger(__name__)
 from app.models.pipeline import StageName, PipelineStatus
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
+from app.service.agent_coordinator_service import agent_coordinator_service
+
+logger = logging.getLogger(__name__)
 
 
 class DesignHandler(StageHandler):
-    """技术设计阶段处理器（简化版）"""
+    """技术设计阶段处理器（使用统一服务）"""
 
     @property
     def stage_name(self) -> StageName:
@@ -52,7 +52,7 @@ class DesignHandler(StageHandler):
         return context
 
     async def execute(self, context: StageContext) -> StageResult:
-        """执行技术设计（简化版，与测试脚本一致）"""
+        """执行技术设计（使用 AgentCoordinatorService）"""
         pipeline_id = context.pipeline_id
 
         await push_log(pipeline_id, "info", "开始技术设计...", stage="DESIGN")
@@ -61,14 +61,41 @@ class DesignHandler(StageHandler):
         arch_output = context.previous_output
 
         try:
-            # 【简化】直接调用 designer_agent.design()，与测试脚本一致
-            # 不通过 AgentCoordinatorService，不获取代码上下文（RAG 已禁用）
-            design_result = await designer_agent.design(
-                architect_output=arch_output,
+            # 【统一】使用 AgentCoordinatorService 构建上下文
+            # 获取需求描述
+            requirement = arch_output.get("requirement", "")
+
+            # 构建 DesignerAgent 上下文
+            designer_context = await agent_coordinator_service.build_designer_context(
+                requirement=requirement,
+                arch_output=arch_output,
                 file_tree={},  # 空字典，与测试脚本一致
-                related_code_context="",  # 空字符串，与测试脚本一致
-                full_files_context=arch_output.get("injected_files", {}),  # 与测试脚本一致
                 pipeline_id=pipeline_id
+            )
+
+            await push_log(
+                pipeline_id,
+                "info",
+                f"调用 DesignerAgent (injected_files: {len(designer_context.get('injected_files', {}))} files)",
+                stage="DESIGN"
+            )
+
+            # 调用 DesignerAgent
+            design_result = await designer_agent.design(
+                architect_output=designer_context["arch_output"],
+                file_tree=designer_context["file_tree"],
+                related_code_context="",  # 空字符串，与测试脚本一致
+                full_files_context=designer_context["injected_files"],
+                pipeline_id=pipeline_id
+            )
+
+            # 保存 Agent 调试信息
+            self._save_agent_log(
+                agent_name="DesignerAgent",
+                stage="design",
+                input_data=designer_context,
+                output_data=design_result,
+                system_prompt=designer_agent.system_prompt
             )
 
             if not design_result.get("success"):

@@ -39,12 +39,14 @@ export function CreatePipelineModal({ isOpen, onClose, initialTemplate }: Create
       apiPost<CreatePipelineResponse>('/pipeline/create', data),
     onSuccess: (response) => {
       console.log('[CreatePipeline] 创建成功，响应:', response);
-      addToast({ type: 'success', message: '流水线创建成功' });
-      queryClient.invalidateQueries({ queryKey: ['pipelines'] });
-      onClose();
       // 后端返回的 ID 字段名为 pipeline_id
       const pipelineId = response?.pipeline_id;
       if (pipelineId) {
+        // 【优化】立即关闭弹窗并跳转，在详情页显示骨架屏
+        // 避免用户卡在弹窗等待
+        onClose();
+        addToast({ type: 'success', message: '流水线创建成功' });
+        queryClient.invalidateQueries({ queryKey: ['pipelines'] });
         navigate(`/console/pipelines/${pipelineId}`);
       } else {
         console.error('[CreatePipeline] 响应中未找到 pipeline_id:', response);

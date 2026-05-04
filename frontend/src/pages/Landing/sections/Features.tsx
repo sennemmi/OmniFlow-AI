@@ -83,10 +83,10 @@ export function Features() {
                   </div>
                   <div className="flex-1 rounded-xl bg-black/40 p-4 font-mono text-sm overflow-hidden">
                     <div className="text-purple-400">// AI 正在分析需求...</div>
-                    <div className="text-green-400 mt-2">✓ 理解业务逻辑</div>
-                    <div className="text-green-400">✓ 设计数据模型</div>
-                    <div className="text-green-400">✓ 生成 API 接口</div>
-                    <div className="text-blue-400 mt-4">→ 生成 React 组件</div>
+                    <div className="text-green-400 mt-2">[完成] 理解业务逻辑</div>
+                    <div className="text-green-400">[完成] 设计数据模型</div>
+                    <div className="text-green-400">[完成] 生成 API 接口</div>
+                    <div className="text-blue-400 mt-4">[进行中] 生成 React 组件</div>
                     <div className="text-white/70 mt-2 pl-4">export const UserProfile = () ={'>'} {'{'}</div>
                     <div className="text-white/70 pl-8">// AI 生成的代码...</div>
                   </div>

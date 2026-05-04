@@ -197,10 +197,10 @@ function GettingStartedContent({ onCopy, copiedCode }: { onCopy: (id: string, co
           <div className="p-4 bg-bg-secondary rounded-lg border border-border-default">
             <h4 className="font-medium text-text-primary mb-2">AI 输出</h4>
             <ul className="text-sm text-text-secondary space-y-1">
-              <li>✓ 技术架构设计</li>
-              <li>✓ React 登录组件</li>
-              <li>✓ 后端 API 接口</li>
-              <li>✓ 单元测试用例</li>
+              <li>[完成] 技术架构设计</li>
+              <li>[完成] React 登录组件</li>
+              <li>[完成] 后端 API 接口</li>
+              <li>[完成] 单元测试用例</li>
             </ul>
           </div>
         </div>

@@ -30,12 +30,8 @@ def setup_test_env():
     yield
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """创建会话级别的事件循环"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# 注意：pytest-asyncio 0.24+ 会自动管理事件循环
+# 不需要自定义 event_loop fixture，否则可能导致兼容性问题
 
 
 @pytest.fixture

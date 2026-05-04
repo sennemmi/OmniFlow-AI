@@ -35,7 +35,7 @@ import {
 } from 'lucide-react';
 import { apiGet, apiPost } from '@utils/axios';
 import { usePipelineStore } from '@stores/pipelineStore';
-import { PipelineNode, ApproveDrawer, ThoughtLog } from '@components/Pipeline';
+import { PipelineNode, ApproveDrawer, ThoughtLog, PipelineSkeleton } from '@components/Pipeline';
 import { usePipelineFlow, statusConfig, STAGE_CONFIG } from '@hooks/usePipelineFlow';
 import type { Pipeline, PipelineStage } from '@types';
 
@@ -73,10 +73,19 @@ export function PipelineDetail() {
   const isValidId = !isNaN(pipelineId) && pipelineId > 0;
 
   // 获取流水线详情（动态轮询）
-  const { data: response, isLoading, refetch } = useQuery<Pipeline>({
+  const { data: response, isLoading, isFetching, refetch, error } = useQuery<Pipeline>({
     queryKey: ['pipeline', pipelineId],
     queryFn: () => apiGet(`/pipeline/${pipelineId}/status`),
     enabled: isValidId,
+    retry: (failureCount, error: any) => {
+      // 【优化】如果 Pipeline 不存在（404），最多重试 3 次
+      // 给后端一些时间完成数据持久化
+      if (error?.response?.status === 404 && failureCount < 3) {
+        return true;
+      }
+      return false;
+    },
+    retryDelay: (attemptIndex) => Math.min(1000 * (attemptIndex + 1), 3000), // 递增延迟
     refetchInterval: (query) => {
       // 根据 pipeline 状态动态决定轮询间隔
       const data = query.state.data as Pipeline | undefined;
@@ -223,22 +232,35 @@ export function PipelineDetail() {
     );
   }
 
-  if (isLoading) {
-    return (
-      <div className="h-full flex items-center justify-center">
-        <Loader2 className="w-8 h-8 text-brand-primary animate-spin" />
-      </div>
-    );
+  // 【优化】加载状态：使用骨架屏提升体验
+  // 首次加载、或正在获取数据且还没有数据时显示骨架屏
+  if (isLoading || (isFetching && !pipeline)) {
+    return <PipelineSkeleton />;
   }
 
+  // 【新增】数据获取完成但为空时，显示骨架屏等待（可能是新创建的流水线）
+  // 等待重试机制完成，避免闪烁错误页面
+  if (!pipeline && !error) {
+    return <PipelineSkeleton />;
+  }
+
+  // 【优化】Pipeline 不存在时的处理
   if (!pipeline) {
+    const isNotFound = (error as any)?.response?.status === 404;
     return (
       <div className="h-full flex flex-col items-center justify-center">
         <AlertCircle className="w-12 h-12 text-status-error mb-4" />
-        <p className="text-text-secondary">流水线不存在或已被删除</p>
-        <button onClick={() => navigate('/console')} className="mt-4 btn-primary">
-          返回控制台
-        </button>
+        <p className="text-text-secondary">
+          {isNotFound ? '流水线不存在或正在初始化中' : '加载流水线失败'}
+        </p>
+        <div className="flex gap-3 mt-4">
+          <button onClick={() => refetch()} className="btn-secondary">
+            重试
+          </button>
+          <button onClick={() => navigate('/console')} className="btn-primary">
+            返回控制台
+          </button>
+        </div>
       </div>
     );
   }
@@ -581,7 +603,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
 
   // 计算阶段统计数据
   const getStageStats = (stage: PipelineStage) => {
-    // ★ 直接从 stage 对象读取 duration_ms，不再依赖 created_at/completed_at 计算
+    // [注意] 直接从 stage 对象读取 duration_ms，不再依赖 created_at/completed_at 计算
     let durationText = '-';
     let durationSeconds = 0;
 
@@ -619,7 +641,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
       }
     }
 
-    // ★ 直接从 stage 对象读取 Token 用量，不再从 output_data 中提取
+    // [注意] 直接从 stage 对象读取 Token 用量，不再从 output_data 中提取
     const tokens = (stage.input_tokens || 0) + (stage.output_tokens || 0);
 
     // 从 output_data 中估算代码行数
@@ -764,7 +786,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
           <span className="text-xs text-slate-500">总耗时</span>
           <span className="text-sm font-semibold text-slate-900">
             {(() => {
-              // ★ 从 stage.duration_ms 累加，不再使用 s.duration
+              // [注意] 从 stage.duration_ms 累加，不再使用 s.duration
               const totalMs = pipeline.stages?.reduce((acc, s) => acc + (s.duration_ms || 0), 0) || 0;
               const totalSeconds = Math.floor(totalMs / 1000);
               if (totalSeconds > 3600) {
@@ -780,7 +802,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
           <span className="text-xs text-slate-500">总 Token</span>
           <span className="text-sm font-semibold text-slate-900">
             {(pipeline.stages?.reduce((acc, s) => {
-              // ★ 直接从 stage 对象累加 Token，不再从 output_data 中提取
+              // [注意] 直接从 stage 对象累加 Token，不再从 output_data 中提取
               const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
               return acc + (s.status !== 'pending' ? tokens : 0);
             }, 0) || 0).toLocaleString()}

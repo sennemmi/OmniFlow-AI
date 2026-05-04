@@ -13,14 +13,13 @@ from typing import Any, Dict
 from app.core.sse_log_buffer import push_log
 from app.core.timezone import now
 from app.models.pipeline import StageName, PipelineStatus, StageStatus, PipelineStage
-from app.service.code_executor import CodeExecutorService
 from app.service.git_provider import GitProviderService, GitProviderError
 from app.service.platform_provider import GitHubProviderService
 from app.service.pr_generator import PRGeneratorService
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
-from app.service.workspace import workspace_context
 from app.service.sandbox_manager import sandbox_manager
+from app.service.sandbox_orchestrator import get_sandbox_orchestrator
 
 
 class DeliveryHandler(StageHandler):
@@ -72,92 +71,93 @@ class DeliveryHandler(StageHandler):
         commit_hash = None
         pr_url = None
         pr_created = False
-        execution_result = None
-        pr_result = None
+        copied_count = 0
 
         try:
-            # 使用 WorkspaceService 管理临时工作区
-            with workspace_context(pipeline_id) as ws:
-                workspace_dir = ws.get_workspace_path()
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"创建临时工作区: {workspace_dir.name}",
-                    stage="DELIVERY"
-                )
+            # 【绑定挂载架构】直接使用 Sandbox 的宿主机工作区目录
+            orchestrator = get_sandbox_orchestrator(pipeline_id)
+            workspace_path = orchestrator.get_workspace_path()
 
-                # Git 操作
-                git_service = GitProviderService(str(workspace_dir))
-                timestamp = now().strftime("%Y%m%d_%H%M%S")
-                git_branch = f"devflow/pipeline-{pipeline_id}-{timestamp}"
+            if not workspace_path:
+                raise ValueError("Sandbox 工作区未初始化，无法执行 DELIVERY 阶段")
 
-                try:
-                    git_service.create_branch(git_branch)
-                except GitProviderError as e:
-                    if "分支已存在" in str(e):
-                        git_service.checkout_branch(git_branch)
-                    else:
-                        raise
+            workspace_dir = Path(workspace_path)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"使用 Sandbox 工作区: {workspace_dir.name}",
+                stage="DELIVERY"
+            )
 
-                # 应用代码变更
-                code_executor = CodeExecutorService(str(workspace_dir))
-                changes_dict = {f["file_path"]: f["content"] for f in generated_files}
+            # 【绑定挂载架构】文件已在宿主机工作区，无需复制
+            # Agent 在 Sandbox 中的修改直接反映到宿主机 temp_dir
+            modified_files = coding_output_data.get("modified_files", [])
+            if not modified_files and generated_files:
+                # 如果没有记录修改的文件列表，从 generated_files 推断
+                modified_files = [f["file_path"] for f in generated_files]
 
-                await push_log(pipeline_id, "info", "应用代码变更...", stage="DELIVERY")
-                execution_result = code_executor.apply_changes(
-                    changes=changes_dict,
-                    create_if_missing=True
-                )
+            copied_count = len(modified_files)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"工作区已有 {copied_count} 个修改的文件（绑定挂载）",
+                stage="DELIVERY"
+            )
 
-                if not execution_result.success:
-                    code_executor.rollback_changes(execution_result.changes)
-                    return StageResult.failure_result(
-                        message="Code execution failed",
-                        output_data={"execution_summary": execution_result.summary}
-                    )
+            # Git 操作
+            git_service = GitProviderService(str(workspace_dir))
+            timestamp = now().strftime("%Y%m%d_%H%M%S")
+            git_branch = f"devflow/pipeline-{pipeline_id}-{timestamp}"
 
-                # Git 提交
-                if execution_result.summary["success"] > 0:
-                    git_service.add_files()
-                    if git_service.has_changes():
-                        commit_message = f"feat(pipeline-{pipeline_id}): {multi_agent_output.get('summary', '代码生成')[:100]}"
-                        git_service.commit_changes(commit_message)
-                        commit_hash = git_service.get_last_commit_hash()
-
-                # 推送分支
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"推送代码到远程分支 {git_branch}...",
-                    stage="DELIVERY"
-                )
-                git_service.push_branch(git_branch)
-
-                # 生成 PR 描述
-                pr_description = await PRGeneratorService.generate_pr_description(
-                    pipeline_id=pipeline_id,
-                    multi_agent_output=multi_agent_output,
-                    execution_summary=execution_result.summary,
-                    git_service=git_service
-                )
-
-                # 创建 PR
-                pr_title = f"OmniFlowAI: {requirement_summary}"
-                async with GitHubProviderService() as github_service:
-                    pr_result = await github_service.create_pull_request(
-                        head_branch=git_branch,
-                        title=pr_title,
-                        body=pr_description,
-                        base_branch="main"
-                    )
-
-                if pr_result.success:
-                    pr_url = pr_result.pr_url
-                    pr_created = True
-                    await push_log(pipeline_id, "info", f"PR 创建成功: {pr_url}", stage="DELIVERY")
+            try:
+                git_service.create_branch(git_branch)
+            except GitProviderError as e:
+                if "分支已存在" in str(e):
+                    git_service.checkout_branch(git_branch)
                 else:
-                    pr_created = False
-                    await push_log(pipeline_id, "warning", f"PR 创建失败: {pr_result.error}", stage="DELIVERY")
+                    raise
+
+            # Git 提交
+            git_service.add_files()
+            if git_service.has_changes():
+                commit_message = f"feat(pipeline-{pipeline_id}): {multi_agent_output.get('summary', '代码生成')[:100]}"
+                git_service.commit_changes(commit_message)
+                commit_hash = git_service.get_last_commit_hash()
+
+            # 推送分支
+            await push_log(
+                pipeline_id,
+                "info",
+                f"推送代码到远程分支 {git_branch}...",
+                stage="DELIVERY"
+            )
+            git_service.push_branch(git_branch)
+
+            # 生成 PR 描述
+            pr_description = await PRGeneratorService.generate_pr_description(
+                pipeline_id=pipeline_id,
+                multi_agent_output=multi_agent_output,
+                execution_summary={"success": copied_count, "total": len(modified_files)},
+                git_service=git_service
+            )
+
+            # 创建 PR
+            pr_title = f"OmniFlowAI: {requirement_summary}"
+            async with GitHubProviderService() as github_service:
+                pr_result = await github_service.create_pull_request(
+                    head_branch=git_branch,
+                    title=pr_title,
+                    body=pr_description,
+                    base_branch="main"
+                )
+
+            if pr_result.success:
+                pr_url = pr_result.pr_url
+                pr_created = True
+                await push_log(pipeline_id, "info", f"PR 创建成功: {pr_url}", stage="DELIVERY")
+            else:
+                pr_created = False
+                await push_log(pipeline_id, "warning", f"PR 创建失败: {pr_result.error}", stage="DELIVERY")
 
             # 返回成功结果
             return StageResult.success_result(
@@ -167,7 +167,7 @@ class DeliveryHandler(StageHandler):
                     "commit_hash": commit_hash,
                     "pr_url": pr_url,
                     "pr_created": pr_created,
-                    "execution_summary": execution_result.summary if execution_result else {}
+                    "execution_summary": {"success": copied_count, "total": len(modified_files)}
                 },
                 status=PipelineStatus.SUCCESS,
                 git_branch=git_branch,

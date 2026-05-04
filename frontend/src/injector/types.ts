@@ -122,10 +122,15 @@ export interface BatchModifyResponse {
   data?: {
     success_files: number;
     failed_files: number;
+    summary?: string;
     results: Array<{
       file: string;
       success: boolean;
       error?: string;
+      search_block?: string;
+      replace_block?: string;
+      change_type?: string;
+      new_content?: string;
     }>;
   };
   error?: string;
@@ -141,6 +146,9 @@ export interface PreviewState {
   modifiedContent: string | null;
   previewBanner: HTMLElement | null;
   escHandler: ((e: KeyboardEvent) => void) | null;
+  isBatch: boolean;
+  successCount: number;
+  failedCount: number;
 }
 
 // ============================================
@@ -182,7 +190,7 @@ export interface OmniEvents {
   'ui:panel:show': { elements: HTMLElement[] };
   'ui:panel:close': void;
   'ui:notification:show': { prUrl: string };
-  'ui:preview-controls:show': { filePath: string; originalContent: string };
+  'ui:preview-controls:show': { filePath: string; originalContent: string; isBatch?: boolean; successCount?: number; failedCount?: number };
   'ui:preview-controls:hide': void;
 
   // 系统事件

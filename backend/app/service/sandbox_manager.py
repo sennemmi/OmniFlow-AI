@@ -151,13 +151,19 @@ class SandboxManager:
         except Exception:
             pass  # 忽略错误，容器可能不存在
 
-    async def start(self, pipeline_id: int, project_path: str) -> SandboxInfo:
+    async def start(
+        self,
+        pipeline_id: int,
+        project_path: Optional[str] = None,
+        use_bind_mount: bool = False
+    ) -> SandboxInfo:
         """
         启动沙箱容器
 
         Args:
             pipeline_id: Pipeline ID
-            project_path: 项目路径
+            project_path: 项目路径（可选，如果不提供则需要在启动后使用 docker cp 复制代码）
+            use_bind_mount: 是否使用绑定挂载（默认 False，使用 docker cp 性能更好）
 
         Returns:
             SandboxInfo: 沙箱信息
@@ -186,15 +192,20 @@ class SandboxManager:
             cmd = [
                 "docker", "run", "--rm", "-d",
                 "--name", container_name,
-                "-v", f"{project_path}:/workspace",
                 "-p", f"{port}:8000",
                 "--memory", "1g",
                 "--cpus", "2",
                 "--network", self._network_name,
-                "omniflowai/sandbox:latest",
             ]
 
-            info("Starting sandbox", container_name=container_name, port=port)
+            # 【性能优化】默认不使用绑定挂载，而是后续使用 docker cp
+            # 这样可以避免跨设备 I/O 损耗
+            if use_bind_mount and project_path:
+                cmd.extend(["-v", f"{project_path}:/workspace"])
+
+            cmd.append("omniflowai/sandbox:latest")
+
+            info("Starting sandbox", container_name=container_name, port=port, use_bind_mount=use_bind_mount)
 
             # 启动容器
             proc = await asyncio.create_subprocess_exec(
@@ -232,12 +243,22 @@ class SandboxManager:
 
             info("Sandbox started", container_id=container_id[:12])
 
+            # 【性能优化】如果不使用绑定挂载，使用 docker cp 复制代码到容器
+            if not use_bind_mount and project_path:
+                info("Copying project to container using docker cp", project_path=project_path)
+                copy_success = await self._copy_project_to_container(container_name, project_path)
+                if not copy_success:
+                    error("Failed to copy project to container")
+                    await self._stop_container(container_name)
+                    raise RuntimeError("Failed to copy project to container")
+                info("Project copied to container successfully")
+
             # 创建沙箱信息
             sandbox_info = SandboxInfo(
                 container_id=container_id,
                 pipeline_id=pipeline_id,
                 port=port,
-                project_path=project_path
+                project_path=project_path or ""
             )
 
             self._sandboxes[pipeline_id] = sandbox_info
@@ -246,11 +267,56 @@ class SandboxManager:
         finally:
             set_pipeline_id(None)
 
-    async def _stop_container(self, container_name: str) -> bool:
-        """停止容器（内部方法）"""
+    async def _copy_project_to_container(self, container_name: str, project_path: str) -> bool:
+        """
+        使用 docker cp 将项目代码复制到容器内
+
+        比绑定挂载性能更好，避免跨设备 I/O 损耗
+
+        Args:
+            container_name: 容器名称
+            project_path: 项目路径
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 首先创建 /workspace 目录
+            mkdir_proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", container_name, "mkdir", "-p", "/workspace",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await mkdir_proc.communicate()
+
+            # 使用 docker cp 复制项目代码
+            copy_proc = await asyncio.create_subprocess_exec(
+                "docker", "cp", f"{project_path}/.", f"{container_name}:/workspace",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await copy_proc.communicate()
+
+            if copy_proc.returncode != 0:
+                error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                error(f"docker cp failed: {error_msg}")
+                return False
+
+            return True
+        except Exception as e:
+            error(f"Error copying project to container: {str(e)}")
+            return False
+
+    async def _stop_container(self, container_name: str, timeout: int = 10) -> bool:
+        """停止容器（内部方法）
+
+        Args:
+            container_name: 容器名称
+            timeout: 停止超时时间（秒），默认 10 秒，0 表示立即强制停止
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "stop", container_name,
+                "docker", "stop", "-t", str(timeout), container_name,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
@@ -260,12 +326,34 @@ class SandboxManager:
             error(f"Error stopping container {container_name}: {str(e)}")
             return False
 
-    async def stop(self, pipeline_id: int) -> bool:
+    async def _kill_container(self, container_name: str) -> bool:
+        """强制停止容器（使用 docker kill，立即终止）
+
+        Args:
+            container_name: 容器名称
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "kill", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+            return proc.returncode == 0
+        except Exception as e:
+            error(f"Error killing container {container_name}: {str(e)}")
+            return False
+
+    async def stop(self, pipeline_id: int, fast: bool = False) -> bool:
         """
         停止沙箱容器
 
         Args:
             pipeline_id: Pipeline ID
+            fast: 是否使用快速停止（docker kill，立即终止，不等待优雅关闭）
 
         Returns:
             bool: 是否成功
@@ -280,11 +368,15 @@ class SandboxManager:
             # 获取沙箱信息并释放端口
             sandbox_info = self._sandboxes[pipeline_id]
             self._release_port(sandbox_info.port)
-            
-            container_name = f"omniflow-sandbox-{pipeline_id}"
-            info(f"Stopping sandbox container", container_name=container_name)
 
-            success = await self._stop_container(container_name)
+            container_name = f"omniflow-sandbox-{pipeline_id}"
+
+            if fast:
+                info(f"Fast stopping sandbox container (docker kill)", container_name=container_name)
+                success = await self._kill_container(container_name)
+            else:
+                info(f"Stopping sandbox container", container_name=container_name)
+                success = await self._stop_container(container_name)
 
             if success:
                 del self._sandboxes[pipeline_id]

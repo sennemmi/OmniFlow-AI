@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.service.e2e_test_service import E2ETestService
+from app.service.error_analysis_service import ErrorAnalysisService
 from app.service.sandbox_file_service import SandboxFileService
 from app.utils.agent_output_utils import merge_files_content
 from app.utils.repair_loop_utils import (
@@ -199,7 +199,7 @@ async def execute_fix_by_type(
     state: FixLoopState,
     file_service: SandboxFileService,
     design_output: Dict,
-    e2e_service: E2ETestService,
+    error_analysis_service: ErrorAnalysisService,
     logs: str = "",
     failed_tests: List[str] = None
 ) -> FixResult:
@@ -211,7 +211,7 @@ async def execute_fix_by_type(
         state: 修复循环状态
         file_service: 文件服务
         design_output: 设计输出
-        e2e_service: E2E 测试服务
+        error_analysis_service: 错误分析服务
         logs: 错误日志
         failed_tests: 失败的测试列表
 
@@ -230,8 +230,7 @@ async def execute_fix_by_type(
         # 【SyntaxError 策略】仅传递出错的单个文件，且只传递出错行附近的上下文（±20行）
         logger.info("[FixLoop] 使用 SyntaxError 策略：精简上下文")
 
-        error_analysis = e2e_service.analyze_errors(logs, failed_tests)
-        syntax_errors = error_analysis.get("syntax_errors", [])
+        syntax_errors = error_analysis_service.extract_syntax_errors(logs)
 
         if not syntax_errors:
             return FixResult(success=False, message="未找到语法错误")
@@ -244,7 +243,8 @@ async def execute_fix_by_type(
             files_to_check=focused_context,
             file_service=file_service,
             design_output={**design_output, "pipeline_id": pipeline_id},
-            max_retries=2
+            max_retries=2,
+            pipeline_id=pipeline_id,
         )
 
         return FixResult(success=bool(fixed), message=f"语法修复: {len(fixed)} 个文件")
@@ -253,8 +253,7 @@ async def execute_fix_by_type(
         # 【ImportError 策略】仅传递测试文件和被测模块文件，不传递整个项目
         logger.info("[FixLoop] 使用 ImportError 策略：仅传递相关模块")
 
-        error_analysis = e2e_service.analyze_errors(logs, failed_tests)
-        import_errors = error_analysis.get("import_errors", [])
+        import_errors = error_analysis_service.extract_import_errors(logs)
 
         if not import_errors:
             return FixResult(success=False, message="未找到导入错误")

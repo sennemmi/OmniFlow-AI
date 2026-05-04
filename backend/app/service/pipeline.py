@@ -74,21 +74,6 @@ class PipelineService:
 
         info("Pipeline 记录创建成功", pipeline_id=pipeline.id, status="RUNNING")
 
-        # 【关键修复】Step 0: 立即启动 Docker Sandbox（与 test_e2e_with_contract_v2.py 统一）
-        try:
-            from pathlib import Path
-            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
-            sandbox_info = await sandbox_manager.start(pipeline.id, project_path)
-            info("Docker Sandbox 启动成功", 
-                 pipeline_id=pipeline.id, 
-                 container_id=sandbox_info.container_id[:12],
-                 port=sandbox_info.port)
-        except Exception as e:
-            error_msg = f"Docker Sandbox 启动失败: {str(e)}"
-            info(error_msg, pipeline_id=pipeline.id)
-            # 不阻断流程，继续创建 Pipeline，但记录错误
-            # 后续阶段可以尝试重新启动 Sandbox
-
         # 2. 创建 REQUIREMENT 阶段
         stage = PipelineStage(
             pipeline_id=pipeline.id,
@@ -114,6 +99,29 @@ class PipelineService:
         pipeline_with_stages = result.scalar_one()
 
         return cls._build_pipeline_read(pipeline_with_stages)
+
+    @classmethod
+    async def start_sandbox_for_pipeline(
+        cls,
+        pipeline_id: int
+    ) -> None:
+        """
+        为 Pipeline 启动 Docker Sandbox（在事务提交后调用）
+        
+        注意：此方法应在事务提交后调用，避免长时间占用数据库连接
+        """
+        try:
+            from pathlib import Path
+            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+            sandbox_info = await sandbox_manager.start(pipeline_id, project_path)
+            info("Docker Sandbox 启动成功", 
+                 pipeline_id=pipeline_id, 
+                 container_id=sandbox_info.container_id[:12],
+                 port=sandbox_info.port)
+        except Exception as e:
+            error_msg = f"Docker Sandbox 启动失败: {str(e)}"
+            info(error_msg, pipeline_id=pipeline_id)
+            # 不阻断流程，后续阶段可以尝试重新启动 Sandbox
     
     @classmethod
     async def run_architect_task(
@@ -355,8 +363,7 @@ class PipelineService:
         # 处理 DESIGN 阶段的特殊情况（需要后台任务）
         if current_stage == StageName.DESIGN and background_tasks:
             if result.output_data.get("requires_background_task"):
-                from app.api.v1.pipeline import run_coding_task
-                background_tasks.add_task(run_coding_task, pipeline_id)
+                background_tasks.add_task(cls._run_coding_task_background, pipeline_id)
 
                 return {
                     "success": True,
@@ -605,7 +612,7 @@ class PipelineService:
         if background_tasks and isinstance(background_tasks, BackgroundTasks):
             if current_stage == StageName.CODING:
                 # 重试 CODING 阶段
-                background_tasks.add_task(run_coding_task, pipeline_id)
+                background_tasks.add_task(cls._run_coding_task_background, pipeline_id)
                 await push_log(
                     pipeline_id,
                     "info",
@@ -624,7 +631,7 @@ class PipelineService:
                     requirement = requirement_stage.input_data.get("requirement", "")
                     element_context = requirement_stage.input_data.get("element_context", {})
                     background_tasks.add_task(
-                        run_architect_task,
+                        cls._run_architect_task_background,
                         pipeline_id,
                         requirement,
                         element_context
@@ -665,7 +672,8 @@ class PipelineService:
         cls,
         pipeline_id: int,
         reason: str,
-        session: AsyncSession
+        session: AsyncSession,
+        background_tasks=None
     ) -> Dict[str, Any]:
         """
         终止 Pipeline
@@ -674,6 +682,7 @@ class PipelineService:
             pipeline_id: Pipeline ID
             reason: 终止原因
             session: 数据库 session
+            background_tasks: FastAPI BackgroundTasks，用于异步执行资源清理
 
         Returns:
             终止结果
@@ -703,16 +712,16 @@ class PipelineService:
         # 更新 Pipeline 状态为 failed
         await WorkflowService.set_pipeline_failed(pipeline, session)
 
-        # 停止 Sandbox
-        try:
-            await sandbox_manager.stop(pipeline_id)
-            info("Sandbox 已停止", pipeline_id=pipeline_id)
-        except Exception as e:
-            info(f"停止 Sandbox 时出错（非关键）: {str(e)}", pipeline_id=pipeline_id)
-
-        # 清理 SSE 日志缓冲区
-        from app.core.sse_log_buffer import remove_buffer
-        remove_buffer(pipeline_id)
+        # 使用后台任务异步清理资源，避免阻塞 API 响应
+        if background_tasks:
+            background_tasks.add_task(
+                cls._cleanup_pipeline_resources,
+                pipeline_id,
+                reason
+            )
+        else:
+            # 如果没有提供 background_tasks，同步执行（兼容旧代码）
+            await cls._cleanup_pipeline_resources(pipeline_id, reason)
 
         return {
             "success": True,
@@ -723,6 +732,20 @@ class PipelineService:
                 "terminated_at": datetime.now().isoformat()
             }
         }
+
+    @staticmethod
+    async def _cleanup_pipeline_resources(pipeline_id: int, reason: str) -> None:
+        """后台任务：清理 Pipeline 资源（Sandbox、日志缓冲区等）"""
+        # 停止 Sandbox（使用快速停止）
+        try:
+            await sandbox_manager.stop(pipeline_id, fast=True)
+            info("Sandbox 已停止", pipeline_id=pipeline_id)
+        except Exception as e:
+            info(f"停止 Sandbox 时出错（非关键）: {str(e)}", pipeline_id=pipeline_id)
+
+        # 清理 SSE 日志缓冲区
+        from app.core.sse_log_buffer import remove_buffer
+        remove_buffer(pipeline_id)
 
     @classmethod
     def _get_handler_for_stage(cls, stage_name: StageName) -> Optional[Any]:
@@ -758,6 +781,173 @@ class PipelineService:
             except Exception as e:
                 await session.rollback()
                 error(f"后台运行阶段 {stage_name} 失败", pipeline_id=pipeline_id, exc_info=True)
+
+    @staticmethod
+    async def _run_coding_task_background(pipeline_id: int) -> None:
+        """
+        后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，完成后等待 CODE_REVIEW 审批
+        
+        这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
+        """
+        from app.core.database import async_session_factory
+        from app.core.sse_log_buffer import push_log
+        from app.core.logging import op_logger, error
+
+        session = async_session_factory()
+        try:
+            await push_log(pipeline_id, "info", "后台任务启动：开始执行代码生成...", stage="CODING")
+
+            # 1. 执行 CODING 阶段
+            coding_result = await PipelineService.trigger_coding_phase(
+                pipeline_id=pipeline_id,
+                session=session
+            )
+
+            if coding_result["success"]:
+                await session.commit()
+                await push_log(pipeline_id, "info", "代码生成完成，开始单元测试阶段...", stage="UNIT_TESTING")
+
+                # 2. 执行 UNIT_TESTING 阶段
+                testing_result = await PipelineService._trigger_testing_phase(
+                    pipeline_id=pipeline_id,
+                    session=session
+                )
+
+                if testing_result["success"]:
+                    await session.commit()
+                    test_generated = testing_result.get("test_generated", False)
+                    test_run_success = testing_result.get("test_run_success", False)
+
+                    # 3. 推送状态日志，然后等待 CODE_REVIEW 审批（不做自动推进）
+                    if test_generated and test_run_success:
+                        await push_log(
+                            pipeline_id,
+                            "success",
+                            "单元测试通过，等待代码审查",
+                            stage="CODE_REVIEW"
+                        )
+                    elif test_generated:
+                        await push_log(
+                            pipeline_id,
+                            "warning",
+                            "单元测试部分未通过，等待代码审查",
+                            stage="CODE_REVIEW"
+                        )
+                    else:
+                        await push_log(
+                            pipeline_id,
+                            "info",
+                            "代码生成完成，等待代码审查",
+                            stage="CODE_REVIEW"
+                        )
+                else:
+                    await session.commit()
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        "单元测试阶段异常，等待代码审查",
+                        stage="CODE_REVIEW"
+                    )
+            else:
+                await session.rollback()
+                op_logger.log_pipeline_status_change(
+                    pipeline_id=pipeline_id,
+                    old_status='running',
+                    new_status='failed',
+                    stage='CODING',
+                    error=coding_result.get("message", "Unknown error")
+                )
+                # 更新 pipeline 状态为 failed
+                try:
+                    async with async_session_factory() as err_session:
+                        await PipelineService.mark_pipeline_failed(
+                            pipeline_id=pipeline_id,
+                            error=coding_result.get("message", "Coding phase failed"),
+                            session=err_session
+                        )
+                        await err_session.commit()
+                except Exception:
+                    pass
+        except Exception as e:
+            await session.rollback()
+            error(
+                "Pipeline CODING/UNIT_TESTING 阶段失败",
+                pipeline_id=pipeline_id,
+                exc_info=True
+            )
+            op_logger.log_pipeline_status_change(
+                pipeline_id=pipeline_id,
+                old_status='running',
+                new_status='failed',
+                stage='CODING',
+                error=str(e)
+            )
+            # 更新 pipeline 状态为 failed
+            try:
+                async with async_session_factory() as err_session:
+                    await PipelineService.mark_pipeline_failed(
+                        pipeline_id=pipeline_id,
+                        error=str(e),
+                        session=err_session
+                    )
+                    await err_session.commit()
+            except Exception:
+                pass
+        finally:
+            await session.close()
+
+    @staticmethod
+    async def _run_architect_task_background(
+        pipeline_id: int,
+        requirement: str,
+        element_context: Optional[Dict[str, Any]]
+    ) -> None:
+        """
+        后台任务：运行 ArchitectAgent 分析
+        
+        这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
+        """
+        from app.core.database import async_session_factory
+        from app.core.logging import op_logger, error
+
+        session = async_session_factory()
+        try:
+            await PipelineService.run_architect_task(
+                pipeline_id=pipeline_id,
+                requirement=requirement,
+                element_context=element_context,
+                session=session
+            )
+            # 显式提交
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            # 记录结构化日志，同时记录完整堆栈
+            error(
+                "Pipeline REQUIREMENT 阶段失败",
+                pipeline_id=pipeline_id,
+                exc_info=True
+            )
+            op_logger.log_pipeline_status_change(
+                pipeline_id=pipeline_id,
+                old_status='running',
+                new_status='failed',
+                stage='REQUIREMENT',
+                error=str(e)
+            )
+            # 更新 pipeline 状态为 failed，让前端感知
+            try:
+                async with async_session_factory() as err_session:
+                    await PipelineService.mark_pipeline_failed(
+                        pipeline_id=pipeline_id,
+                        error=str(e),
+                        session=err_session
+                    )
+                    await err_session.commit()
+            except Exception:
+                pass
+        finally:
+            await session.close()
 
     # ==================== 查询方法 ====================
 

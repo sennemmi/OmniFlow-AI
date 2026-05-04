@@ -1,9 +1,8 @@
 """
-需求分析阶段处理器（简化版）
+需求分析阶段处理器（使用 AgentCoordinatorService）
 
-与测试脚本 test_e2e_with_contract_v2.py 保持一致：
-- 直接调用 architect_agent.analyze()
-- 只保留审批阶段的功能
+使用统一的 AgentCoordinatorService 构建 Agent 上下文
+与 E2E 测试脚本保持一致
 """
 
 from typing import Any, Dict, Optional
@@ -15,10 +14,11 @@ from app.agents.architect import architect_agent
 from app.models.pipeline import StageName, PipelineStatus
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
+from app.service.agent_coordinator_service import agent_coordinator_service
 
 
 class RequirementHandler(StageHandler):
-    """需求分析阶段处理器（简化版）"""
+    """需求分析阶段处理器（使用统一服务）"""
 
     @property
     def stage_name(self) -> StageName:
@@ -45,7 +45,7 @@ class RequirementHandler(StageHandler):
         return context
 
     async def execute(self, context: StageContext) -> StageResult:
-        """执行需求分析（简化版，与测试脚本一致）"""
+        """执行需求分析（使用 AgentCoordinatorService）"""
         pipeline_id = context.pipeline_id
         requirement = context.get("requirement", "")
         element_context = context.get("element_context")
@@ -53,18 +53,40 @@ class RequirementHandler(StageHandler):
         await push_log(pipeline_id, "info", "开始需求分析...", stage="REQUIREMENT")
 
         try:
-            # 【简化】直接调用 architect_agent.analyze()，与测试脚本一致
-            # 不通过 AgentCoordinatorService
-            # file_tree 使用空字典，与测试脚本一致
-            # project_path 从 settings 获取
+            # 【统一】使用 AgentCoordinatorService 构建上下文
             project_path = settings.TARGET_PROJECT_PATH
 
-            arch_result = await architect_agent.analyze(
+            # 构建 ArchitectAgent 上下文
+            architect_context = await agent_coordinator_service.build_architect_context(
                 requirement=requirement,
                 file_tree={},  # 空字典，与测试脚本一致
                 element_context=element_context,
+                pipeline_id=pipeline_id
+            )
+
+            await push_log(
+                pipeline_id,
+                "info",
+                f"调用 ArchitectAgent (file_tree: {len(architect_context.get('file_tree', {}))} items)",
+                stage="REQUIREMENT"
+            )
+
+            # 调用 ArchitectAgent
+            arch_result = await architect_agent.analyze(
+                requirement=architect_context["requirement"],
+                file_tree=architect_context["file_tree"],
+                element_context=architect_context["element_context"],
                 pipeline_id=pipeline_id,
                 project_path=project_path
+            )
+
+            # 保存 Agent 调试信息
+            self._save_agent_log(
+                agent_name="ArchitectAgent",
+                stage="analyze",
+                input_data=architect_context,
+                output_data=arch_result,
+                system_prompt=architect_agent.system_prompt
             )
 
             if not arch_result.get("success"):

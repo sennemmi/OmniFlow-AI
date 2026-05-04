@@ -4,14 +4,17 @@ import tailwindcss from '@tailwindcss/vite'
 import componentDebugger from 'vite-plugin-component-debugger'
 import path from 'path'
 
-// OmniFlowAI 悬浮对话框注入插件
-const omniFlowOverlayPlugin = () => ({
+// 【修改点 1】: 接收 isDev 参数，动态判断注入路径
+const omniFlowOverlayPlugin = (isDev: boolean) => ({
   name: 'omniflow-overlay',
   transformIndexHtml(html: string) {
-    // 在 body 末尾注入 injector.js 脚本
+    // 开发模式直接以 module 方式引入 TS 源文件，生产模式使用打包后的 IIFE 产物
+    const scriptSrc = isDev ? '/src/injector/index.ts' : '/omni-injector.iife.js'
+    const typeAttr = isDev ? ' type="module"' : ''
+
     return html.replace(
       '</body>',
-      '  <script src="/injector.js" data-api-url="http://localhost:8000"></script>\n</body>'
+      `  <script${typeAttr} src="${scriptSrc}" data-api-url="http://localhost:8000"></script>\n</body>`
     )
   },
 })
@@ -29,8 +32,8 @@ export default defineConfig(({ mode }) => {
       }) : null,
       react(),
       tailwindcss(),
-      // OmniFlowAI 悬浮对话框注入
-      omniFlowOverlayPlugin(),
+      // 【修改点 2】: 传入 isDev 变量
+      omniFlowOverlayPlugin(isDev),
     ].filter(Boolean),
     resolve: {
       alias: {

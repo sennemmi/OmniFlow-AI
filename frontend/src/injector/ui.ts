@@ -45,8 +45,8 @@ class UIManager {
       this.hideProgress();
     });
 
-    bus.on('ui:notification:show', ({ prUrl }) => {
-      this.createCompletionNotification(prUrl);
+    bus.on('ui:notification:show', (params) => {
+      this.createCompletionNotification(params);
     });
 
     bus.on('mode:selection:enter', () => {
@@ -292,7 +292,7 @@ class UIManager {
         </p>
         ${hasPreciseSource ? `
         <div style="margin-top: 8px; padding: 8px 12px; background: #F0FFF5; border-radius: 6px; border: 1px solid #00B42A;">
-          <span style="font-size: 12px; color: #00B42A;">✅ 已精确定位到源码位置</span>
+          <span style="font-size: 12px; color: #00B42A;">[成功] 已精确定位到源码位置</span>
         </div>
         ` : ''}
       </div>
@@ -317,7 +317,9 @@ class UIManager {
 
     cancelBtn?.addEventListener('click', () => {
       stateManager.resetSelectionState();
+      stateManager.clearAllHighlights();
       overlay.remove();
+      appState.editDialog = null;
     });
 
     submitBtn?.addEventListener('click', () => {
@@ -341,7 +343,9 @@ class UIManager {
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) {
         stateManager.resetSelectionState();
+        stateManager.clearAllHighlights();
         overlay.remove();
+        appState.editDialog = null;
       }
     });
 
@@ -418,7 +422,7 @@ class UIManager {
     if (percent >= 100 && spinnerEl) {
       (spinnerEl as HTMLElement).style.border = 'none';
       (spinnerEl as HTMLElement).style.background = '#00B42A';
-      spinnerEl.innerHTML = '✓';
+      spinnerEl.innerHTML = '[完成]';
       (spinnerEl as HTMLElement).style.color = '#fff';
       (spinnerEl as HTMLElement).style.display = 'flex';
       (spinnerEl as HTMLElement).style.alignItems = 'center';
@@ -476,45 +480,110 @@ class UIManager {
   /**
    * 创建完成通知
    */
-  createCompletionNotification(prUrl: string): void {
+  createCompletionNotification(params: {
+    prUrl: string;
+    prNumber?: number;
+    branch?: string;
+    filePath?: string;
+  }): void {
+    const { prUrl, prNumber, branch, filePath } = params;
+
     const notification = dom.create('div', 'omni-completion-notification', {
       position: 'fixed',
       top: '24px',
       right: '24px',
-      width: '380px',
+      width: '400px',
       background: '#fff',
       borderRadius: '12px',
       boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
       zIndex: String(config.Z_INDEX + 20),
       overflow: 'hidden',
-      border: '1px solid #00B42A',
+      border: '2px solid #00B42A',
     });
+
+    // 提取文件名
+    const fileName = filePath ? filePath.split('/').pop() : '未知文件';
 
     notification.innerHTML = `
       <div style="padding: 20px;">
         <div style="display: flex; align-items: flex-start; gap: 12px;">
-          <div style="width: 40px; height: 40px; border-radius: 50%; background: #F0FFF5; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-            <span style="font-size: 20px;">✨</span>
+          <div style="width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, #00B42A, #00D68A); display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M20 6L9 17L4 12" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
           </div>
-          <div style="flex: 1;">
-            <h4 style="margin: 0 0 8px; font-size: 16px; font-weight: 600; color: #1F2329;">AI 已完成修改！</h4>
-            <p style="margin: 0 0 12px; font-size: 13px; color: #646A73; line-height: 1.5;">
-              代码已自动同步并 Push 到了 GitHub PR。
-            </p>
+          <div style="flex: 1; min-width: 0;">
+            <h4 style="margin: 0 0 6px; font-size: 16px; font-weight: 600; color: #1F2329;">
+              ✅ MR 创建成功！
+            </h4>
+            <div style="margin: 0 0 12px; font-size: 13px; color: #646A73; line-height: 1.5;">
+              <div style="margin-bottom: 4px;">
+                <span style="font-weight: 500;">PR #${prNumber || '?'}</span>
+                <span style="color: #8F959E; margin: 0 6px;">|</span>
+                <span style="font-family: monospace; background: #F5F6F7; padding: 2px 6px; border-radius: 4px;">${branch || 'unknown'}</span>
+              </div>
+              <div style="color: #8F959E; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                文件: ${fileName}
+              </div>
+            </div>
             <div style="display: flex; gap: 8px;">
-              <a href="${prUrl}" target="_blank" style="padding: 6px 12px; background: #3370FF; color: #fff; text-decoration: none; border-radius: 6px; font-size: 13px; font-weight: 500;">查看 PR</a>
-              <button class="omni-close-notification" style="padding: 6px 12px; background: transparent; border: 1px solid #DEE0E3; color: #646A73; border-radius: 6px; font-size: 13px; cursor: pointer;">关闭</button>
+              <a href="${prUrl}" target="_blank" style="padding: 8px 16px; background: linear-gradient(135deg, #3370FF, #2860EE); color: #fff; text-decoration: none; border-radius: 6px; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                  <polyline points="15 3 21 3 21 9"></polyline>
+                  <line x1="10" y1="14" x2="21" y2="3"></line>
+                </svg>
+                查看 PR
+              </a>
+              <button class="omni-copy-url" data-url="${prUrl}" style="padding: 8px 12px; background: #F5F6F7; border: none; color: #646A73; border-radius: 6px; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px; transition: all 0.2s;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                复制链接
+              </button>
+              <button class="omni-close-notification" style="padding: 8px; background: transparent; border: none; color: #8F959E; border-radius: 6px; font-size: 13px; cursor: pointer; margin-left: auto;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
             </div>
           </div>
         </div>
       </div>
     `;
 
+    // 关闭按钮
     const closeBtn = notification.querySelector('.omni-close-notification');
     closeBtn?.addEventListener('click', () => notification.remove());
 
+    // 复制链接按钮
+    const copyBtn = notification.querySelector('.omni-copy-url');
+    copyBtn?.addEventListener('click', async (e) => {
+      const url = (e.currentTarget as HTMLElement).dataset.url;
+      if (url) {
+        try {
+          await navigator.clipboard.writeText(url);
+          const originalText = copyBtn.innerHTML;
+          copyBtn.innerHTML = `
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#00B42A" stroke-width="2">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+            已复制
+          `;
+          setTimeout(() => {
+            copyBtn.innerHTML = originalText;
+          }, 2000);
+        } catch (err) {
+          console.error('复制失败:', err);
+        }
+      }
+    });
+
     document.body.appendChild(notification);
 
+    // 10秒后自动关闭
     setTimeout(() => {
       if (notification.parentNode) {
         notification.style.animation = 'omni-slide-out 0.3s ease-in';

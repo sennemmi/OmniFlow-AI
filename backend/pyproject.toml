@@ -1,5 +1,6 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"          # 所有 async def test_ 自动识别，不需要手动加 @mark
+asyncio_default_fixture_loop_scope = "function"  # 设置默认的 fixture loop scope
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]

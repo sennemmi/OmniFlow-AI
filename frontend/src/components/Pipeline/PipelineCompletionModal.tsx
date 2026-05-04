@@ -65,7 +65,7 @@ export function PipelineCompletionModal() {
           </div>
 
           <h2 className="text-2xl font-bold text-text-white mb-2">
-            ✨ AI 已完成修改！
+            [完成] AI 已完成修改！
           </h2>
           <p className="text-text-white/80">
             Pipeline #{pipeline.id} 所有阶段已执行完成

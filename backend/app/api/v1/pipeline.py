@@ -219,162 +219,6 @@ class PipelineRetryResponse(BaseModel):
     message: str = Field(..., description="重试消息")
 
 
-async def run_architect_task(pipeline_id: int, requirement: str, element_context: Optional[Dict[str, Any]]) -> None:
-    """后台任务：使用独立 session，确保事务完整性"""
-    session = async_session_factory()
-    try:
-        await PipelineService.run_architect_task(
-            pipeline_id=pipeline_id,
-            requirement=requirement,
-            element_context=element_context,
-            session=session
-        )
-        # 显式提交
-        await session.commit()
-    except Exception as e:
-        await session.rollback()
-        # 记录结构化日志，同时记录完整堆栈
-        from app.core.logging import op_logger, error
-        error(
-            "Pipeline REQUIREMENT 阶段失败",
-            pipeline_id=pipeline_id,
-            exc_info=True
-        )
-        op_logger.log_pipeline_status_change(
-            pipeline_id=pipeline_id,
-            old_status='running',
-            new_status='failed',
-            stage='REQUIREMENT',
-            error=str(e)
-        )
-        # 更新 pipeline 状态为 failed，让前端感知
-        try:
-            async with async_session_factory() as err_session:
-                await PipelineService.mark_pipeline_failed(
-                    pipeline_id=pipeline_id,
-                    error=str(e),
-                    session=err_session
-                )
-                await err_session.commit()
-        except Exception:
-            pass
-    finally:
-        await session.close()
-
-
-async def run_coding_task(pipeline_id: int) -> None:
-    """后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，完成后等待 CODE_REVIEW 审批"""
-    session = async_session_factory()
-    try:
-        from app.core.logging import op_logger
-        from app.core.sse_log_buffer import push_log
-
-        await push_log(pipeline_id, "info", "后台任务启动：开始执行代码生成...", stage="CODING")
-
-        # 1. 执行 CODING 阶段
-        coding_result = await PipelineService.trigger_coding_phase(
-            pipeline_id=pipeline_id,
-            session=session
-        )
-
-        if coding_result["success"]:
-            await session.commit()
-            await push_log(pipeline_id, "info", "代码生成完成，开始单元测试阶段...", stage="UNIT_TESTING")
-
-            # 2. 执行 UNIT_TESTING 阶段
-            testing_result = await PipelineService._trigger_testing_phase(
-                pipeline_id=pipeline_id,
-                session=session
-            )
-
-            if testing_result["success"]:
-                await session.commit()
-                test_generated = testing_result.get("test_generated", False)
-                test_run_success = testing_result.get("test_run_success", False)
-
-                # 3. 推送状态日志，然后等待 CODE_REVIEW 审批（不做自动推进）
-                if test_generated and test_run_success:
-                    await push_log(
-                        pipeline_id,
-                        "success",
-                        "单元测试通过，等待代码审查",
-                        stage="CODE_REVIEW"
-                    )
-                elif test_generated:
-                    await push_log(
-                        pipeline_id,
-                        "warning",
-                        "单元测试部分未通过，等待代码审查",
-                        stage="CODE_REVIEW"
-                    )
-                else:
-                    await push_log(
-                        pipeline_id,
-                        "info",
-                        "代码生成完成，等待代码审查",
-                        stage="CODE_REVIEW"
-                    )
-            else:
-                await session.commit()
-                await push_log(
-                    pipeline_id,
-                    "warning",
-                    "单元测试阶段异常，等待代码审查",
-                    stage="CODE_REVIEW"
-                )
-        else:
-            await session.rollback()
-            op_logger.log_pipeline_status_change(
-                pipeline_id=pipeline_id,
-                old_status='running',
-                new_status='failed',
-                stage='CODING',
-                error=coding_result.get("message", "Unknown error")
-            )
-            # 更新 pipeline 状态为 failed
-            try:
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=coding_result.get("message", "Coding phase failed"),
-                        session=err_session
-                    )
-                    await err_session.commit()
-            except Exception:
-                pass
-    except Exception as e:
-        await session.rollback()
-        from app.core.logging import op_logger, error
-        from app.core.sse_log_buffer import push_log
-
-        error(
-            "Pipeline CODING/UNIT_TESTING 阶段失败",
-            pipeline_id=pipeline_id,
-            exc_info=True
-        )
-        op_logger.log_pipeline_status_change(
-            pipeline_id=pipeline_id,
-            old_status='running',
-            new_status='failed',
-            stage='CODING',
-            error=str(e)
-        )
-        await push_log(pipeline_id, "error", "代码生成任务失败 (查看后端日志获取详情)", stage="CODING")
-        # 更新 pipeline 状态为 failed
-        try:
-            async with async_session_factory() as err_session:
-                await PipelineService.mark_pipeline_failed(
-                    pipeline_id=pipeline_id,
-                    error=str(e),
-                    session=err_session
-                )
-                await err_session.commit()
-        except Exception:
-            pass
-    finally:
-        await session.close()
-
-
 @router.post(
     "/pipeline/create",
     response_model=ResponseModel,
@@ -418,26 +262,38 @@ async def create_pipeline(
             session=session
         )
 
+        # 【关键修复】确保事务提交，数据持久化到数据库
+        # 这样前端跳转后查询时数据一定存在
+        await session.commit()
+
+        # 【关键修复】在事务提交后启动 Docker Sandbox
+        # 避免长时间占用数据库连接导致 SQLite 锁定
+        background_tasks.add_task(
+            PipelineService.start_sandbox_for_pipeline,
+            pipeline_id=pipeline.id
+        )
+
         # 2. 添加后台任务运行 ArchitectAgent
         background_tasks.add_task(
-            run_architect_task,
+            PipelineService._run_architect_task_background,
             pipeline_id=pipeline.id,
             requirement=data.requirement,
             element_context=element_context
         )
-        
+
         response_data = PipelineCreateResponse(
             pipeline_id=pipeline.id,
             status=pipeline.status.value,
             current_stage=pipeline.current_stage.value if pipeline.current_stage else None,
             created_at=pipeline.created_at.isoformat()
         )
-        
+
         return success_response(
             data=response_data.model_dump(),
             request_id=request_id
         )
     except Exception as e:
+        await session.rollback()
         error("创建 Pipeline 失败", exc_info=True)
         return error_response(
             error=f"Failed to create pipeline: {str(e)}",
@@ -787,14 +643,16 @@ async def reject_pipeline(
     summary="终止 Pipeline",
     description="""
     手动终止运行中的 Pipeline。
-    
+
     终止后：
-    - Pipeline 状态变为 failed
+    - Pipeline 状态立即变为 failed
     - 当前阶段标记为失败
     - 记录终止原因
-    - 清理相关资源
-    
+    - 后台异步清理相关资源（Sandbox、日志缓冲区等）
+
     只能终止状态为 running 的 Pipeline。
+
+    注意：此接口会立即返回，资源清理在后台异步执行。
     """,
     response_description="终止结果"
 )
@@ -802,10 +660,15 @@ async def terminate_pipeline(
     request: Request,
     pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
     data: PipelineTerminateRequest = None,
+    background_tasks: BackgroundTasks = None,
     session: AsyncSession = Depends(get_session)
 ):
     """
     终止 Pipeline（用户手动终止）
+
+    使用 BackgroundTasks 异步执行资源清理，避免阻塞 API 响应。
+    Sandbox 停止操作使用 docker kill 快速终止（约 100ms），
+    相比默认 docker stop（等待 10s）大幅提升响应速度。
     """
     request_id = getattr(request.state, "request_id", "unknown")
 
@@ -813,7 +676,8 @@ async def terminate_pipeline(
         result = await PipelineService.terminate_pipeline(
             pipeline_id=pipeline_id,
             reason=data.reason if data else "用户手动终止",
-            session=session
+            session=session,
+            background_tasks=background_tasks
         )
 
         if not result["success"]:
@@ -987,14 +851,15 @@ async def handle_test_decision(
         return error_response("choice 必须为 update_tests 或 rollback", request_id)
 
     if choice == "rollback":
-        # 直接回滚：调 git provider revert，标记 pipeline FAILED
-        from app.service.git_provider_gitpython import GitProviderGitPython
+        # 修复：使用现役统一的 GitProviderService
+        from app.service.git_provider import GitProviderService
         from app.service.pipeline import PipelineService
         from app.core.config import settings
         from pathlib import Path
 
-        git = GitProviderGitPython(Path(settings.TARGET_PROJECT_PATH))
-        await asyncio.to_thread(git.revert_last_commit)   # 视 git_provider 实现而定
+        # 使用 reset_hard 回滚
+        git = GitProviderService(str(Path(settings.TARGET_PROJECT_PATH)))
+        await asyncio.to_thread(git.reset_hard, "HEAD")
         await PipelineService.mark_pipeline_failed(
             pipeline_id, "用户选择回滚", session
         )

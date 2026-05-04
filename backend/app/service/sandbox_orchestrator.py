@@ -113,10 +113,11 @@ class SandboxOrchestrator:
                     "error": f"复制项目代码失败: {copy_error}"
                 }
             
-            # 1. 启动 Sandbox（使用临时目录作为挂载点）
+            # 1. 启动 Sandbox（使用绑定挂载，宿主机和容器共享工作区）
             self.sandbox_info = await sandbox_manager.start(
                 pipeline_id=self.pipeline_id,
-                project_path=self.temp_dir  # 【关键】使用临时目录而不是原始项目路径
+                project_path=self.temp_dir,  # 【关键】使用临时目录作为挂载点
+                use_bind_mount=True  # 【架构简化】使用绑定挂载，宿主机和容器共享同一个工作区
             )
             
             logger.info(f"[Pipeline {self.pipeline_id}] Sandbox 启动成功", extra={
@@ -224,6 +225,23 @@ class SandboxOrchestrator:
             Dict: 初始化结果
         """
         try:
+            # 【关键修复】先检查是否已经有 Git 仓库且已有提交
+            # 避免重复初始化导致超时
+            check_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git rev-parse --git-dir && git log --oneline -1",
+                timeout=5
+            )
+            if check_result.exit_code == 0:
+                logger.info(f"[Pipeline {self.pipeline_id}] Git 环境已存在且已有提交，跳过初始化")
+                await push_log(
+                    self.pipeline_id,
+                    "info",
+                    "✅ Git 环境已就绪",
+                    stage="REQUIREMENT"
+                )
+                return {"success": True}
+
             await push_log(
                 self.pipeline_id,
                 "info",
@@ -231,14 +249,14 @@ class SandboxOrchestrator:
                 stage="REQUIREMENT"
             )
 
-            # 【新增】强制清理可能存在的锁文件，防止上一次失败导致的死锁
+            # 【新增】强制清理可能存在的锁文件和旧的 Git 目录，防止上一次失败导致的死锁
             await sandbox_manager.exec(
                 self.pipeline_id,
-                "rm -f /workspace/.git/index.lock",
+                "rm -rf /workspace/.git/index.lock /workspace/.git/refs/heads/*.lock",
                 timeout=5
             )
 
-            # 1. git init
+            # 1. git init (如果 .git 不存在)
             init_result = await sandbox_manager.exec(
                 self.pipeline_id,
                 "cd /workspace && git init",
@@ -267,11 +285,30 @@ class SandboxOrchestrator:
                     "error": f"git config 失败: {config_email_result.stderr or config_name_result.stderr}"
                 }
 
-            # 3. git add (增加超时到 60 秒，因为项目文件可能很多)
+            # 3. 检查是否有文件需要提交
+            status_result = await sandbox_manager.exec(
+                self.pipeline_id,
+                "cd /workspace && git status --porcelain | wc -l",
+                timeout=10
+            )
+            if status_result.exit_code == 0:
+                file_count = int(status_result.stdout.strip() or 0)
+                if file_count == 0:
+                    logger.info(f"[Pipeline {self.pipeline_id}] 没有文件需要提交，跳过 git add/commit")
+                    await push_log(
+                        self.pipeline_id,
+                        "info",
+                        "✅ Git 环境初始化完成（无文件需提交）",
+                        stage="REQUIREMENT"
+                    )
+                    return {"success": True}
+                logger.info(f"[Pipeline {self.pipeline_id}] 需要提交 {file_count} 个文件")
+
+            # 4. git add (超时 120 秒，大项目文件可能很多)
             add_result = await sandbox_manager.exec(
                 self.pipeline_id,
                 "cd /workspace && git add -A",  # 使用 -A 确保包含所有文件
-                timeout=60
+                timeout=120
             )
             if add_result.exit_code != 0:
                 return {
@@ -279,11 +316,11 @@ class SandboxOrchestrator:
                     "error": f"git add 失败: {add_result.stderr}"
                 }
 
-            # 4. git commit (增加超时到 30 秒)
+            # 5. git commit (超时 60 秒，首次提交文件较多)
             commit_result = await sandbox_manager.exec(
                 self.pipeline_id,
                 "cd /workspace && git commit -m 'Initial commit'",
-                timeout=30
+                timeout=60
             )
             if commit_result.exit_code != 0:
                 return {
@@ -380,11 +417,23 @@ class SandboxOrchestrator:
     def get_file_service(self) -> Optional[SandboxFileService]:
         """
         获取 SandboxFileService 实例
-        
+
         Returns:
             Optional[SandboxFileService]: 文件服务实例，如果未初始化则返回 None
         """
         return self.file_service
+
+    def get_workspace_path(self) -> Optional[str]:
+        """
+        获取 Sandbox 工作区路径（宿主机上的临时目录）
+
+        【绑定挂载架构】返回宿主机上的 temp_dir，与 Sandbox 容器内的 /workspace 是同一个目录
+        可以直接用于 Git 操作，无需再从 Sandbox 复制文件
+
+        Returns:
+            Optional[str]: 工作区路径，如果未初始化则返回 None
+        """
+        return self.temp_dir
     
     async def cleanup(self) -> Dict[str, Any]:
         """

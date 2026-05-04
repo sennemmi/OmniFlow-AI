@@ -125,7 +125,7 @@ export function formatDesignToMarkdown(output: Record<string, any>): string {
 
   // 预估工作量
   if (output.estimated_effort) {
-    sections.push(`## 预估工作量\n⏱️ ${output.estimated_effort}\n`);
+    sections.push(`## 预估工作量\n[时间] ${output.estimated_effort}\n`);
   }
 
   // 受影响文件

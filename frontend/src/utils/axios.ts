@@ -48,7 +48,7 @@ apiClient.interceptors.response.use(
       return Promise.reject(error);
     }
 
-    // ★ 直接返回业务数据，而不是放入 data 字段
+    // [注意] 直接返回业务数据，而不是放入 data 字段
     return data.data as any;
   },
   (error: AxiosError<ApiResponse<unknown>>) => {

@@ -71,7 +71,8 @@ class StateManager {
     state.selectedElements = [];
     state.hoverElement = null;
 
-    bus.emit('element:deselect:all', undefined);
+    // 注意：不在这里触发 element:deselect:all 事件，避免循环调用
+    // 事件由调用方负责触发
   }
 
   /**
@@ -92,6 +93,8 @@ class StateManager {
       state.editDialog.remove();
       state.editDialog = null;
     }
+    // 关闭对话框时清除圈选框
+    this.clearAllHighlights();
     bus.emit('ui:dialog:close', undefined);
   }
 
@@ -112,8 +115,28 @@ class StateManager {
     document.body.style.cursor = '';
     this.resetSelectionState();
     this.clearFloatingPanel();
+    // 关闭对话框（内部会清除高亮）
     this.closeEditDialog();
+    // 确保清除所有圈选框高亮（包括没有对话框时的高亮）
+    this.clearAllHighlights();
     bus.emit('mode:selection:exit', undefined);
+  }
+
+  /**
+   * 清除所有圈选框高亮
+   */
+  clearAllHighlights(): void {
+    // 清除单元素高亮框
+    const highlightBoxes = document.querySelectorAll('.omni-highlight-box');
+    highlightBoxes.forEach((box) => box.remove());
+    
+    // 清除多选高亮框
+    const multiHighlightBoxes = document.querySelectorAll('.omni-multi-highlight-box');
+    multiHighlightBoxes.forEach((box) => box.remove());
+    
+    // 清除选择框（拖拽选择框）
+    const selectionBoxes = document.querySelectorAll('.omni-selection-box');
+    selectionBoxes.forEach((box) => box.remove());
   }
 
   /**

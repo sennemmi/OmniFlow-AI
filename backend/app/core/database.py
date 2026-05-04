@@ -8,11 +8,38 @@ from sqlmodel import SQLModel
 
 from app.core.config import settings
 
-# 创建异步引擎 - echo=False 彻底关闭 SQLAlchemy 详细日志
+# 创建异步引擎 - 优化连接池配置避免 SQLite 锁定问题
+# 参考 SQLAlchemy 文档：https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#database-locking-behavior-concurrency
+def _get_engine_args():
+    """获取数据库引擎参数"""
+    args = {
+        "echo": False,
+        "future": True,
+    }
+    
+    # SQLite 特定优化
+    if settings.DATABASE_URL.startswith("sqlite"):
+        # SQLite 连接池配置
+        # - pool_pre_ping: 连接前检查连接是否有效
+        # - pool_recycle: 连接回收时间（秒）
+        # - connect_args: 连接参数
+        args.update({
+            "pool_pre_ping": True,
+            "pool_recycle": 3600,  # 1小时回收连接
+            "connect_args": {
+                # 设置 SQLite 超时时间（秒）
+                # 当数据库被锁定时，等待最多 30 秒
+                "timeout": 30,
+                # 启用 WAL 模式提高并发性能
+                # "check_same_thread": False,  # 异步模式下不需要
+            }
+        })
+    
+    return args
+
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
-    future=True
+    **_get_engine_args()
 )
 
 # 创建异步会话工厂

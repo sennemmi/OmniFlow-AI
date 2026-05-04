@@ -24,7 +24,8 @@ async def run_syntax_fix_loop(
     design_output: Dict,
     max_retries: int = 3,
     debugger: Optional["AgentDebugger"] = None,
-    coder_system_prompt: Optional[str] = None
+    coder_system_prompt: Optional[str] = None,
+    pipeline_id: Optional[int] = None,
 ) -> Dict[str, str]:
     """
     运行语法错误修复循环
@@ -35,15 +36,15 @@ async def run_syntax_fix_loop(
         file_service: 文件服务
         design_output: 设计输出
         max_retries: 最大重试次数
+        pipeline_id: Pipeline ID（用于沙箱内语法检查）
 
     Returns:
         修复后的文件字典 {file_path: content}
     """
-    from app.service.code_validation_service import CodeValidationService
+    from app.service.code_validation_service import code_validation_service
     from app.utils.file_operation_utils import build_fix_instruction_with_context
 
     fixed_files = {}
-    validation_service = CodeValidationService()
 
     for attempt in range(max_retries):
         logger.info(f"语法错误自动修复 第 {attempt + 1}/{max_retries} 次")
@@ -136,9 +137,13 @@ async def run_syntax_fix_loop(
                 # 【修复】检测 search_block 是否匹配成功
                 if new_content == current_content:
                     logger.warning(f"search_block 未匹配到内容: {fp}，尝试使用全量替换")
-                    # 降级策略：如果提供了 content，使用全量替换
+                    # 降级策略1：如果提供了 content，使用全量替换
                     if content and content != current_content:
                         new_content = content
+                    # 降级策略2：检查 replace_block 是否像完整文件
+                    elif _looks_like_complete_file(replace_block):
+                        logger.info(f"使用 replace_block 作为完整文件内容: {fp}")
+                        new_content = replace_block
                     else:
                         logger.warning(f"未提供有效的全量替换内容，跳过: {fp}")
                         continue
@@ -147,6 +152,8 @@ async def run_syntax_fix_loop(
 
             if not new_content:
                 logger.warning(f"没有生成有效内容: {fp}")
+                # 【关键修复】当没有生成有效内容时，记录为修复失败
+                # 但不立即退出，让后续的统一错误检查来处理
                 continue
 
             # 【关键修复1】将修复后的内容写入沙箱，并检查返回值
@@ -168,10 +175,11 @@ async def run_syntax_fix_loop(
                 # 使用实际内容继续
                 new_content = actual_content
 
-            # 【关键修复3】使用回读后的内容进行语法检查
-            check_result = await validation_service.check_syntax_with_py_compile(
-                [{"file_path": fp, "change_type": "add", "content": new_content}],
-                file_service
+            # 【关键修复3】使用沙箱内语法检查（避免宿主机编码问题）
+            check_result = await code_validation_service.check_syntax_in_sandbox(
+                file_path=fp,
+                pipeline_id=pipeline_id,
+                content=new_content
             )
 
             # 更新内存中的文件内容（使用回读后的实际内容）
@@ -181,11 +189,11 @@ async def run_syntax_fix_loop(
                 fixed_files[fp] = new_content
                 logger.info(f"语法修复成功: {fp}")
             else:
-                logger.warning(f"修复后仍有语法错误: {fp} - {check_result[0].error}")
+                logger.warning(f"修复后仍有语法错误: {fp} - {check_result.error}")
 
-        # 【关键修复4】检查剩余错误时，从沙箱重新读取文件
+        # 【关键修复4】检查剩余错误时，使用沙箱内语法检查
         remaining_errors = await _check_remaining_syntax_errors(
-            syntax_errors, files_to_check, validation_service, file_service
+            syntax_errors, file_service, pipeline_id
         )
 
         if not remaining_errors:
@@ -537,7 +545,7 @@ async def run_test_syntax_fix_loop(
         syntax_errors = [err.to_dict() for err in remaining_errors]
         test_files = fixed_test_files
 
-    return []
+    return remaining
 
 
 def _extract_files_from_output(output: Any) -> List[Dict]:
@@ -547,6 +555,29 @@ def _extract_files_from_output(output: Any) -> List[Dict]:
     elif isinstance(output, dict):
         return output.get("files", [])
     return []
+
+
+def _looks_like_complete_file(code: str) -> bool:
+    """
+    简单判断一个代码块是否像是完整的 Python 文件（包含导入或函数定义）
+    
+    用于 search_block 匹配失败时的回退策略
+    """
+    if not code or not isinstance(code, str):
+        return False
+    
+    lines = code.strip().splitlines()
+    if len(lines) < 2:
+        return False
+    
+    # 检查是否包含 import 或 def 或 class 关键字
+    has_import = any(
+        line.lstrip().startswith('import ') or line.lstrip().startswith('from ')
+        for line in lines
+    )
+    has_def = any('def ' in line or 'class ' in line for line in lines)
+    
+    return has_import or has_def
 
 
 def _update_files_to_check(files_to_check: List[Tuple[str, str]], file_path: str, new_content: str):
@@ -559,15 +590,16 @@ def _update_files_to_check(files_to_check: List[Tuple[str, str]], file_path: str
 
 async def _check_remaining_syntax_errors(
     syntax_errors: List[Dict],
-    files_to_check: List[Tuple[str, str]],
-    validation_service,
-    file_service: SandboxFileService
+    file_service: SandboxFileService,
+    pipeline_id: Optional[int] = None,
 ) -> List[Dict]:
     """
     检查剩余的语法错误
     
-    【关键修复】从沙箱重新读取文件内容进行验证，而不是使用内存中的内容
+    【关键修复】使用沙箱内语法检查，避免宿主机编码问题
     """
+    from app.service.code_validation_service import code_validation_service
+    
     remaining = []
     checked_files = set()
     
@@ -587,16 +619,18 @@ async def _check_remaining_syntax_errors(
         check_content = read_result.content
         
         if check_content:
-            check_result = await validation_service.check_syntax_with_py_compile(
-                [{"file_path": fp, "change_type": "add", "content": check_content}],
-                file_service
+            # 使用沙箱内语法检查
+            check_result = await code_validation_service.check_syntax_in_sandbox(
+                file_path=fp,
+                pipeline_id=pipeline_id,
+                content=check_content
             )
             if check_result:
-                logger.warning(f"仍有语法错误: {fp} - {check_result[0].error}")
+                logger.warning(f"仍有语法错误: {fp} - {check_result.error}")
                 remaining.append({
                     "file": fp,
-                    "error": check_result[0].error,
-                    "line": check_result[0].line
+                    "error": check_result.error,
+                    "line": check_result.line
                 })
         else:
             logger.warning(f"文件内容为空: {fp}")

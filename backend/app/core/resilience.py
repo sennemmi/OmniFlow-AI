@@ -17,6 +17,7 @@ import time
 from typing import Callable, Any, Optional, TypeVar, Generic, Dict
 from enum import Enum
 from functools import wraps
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -322,9 +323,12 @@ class ResilienceManager:
     弹性管理器
 
     管理多个 RetryExecutor 实例，提供统一的弹性能力
+    使用 LRU 策略限制最大执行器数量，防止内存无限增长
     """
 
-    _executors: Dict[str, RetryExecutor] = {}
+    _executors: OrderedDict[str, RetryExecutor] = OrderedDict()
+    _max_executors: int = 50  # 最大执行器数量限制
+    _access_count: Dict[str, int] = {}  # 访问计数，用于 LRU
 
     @classmethod
     def get_executor(
@@ -335,7 +339,7 @@ class ResilienceManager:
         **kwargs
     ) -> RetryExecutor:
         """
-        获取或创建 RetryExecutor
+        获取或创建 RetryExecutor（带 LRU 缓存）
 
         Args:
             name: 执行器名称
@@ -346,22 +350,57 @@ class ResilienceManager:
         Returns:
             RetryExecutor 实例
         """
-        if name not in cls._executors:
-            cls._executors[name] = RetryExecutor(
-                name=name,
-                max_retries=max_retries,
-                base_delay=base_delay,
-                **kwargs
-            )
+        if name in cls._executors:
+            # 移动到末尾（最近使用）
+            cls._executors.move_to_end(name)
+            cls._access_count[name] = cls._access_count.get(name, 0) + 1
+            return cls._executors[name]
+        
+        # 检查是否需要淘汰最久未使用的执行器
+        if len(cls._executors) >= cls._max_executors:
+            cls._evict_oldest_executor()
+        
+        # 创建新执行器
+        cls._executors[name] = RetryExecutor(
+            name=name,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            **kwargs
+        )
+        cls._access_count[name] = 1
+        logger.info(f"[ResilienceManager] 创建新执行器: {name} (当前: {len(cls._executors)}/{cls._max_executors})")
         return cls._executors[name]
+    
+    @classmethod
+    def _evict_oldest_executor(cls):
+        """淘汰最久未使用的执行器"""
+        if not cls._executors:
+            return
+        
+        # 获取最久未使用的 key（OrderedDict 的第一个元素）
+        oldest_name = next(iter(cls._executors))
+        oldest_executor = cls._executors[oldest_name]
+        
+        logger.info(f"[ResilienceManager] 淘汰执行器: {oldest_name} "
+                   f"(访问次数: {cls._access_count.get(oldest_name, 0)})")
+        
+        # 从缓存中移除
+        cls._executors.pop(oldest_name)
+        cls._access_count.pop(oldest_name, None)
 
     @classmethod
     def get_stats(cls) -> Dict[str, Dict[str, Any]]:
         """获取所有执行器的统计信息"""
-        return {
+        stats = {
             name: executor.get_stats()
             for name, executor in cls._executors.items()
         }
+        stats["_cache_info"] = {
+            "size": len(cls._executors),
+            "max_size": cls._max_executors,
+            "access_counts": cls._access_count.copy()
+        }
+        return stats
 
     @classmethod
     def reset(cls, name: Optional[str] = None):
@@ -369,8 +408,18 @@ class ResilienceManager:
         if name:
             if name in cls._executors:
                 del cls._executors[name]
+                cls._access_count.pop(name, None)
         else:
             cls._executors.clear()
+            cls._access_count.clear()
+    
+    @classmethod
+    def set_max_executors(cls, max_size: int):
+        """设置最大执行器数量"""
+        cls._max_executors = max(max_size, 1)  # 至少保留 1 个
+        # 如果当前数量超过新限制，淘汰多余的
+        while len(cls._executors) > cls._max_executors:
+            cls._evict_oldest_executor()
 
 
 # 便捷装饰器
