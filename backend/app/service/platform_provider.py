@@ -63,7 +63,7 @@ class GitHubProviderService:
         Returns:
             PRResult: 创建结果
         """
-        url = f"https://api.github.com/repos/{settings.GITHUB_REPO}/pulls"
+        url = f"https://api.github.com/repos/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}/pulls"
         headers = {
             "Authorization": f"token {settings.GITHUB_TOKEN}",
             "Accept": "application/vnd.github.v3+json"

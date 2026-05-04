@@ -19,11 +19,14 @@ import asyncio
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from app.core.config import settings
 
 # ========================== 配置 ==========================
 TARGET_PROJECT_PATH = os.environ.get("TARGET_PROJECT_PATH", str(Path(__file__).parent.parent.parent))
@@ -85,7 +88,7 @@ async def test_delivery_simple():
             if backend_source.exists():
                 print(f"   复制 backend 目录...")
                 try:
-                    # 使用 shutil 复制整个目录
+                    # 使用 shutil 复制整个目录（保留 .git 目录以便 Git 操作）
                     shutil.copytree(
                         backend_source,
                         backend_target,
@@ -94,13 +97,12 @@ async def test_delivery_simple():
                             "*.pyc",
                             ".pytest_cache",
                             "*.egg-info",
-                            ".git",
                             "node_modules"
                         ),
                         dirs_exist_ok=True
                     )
                     copied_count += 1
-                    print(f"   ✅ backend 目录复制完成")
+                    print(f"   ✅ backend 目录复制完成（含 .git）")
                 except Exception as e:
                     print(f"   ⚠️ backend 目录复制失败: {e}")
                     failed_files.append("backend/")
@@ -128,19 +130,43 @@ async def test_delivery_simple():
             print(f"      - 成功: {copied_count}")
             print(f"      - 失败: {len(failed_files)}")
 
+            # 记录成功复制的文件列表，用于后续 Git 添加
+            copied_files = [f for f in TEST_FILES if (workspace_dir / f).exists()]
+            if backend_source.exists():
+                copied_files.append("backend/")
+
             # ========== Step 4: Git 操作 ==========
             print("\n" + "="*60)
             print("Step 4: Git 操作")
             print("="*60)
 
             git_service = GitProviderService(str(workspace_dir))
+
+            # 【关键】设置 AI 远程仓库
+            try:
+                git_service.setup_ai_remote("ai")
+                print(f"   ✅ 设置 AI 远程仓库: {settings.GITHUB_OWNER}/{settings.GITHUB_REPO}")
+            except Exception as e:
+                print(f"   ⚠️ 设置 AI 远程仓库失败: {e}")
+
+            # 【关键】重置工作区，丢弃所有本地修改（避免分支切换冲突）
+            try:
+                git_service.reset_hard("HEAD")
+                git_service.clean_untracked()
+                print("   ✅ 重置工作区，丢弃本地修改")
+            except Exception as e:
+                print(f"   ⚠️ 重置工作区失败: {e}")
+
             timestamp = now().strftime("%Y%m%d_%H%M%S")
             git_branch = f"devflow/test-delivery-{TEST_PIPELINE_ID}-{timestamp}"
 
-            # 创建分支
+            # 创建分支（基于 AI 远程的 main 分支）
             try:
-                git_service.create_branch(git_branch)
-                print(f"   ✅ 创建分支: {git_branch}")
+                # 先获取 AI 远程的最新代码
+                git_service.fetch("ai")
+                # 从 AI 远程的 main 分支创建新分支
+                git_service._run_git_command(["checkout", "-b", git_branch, "ai/main"])
+                print(f"   ✅ 创建分支: {git_branch} (基于 ai/main)")
             except Exception as e:
                 print(f"   ⚠️ 创建分支失败: {e}")
                 # 尝试使用已有分支
@@ -152,27 +178,37 @@ async def test_delivery_simple():
                     print(f"   ❌ 分支操作失败: {e2}")
                     return
 
-            # 添加文件
-            git_service.add_files()
-            print("   ✅ 添加文件到暂存区")
+            # 添加文件（只添加我们复制的文件，避免扫描整个工作区）
+            print("   ⏳ 添加文件到暂存区...")
+            start_time = time.time()
+            for file_path in copied_files:
+                try:
+                    git_service.add_files([file_path])
+                except Exception as e:
+                    print(f"   ⚠️ 添加文件失败 {file_path}: {e}")
+            elapsed = time.time() - start_time
+            print(f"   ✅ 添加文件到暂存区 ({elapsed:.2f}s)")
 
             # 提交
             if git_service.has_changes():
+                print("   ⏳ 提交变更...")
+                start_time = time.time()
                 commit_message = f"feat(test-delivery-{TEST_PIPELINE_ID}): 测试交付阶段\n\n- 从工作区复制文件\n- 测试 Git 提交流程\n- 验证 PR 创建"
                 git_service.commit_changes(commit_message)
                 commit_hash = git_service.get_last_commit_hash()
-                print(f"   ✅ 提交: {commit_hash[:8]}")
-            else:
-                print("   ⚠️ 没有变更需要提交")
-                commit_hash = None
-
-            # 推送
+                elapsed = time.time() - start_time
+                print(f"   ✅ 提交: {commit_hash[:8]} ({elapsed:.2f}s)")
+            # 推送到 AI 远程仓库
             if commit_hash:
+                print(f"   ⏳ 推送到 AI 远程: {git_branch}...")
+                start_time = time.time()
                 try:
-                    git_service.push_branch(git_branch)
-                    print(f"   ✅ 推送到远程: {git_branch}")
+                    git_service._run_git_command(["push", "-u", "ai", git_branch])
+                    elapsed = time.time() - start_time
+                    print(f"   ✅ 推送到 AI 远程: {git_branch} ({elapsed:.2f}s)")
                 except Exception as e:
-                    print(f"   ⚠️ 推送失败: {e}")
+                    elapsed = time.time() - start_time
+                    print(f"   ⚠️ 推送失败 ({elapsed:.2f}s): {e}")
                     print("   可能原因: 远程仓库未配置或网络问题")
 
             # ========== Step 5: 创建 PR ==========

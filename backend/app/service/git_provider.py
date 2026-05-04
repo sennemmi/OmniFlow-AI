@@ -596,6 +596,30 @@ class GitProviderService:
         """
         return self._run_git_command(["remote", "set-url", remote, url])
 
+    def setup_ai_remote(self, remote_name: str = "ai") -> GitResult:
+        """
+        设置 AI 专用远程仓库
+
+        使用 .env 中配置的 GITHUB_OWNER 和 GITHUB_REPO 设置远程仓库。
+        如果远程已存在则更新 URL，否则添加新的远程。
+
+        Args:
+            remote_name: AI 远程仓库名称，默认 "ai"
+
+        Returns:
+            GitResult: 操作结果
+        """
+        remote_url = f"https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git"
+
+        # 检查远程是否已存在
+        try:
+            self._run_git_command(["remote", "get-url", remote_name], check=False)
+            # 存在则更新 URL
+            return self._run_git_command(["remote", "set-url", remote_name, remote_url])
+        except GitProviderError:
+            # 不存在则添加
+            return self._run_git_command(["remote", "add", remote_name, remote_url])
+
     def fetch(self, remote: str = "origin") -> GitResult:
         """
         从远程获取更新
