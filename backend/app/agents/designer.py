@@ -771,6 +771,73 @@ signature_change_reason: 无需修改，复用现有函数
         
         return "\n".join(lines)
 
+    def _classify_interface_symbol(
+        self,
+        symbol_name: str,
+        module: str,
+        full_files_context: Dict[str, str]
+    ) -> tuple[bool, bool, str | None, str | None]:
+        """
+        【抽取】对 interface_spec 符号进行 AST 分类
+
+        返回:
+            (is_module_level, is_class_method, parent_class, file_content)
+            - is_module_level: 是否是模块级可导入符号（函数/类）
+            - is_class_method: 是否是类方法
+            - parent_class: 如果是类方法，返回类名
+            - file_content: 文件内容（用于上层复用）
+        """
+        import ast
+
+        if not symbol_name or not module:
+            return False, False, None, None
+
+        # 标准化模块路径
+        clean_module = module.replace("backend/", "").replace("backend\\", "").lstrip("/")
+        if not clean_module.endswith(".py"):
+            clean_module += ".py"
+
+        # 查找对应的文件内容
+        file_content = None
+        for path, content in full_files_context.items():
+            path_clean = path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            if path_clean == clean_module or path_clean == clean_module.replace(".py", ""):
+                file_content = content
+                break
+
+        if not file_content:
+            return False, False, None, None
+
+        try:
+            tree = ast.parse(file_content)
+        except SyntaxError:
+            return False, False, None, file_content
+
+        is_module_level = False
+        is_class_method = False
+        parent_class = None
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol_name:
+                is_module_level = True
+                break
+            elif isinstance(node, ast.ClassDef) and node.name == symbol_name:
+                is_module_level = True
+                break
+
+        if not is_module_level:
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == symbol_name:
+                            is_class_method = True
+                            parent_class = node.name
+                            break
+                    if is_class_method:
+                        break
+
+        return is_module_level, is_class_method, parent_class, file_content
+
     def _auto_correct_interface_specs(
         self,
         interface_specs: list,
@@ -778,122 +845,39 @@ signature_change_reason: 无需修改，复用现有函数
     ) -> tuple[list, list]:
         """
         【自动修正】将类方法符号自动转换为类名符号
-
-        问题背景：
-        - LLM 可能错误地将类方法（如 HealthService.get_component_health）作为独立符号提取
-        - 但类方法不能通过 `from module import symbol` 直接导入
-        - 此方法自动将类方法符号替换为类名符号
-
-        修正逻辑：
-        1. 对于每个 interface_spec，检查其 symbol_name 是否是某个类的方法
-        2. 如果是类方法，将 symbol_name 替换为类名
-        3. 在 expected_behavior 中说明实际使用的是类的方法
-
-        Args:
-            interface_specs: 接口契约列表
-            full_files_context: 完整文件内容映射
-
-        Returns:
-            tuple[修正后的契约列表, 修正日志列表]
         """
-        import ast
         import copy
 
         corrected_specs = copy.deepcopy(interface_specs)
         correction_log = []
 
-        for i, spec in enumerate(corrected_specs):
-            # 处理 InterfaceSpec 对象或字典
-            if hasattr(spec, 'symbol_name'):
-                symbol_name = spec.symbol_name
-                module = spec.module
-                is_object = True
-            else:
-                symbol_name = spec.get("symbol_name", "")
-                module = spec.get("module", "")
-                is_object = False
+        for spec in corrected_specs:
+            is_object = hasattr(spec, 'symbol_name')
+            symbol_name = spec.symbol_name if is_object else spec.get("symbol_name", "")
+            module = spec.module if is_object else spec.get("module", "")
 
-            if not symbol_name or not module:
-                continue
+            is_module_level, is_class_method, parent_class, _ = self._classify_interface_symbol(
+                symbol_name, module, full_files_context
+            )
 
-            # 标准化模块路径
-            clean_module = module.replace("backend/", "").replace("backend\\", "").lstrip("/")
-            if not clean_module.endswith(".py"):
-                clean_module += ".py"
+            if is_class_method and parent_class:
+                old_symbol = symbol_name
+                new_symbol = parent_class
 
-            # 查找对应的文件内容
-            file_content = None
-            for path, content in full_files_context.items():
-                path_clean = path.replace("backend/", "").replace("backend\\", "").lstrip("/")
-                if path_clean == clean_module or path_clean == clean_module.replace(".py", ""):
-                    file_content = content
-                    break
+                if is_object:
+                    spec.symbol_name = new_symbol
+                    old_behavior = spec.expected_behavior or ""
+                    spec.expected_behavior = f"使用类 {parent_class} 的 {old_symbol} 方法。{old_behavior}"
+                    spec.signature = f"class {parent_class}:"
+                else:
+                    spec["symbol_name"] = new_symbol
+                    old_behavior = spec.get("expected_behavior", "")
+                    spec["expected_behavior"] = f"使用类 {parent_class} 的 {old_symbol} 方法。{old_behavior}"
+                    spec["signature"] = f"class {parent_class}:"
 
-            if not file_content:
-                # 文件不在上下文中，可能是新文件，跳过
-                continue
-
-            try:
-                tree = ast.parse(file_content)
-
-                # 检查符号是否是模块级可导入的
-                is_module_level = False
-                is_class_method = False
-                parent_class = None
-                method_signature = ""
-
-                for node in tree.body:
-                    # 检查是否是模块级函数或类
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol_name:
-                        is_module_level = True
-                        break
-                    elif isinstance(node, ast.ClassDef) and node.name == symbol_name:
-                        is_module_level = True
-                        break
-
-                # 如果不是模块级的，检查是否是类方法
-                if not is_module_level:
-                    for node in tree.body:
-                        if isinstance(node, ast.ClassDef):
-                            for item in node.body:
-                                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                    if item.name == symbol_name:
-                                        is_class_method = True
-                                        parent_class = node.name
-                                        # 提取方法签名
-                                        args = [arg.arg for arg in item.args.args]
-                                        method_signature = f"def {symbol_name}({', '.join(args)})"
-                                        break
-                        if is_class_method:
-                            break
-
-                # 如果是类方法，自动修正为类名
-                if is_class_method and parent_class:
-                    old_symbol = symbol_name
-                    new_symbol = parent_class
-
-                    if is_object:
-                        spec.symbol_name = new_symbol
-                        # 更新 expected_behavior 说明实际使用的是类的方法
-                        old_behavior = spec.expected_behavior or ""
-                        spec.expected_behavior = f"使用类 {parent_class} 的 {old_symbol} 方法。{old_behavior}"
-                        # 更新 signature 为类定义
-                        spec.signature = f"class {parent_class}:"
-                    else:
-                        spec["symbol_name"] = new_symbol
-                        # 更新 expected_behavior 说明实际使用的是类的方法
-                        old_behavior = spec.get("expected_behavior", "")
-                        spec["expected_behavior"] = f"使用类 {parent_class} 的 {old_symbol} 方法。{old_behavior}"
-                        # 更新 signature 为类定义
-                        spec["signature"] = f"class {parent_class}:"
-
-                    correction_log.append(
-                        f"'{old_symbol}' -> '{new_symbol}' (类方法转为类名)"
-                    )
-
-            except SyntaxError:
-                # 文件有语法错误，跳过
-                continue
+                correction_log.append(
+                    f"'{old_symbol}' -> '{new_symbol}' (类方法转为类名)"
+                )
 
         return corrected_specs, correction_log
 
@@ -904,98 +888,24 @@ signature_change_reason: 无需修改，复用现有函数
     ) -> list:
         """
         【关键修复】验证 interface_specs 中的符号是否都是模块级可导入的
-
-        问题背景：
-        - DesignerAgent 可能错误地将类方法（如 HealthService.get_component_health）记录为契约符号
-        - 但类方法不能通过 `from module import symbol` 直接导入
-        - 这会导致 TesterAgent 生成错误的 import 语句，引发 ImportError
-
-        验证逻辑：
-        1. 对于每个 interface_spec，检查其 symbol_name 是否存在于对应模块的顶层
-        2. 如果 symbol_name 是类名（如 HealthService），允许
-        3. 如果 symbol_name 是模块级函数，允许
-        4. 如果 symbol_name 实际上是某个类的方法，拒绝并返回错误
-
-        Args:
-            interface_specs: 接口契约列表
-            full_files_context: 完整文件内容映射
-
-        Returns:
-            list: 错误列表，空列表表示所有符号都可导入
         """
-        import ast
         errors = []
 
         for spec in interface_specs:
-            # 处理 InterfaceSpec 对象或字典
-            if hasattr(spec, 'symbol_name'):
-                symbol_name = spec.symbol_name
-                module = spec.module
-            else:
-                symbol_name = spec.get("symbol_name", "")
-                module = spec.get("module", "")
+            symbol_name = spec.symbol_name if hasattr(spec, 'symbol_name') else spec.get("symbol_name", "")
+            module = spec.module if hasattr(spec, 'symbol_name') else spec.get("module", "")
 
-            if not symbol_name or not module:
-                continue
+            is_module_level, is_class_method, parent_class, _ = self._classify_interface_symbol(
+                symbol_name, module, full_files_context
+            )
 
-            # 标准化模块路径
-            clean_module = module.replace("backend/", "").replace("backend\\", "").lstrip("/")
-            if not clean_module.endswith(".py"):
-                clean_module += ".py"
-
-            # 查找对应的文件内容
-            file_content = None
-            for path, content in full_files_context.items():
-                path_clean = path.replace("backend/", "").replace("backend\\", "").lstrip("/")
-                if path_clean == clean_module or path_clean == clean_module.replace(".py", ""):
-                    file_content = content
-                    break
-
-            if not file_content:
-                # 文件不在上下文中，可能是新文件，跳过验证
-                continue
-
-            try:
-                tree = ast.parse(file_content)
-
-                # 检查符号是否是模块级可导入的
-                is_module_level = False
-                is_class_method = False
-                parent_class = None
-
-                for node in tree.body:
-                    # 检查是否是模块级函数或类
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol_name:
-                        is_module_level = True
-                        break
-                    elif isinstance(node, ast.ClassDef) and node.name == symbol_name:
-                        is_module_level = True
-                        break
-
-                # 如果不是模块级的，检查是否是类方法
-                if not is_module_level:
-                    for node in tree.body:
-                        if isinstance(node, ast.ClassDef):
-                            for item in node.body:
-                                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                    if item.name == symbol_name:
-                                        is_class_method = True
-                                        parent_class = node.name
-                                        break
-                        if is_class_method:
-                            break
-
-                if is_class_method:
-                    errors.append({
-                        "symbol": symbol_name,
-                        "module": module,
-                        "error": f"'{symbol_name}' 是类 '{parent_class}' 的方法，不是模块级符号",
-                        "suggestion": f"应该改为导出类 '{parent_class}'，或者将 '{symbol_name}' 改为模块级函数"
-                    })
-
-            except SyntaxError:
-                # 文件有语法错误，跳过验证
-                continue
+            if is_class_method:
+                errors.append({
+                    "symbol": symbol_name,
+                    "module": module,
+                    "error": f"'{symbol_name}' 是类 '{parent_class}' 的方法，不是模块级符号",
+                    "suggestion": f"应该改为导出类 '{parent_class}'，或者将 '{symbol_name}' 改为模块级函数"
+                })
 
         return errors
 

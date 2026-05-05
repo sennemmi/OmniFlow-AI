@@ -52,18 +52,11 @@ const statusConfig: Record<
     indicatorClass: 'running'
   },
   // 【修复】直接使用 success 状态，与后端保持一致
-  success: { 
-    icon: CheckCircle2, 
-    className: 'text-status-success bg-status-success/10', 
+  success: {
+    icon: CheckCircle2,
+    className: 'text-status-success bg-status-success/10',
     label: '已完成',
-    indicatorClass: 'completed'
-  },
-  // 【保留】completed 用于向后兼容
-  completed: { 
-    icon: CheckCircle2, 
-    className: 'text-status-success bg-status-success/10', 
-    label: '已完成',
-    indicatorClass: 'completed'
+    indicatorClass: 'success'
   },
   failed: { 
     icon: AlertCircle, 

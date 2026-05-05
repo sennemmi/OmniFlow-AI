@@ -35,13 +35,15 @@ function levelToType(level: string): LogEntry['type'] {
   return map[level] ?? 'info';
 }
 
-// 阶段名称映射到显示文本
+// 阶段名称映射到显示文本（支持后端阶段名和前端节点名）
 function stageToLabel(stage: string): string {
   const map: Record<string, string> = {
     REQUIREMENT: '需求分析',
     DESIGN: '技术设计',
     CODING: '代码生成',
+    CODER: '代码生成',
     UNIT_TESTING: '单元测试',
+    TESTER: '单元测试',
     CODE_REVIEW: '代码审查',
     DELIVERY: '代码交付',
   };
@@ -123,14 +125,12 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
   const [isTyping, setIsTyping] = useState(false);
   const [isRunning, setIsRunning] = useState(initialIsRunning);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'reconnecting'>('connecting');
-  // 【修复】添加 UI 显示用的重连次数 state，仅用于展示，不用于逻辑控制
-  const [reconnectAttemptDisplay, setReconnectAttemptDisplay] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const hasPausedRef = useRef(false);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelayRef = useRef(RECONNECT_CONFIG.initialDelay);
-  // 【修复】使用 ref 而非 state 存储重连次数，避免触发不必要的重渲染和双重重连
+  // 【修复】仅使用 ref 记录重连次数，避免不必要的重渲染和双重重连
   const reconnectAttemptRef = useRef(0);
 
   // 清理重连定时器
@@ -225,8 +225,6 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
       // 指数退避重连
       reconnectAttemptRef.current += 1;
       const currentAttempt = reconnectAttemptRef.current;
-      // 【修复】更新 UI 显示用的重连次数
-      setReconnectAttemptDisplay(currentAttempt);
       setConnectionStatus('reconnecting');
 
       const delay = Math.min(
@@ -322,7 +320,7 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
       return (
         <span className="flex items-center gap-1.5 ml-2">
           <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-          <span className="text-xs text-slate-500">重连中 ({reconnectAttemptDisplay}/{RECONNECT_CONFIG.maxAttempts})...</span>
+          <span className="text-xs text-slate-500">重连中 ({reconnectAttemptRef.current}/{RECONNECT_CONFIG.maxAttempts})...</span>
         </span>
       );
     }
@@ -375,8 +373,8 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
               <Sparkles className="w-6 h-6 text-slate-400" />
             </div>
             <p className="text-sm">
-              {connectionStatus === 'connecting' ? '正在连接日志流...' : 
-               connectionStatus === 'reconnecting' ? `正在重连 (${reconnectAttemptDisplay}/${RECONNECT_CONFIG.maxAttempts})...` :
+              {connectionStatus === 'connecting' ? '正在连接日志流...' :
+               connectionStatus === 'reconnecting' ? `正在重连 (${reconnectAttemptRef.current}/${RECONNECT_CONFIG.maxAttempts})...` :
                '等待 Agent 启动...'}
             </p>
           </div>

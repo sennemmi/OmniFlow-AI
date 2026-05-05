@@ -2,19 +2,12 @@ import { useState } from 'react';
 import { Code2, FilePlus, FileEdit, FileMinus, GitCommit } from 'lucide-react';
 import { DiffViewer } from './DiffViewer';
 import { getLanguageFromPath } from '@utils/formatters';
+import { extractAllCodeChanges, type CodeChange } from '@utils/pipelineHelpers';
 
 // ============================================
 // 代码生成阶段面板 - 展示 CoderAgent 输出
-// 【修复】统一字段映射，支持多种输出结构
+// 【修复】统一调用 pipelineHelpers，消除重复提取逻辑
 // ============================================
-
-interface FileChange {
-  fileName: string;
-  newCode: string;
-  oldCode: string;
-  isNew: boolean;
-  changeType: 'add' | 'modify' | 'delete';
-}
 
 interface CodingPanelProps {
   outputData?: Record<string, unknown>;
@@ -23,79 +16,8 @@ interface CodingPanelProps {
 export function CodingPanel({ outputData }: CodingPanelProps) {
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
 
-  // 【修复】从多种可能的字段路径提取代码变更
-  const codeChanges: FileChange[] = (() => {
-    if (!outputData) return [];
-
-    const changes: FileChange[] = [];
-
-    // 1. 尝试从 coder_output.files 提取（CodeGenerationService 输出结构）
-    const coderOutput = outputData.coder_output as Record<string, unknown> | undefined;
-    if (coderOutput?.files && Array.isArray(coderOutput.files)) {
-      const files = coderOutput.files as Array<{ file_path?: string; path?: string; content?: string }>;
-      files.forEach((f) => {
-        const filePath = f.file_path || f.path;
-        if (filePath && f.content !== undefined) {
-          changes.push({
-            fileName: filePath,
-            newCode: f.content,
-            oldCode: '',
-            isNew: true,
-            changeType: 'add',
-          });
-        }
-      });
-    }
-
-    // 2. 尝试从顶层 files 提取（旧结构兼容）
-    const files_data = outputData.files as Array<{ file_path?: string; path?: string; content?: string }> | undefined;
-    if (files_data && changes.length === 0) {
-      files_data.forEach((f) => {
-        const filePath = f.file_path || f.path;
-        if (filePath && f.content !== undefined) {
-          changes.push({
-            fileName: filePath,
-            newCode: f.content,
-            oldCode: '',
-            isNew: true,
-            changeType: 'add',
-          });
-        }
-      });
-    }
-
-    // 3. 尝试从 modified_files 提取
-    const modified_files = outputData.modified_files as Array<{ file_path?: string; path?: string; content?: string; original_content?: string }> | undefined;
-    if (modified_files) {
-      modified_files.forEach((f) => {
-        const filePath = f.file_path || f.path;
-        if (filePath) {
-          // 检查是否已存在
-          const existingIdx = changes.findIndex(c => c.fileName === filePath);
-          if (existingIdx >= 0) {
-            // 更新为修改类型
-            changes[existingIdx] = {
-              fileName: filePath,
-              newCode: f.content || '',
-              oldCode: f.original_content || '',
-              isNew: false,
-              changeType: 'modify',
-            };
-          } else {
-            changes.push({
-              fileName: filePath,
-              newCode: f.content || '',
-              oldCode: f.original_content || '',
-              isNew: !f.original_content,
-              changeType: f.original_content ? 'modify' : 'add',
-            });
-          }
-        }
-      });
-    }
-
-    return changes;
-  })();
+  // 【修复】直接复用 pipelineHelpers 中的提取函数
+  const codeChanges: CodeChange[] = extractAllCodeChanges(outputData);
 
   // 【修复】从多种可能的字段路径提取摘要
   const summary = (() => {

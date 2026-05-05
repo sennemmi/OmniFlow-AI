@@ -424,7 +424,6 @@ export function PipelineDetail() {
                   pending: '#94A3B8',
                   running: '#3B82F6',
                   paused: '#F59E0B',
-                  completed: '#10B981',
                   success: '#10B981',
                   failed: '#EF4444',
                   approved: '#10B981',
