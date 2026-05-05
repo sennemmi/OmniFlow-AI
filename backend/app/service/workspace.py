@@ -30,17 +30,38 @@ def _remove_readonly(func, path, _):
 class WorkspaceService:
     """
     工作区管理服务
-    
+
     职责：
     1. 创建临时工作区（从目标项目复制）
     2. 管理工作区生命周期
     3. 清理临时工作区
+
+    【架构优化】支持使用外部传入的工作区路径（如 Sandbox 的 temp_dir）
+    避免创建重复的工作区，统一使用 Sandbox 的工作区
     """
-    
-    def __init__(self, pipeline_id: int):
+
+    def __init__(self, pipeline_id: int, external_workspace_path: Optional[str] = None):
         self.pipeline_id = pipeline_id
         self.workspace_dir: Optional[Path] = None
         self._target_path: Optional[Path] = None
+        self._external_workspace_path = external_workspace_path
+
+    def set_external_workspace(self, workspace_path: str) -> None:
+        """
+        设置外部工作区路径（如 Sandbox 的 temp_dir）
+
+        使用外部工作区时，不会创建新的临时目录，直接使用传入的路径
+
+        Args:
+            workspace_path: 外部工作区路径
+        """
+        self._external_workspace_path = workspace_path
+        self.workspace_dir = Path(workspace_path)
+        info(
+            "使用外部工作区",
+            pipeline_id=self.pipeline_id,
+            workspace=str(self.workspace_dir)
+        )
     
     @property
     def target_path(self) -> Path:
@@ -62,12 +83,24 @@ class WorkspaceService:
         异步创建临时工作区
 
         流程：
-        1. 生成唯一工作区目录
-        2. 从目标项目复制代码（在线程池中执行，避免阻塞事件循环）
+        1. 如果设置了外部工作区路径，直接使用
+        2. 否则生成唯一工作区目录
+        3. 从目标项目复制代码（在线程池中执行，避免阻塞事件循环）
 
         Returns:
             Path: 工作区目录路径
         """
+        # 【架构优化】如果设置了外部工作区路径（如 Sandbox 的 temp_dir），直接使用
+        if self._external_workspace_path:
+            self.workspace_dir = Path(self._external_workspace_path)
+            info(
+                "使用外部工作区（异步模式）",
+                pipeline_id=self.pipeline_id,
+                workspace=str(self.workspace_dir)
+            )
+            return self.workspace_dir
+
+        # 否则创建新的临时工作区
         short_uuid = str(uuid.uuid4())[:8]
         self.workspace_dir = Path(tempfile.gettempdir()) / f"omniflow_workspaces/pipeline_{self.pipeline_id}_{short_uuid}"
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -94,12 +127,24 @@ class WorkspaceService:
         同步创建临时工作区（兼容旧代码）
 
         流程：
-        1. 生成唯一工作区目录
-        2. 从目标项目复制代码
+        1. 如果设置了外部工作区路径，直接使用
+        2. 否则生成唯一工作区目录
+        3. 从目标项目复制代码
 
         Returns:
             Path: 工作区目录路径
         """
+        # 【架构优化】如果设置了外部工作区路径（如 Sandbox 的 temp_dir），直接使用
+        if self._external_workspace_path:
+            self.workspace_dir = Path(self._external_workspace_path)
+            info(
+                "使用外部工作区（同步模式）",
+                pipeline_id=self.pipeline_id,
+                workspace=str(self.workspace_dir)
+            )
+            return self.workspace_dir
+
+        # 否则创建新的临时工作区
         short_uuid = str(uuid.uuid4())[:8]
         self.workspace_dir = Path(tempfile.gettempdir()) / f"omniflow_workspaces/pipeline_{self.pipeline_id}_{short_uuid}"
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -172,7 +217,7 @@ class WorkspaceService:
 
 
 @contextmanager
-def workspace_context(pipeline_id: int):
+def workspace_context(pipeline_id: int, external_workspace_path: Optional[str] = None):
     """
     工作区上下文管理器（同步）
 
@@ -182,13 +227,18 @@ def workspace_context(pipeline_id: int):
             # 在工作区中执行操作
             # 退出时自动清理
 
+        # 使用外部工作区（如 Sandbox 的 temp_dir）
+        with workspace_context(pipeline_id, external_workspace_path=sandbox_temp_dir) as ws:
+            workspace_path = ws.get_workspace_path()
+
     Args:
         pipeline_id: Pipeline ID
+        external_workspace_path: 外部工作区路径（可选），如 Sandbox 的 temp_dir
 
     Yields:
         WorkspaceService: 工作区服务实例
     """
-    service = WorkspaceService(pipeline_id)
+    service = WorkspaceService(pipeline_id, external_workspace_path)
     try:
         service.create_workspace()
         yield service
@@ -205,11 +255,15 @@ class AsyncWorkspaceContext:
             workspace_path = ws.get_workspace_path()
             # 在工作区中执行操作
             # 退出时自动清理
+
+        # 使用外部工作区（如 Sandbox 的 temp_dir）
+        async with async_workspace_context(pipeline_id, external_workspace_path=sandbox_temp_dir) as ws:
+            workspace_path = ws.get_workspace_path()
     """
 
-    def __init__(self, pipeline_id: int):
+    def __init__(self, pipeline_id: int, external_workspace_path: Optional[str] = None):
         self.pipeline_id = pipeline_id
-        self.service = WorkspaceService(pipeline_id)
+        self.service = WorkspaceService(pipeline_id, external_workspace_path)
 
     async def __aenter__(self) -> WorkspaceService:
         """异步上下文管理器入口"""
@@ -221,14 +275,15 @@ class AsyncWorkspaceContext:
         await self.service.cleanup_async()
 
 
-def async_workspace_context(pipeline_id: int) -> AsyncWorkspaceContext:
+def async_workspace_context(pipeline_id: int, external_workspace_path: Optional[str] = None) -> AsyncWorkspaceContext:
     """
     创建异步工作区上下文管理器
 
     Args:
         pipeline_id: Pipeline ID
+        external_workspace_path: 外部工作区路径（可选），如 Sandbox 的 temp_dir
 
     Returns:
         AsyncWorkspaceContext: 异步上下文管理器
     """
-    return AsyncWorkspaceContext(pipeline_id)
+    return AsyncWorkspaceContext(pipeline_id, external_workspace_path)

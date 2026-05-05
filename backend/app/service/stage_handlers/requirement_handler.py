@@ -11,7 +11,7 @@ from app.core.logging import info, error
 from app.core.sse_log_buffer import push_log
 from app.core.config import settings
 from app.agents.architect import architect_agent
-from app.models.pipeline import StageName, PipelineStatus
+from app.models.pipeline import StageName, PipelineStatus, StageStatus
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
 from app.service.agent_coordinator_service import agent_coordinator_service
@@ -59,7 +59,6 @@ class RequirementHandler(StageHandler):
             # 构建 ArchitectAgent 上下文
             architect_context = await agent_coordinator_service.build_architect_context(
                 requirement=requirement,
-                file_tree={},  # 空字典，与测试脚本一致
                 element_context=element_context,
                 pipeline_id=pipeline_id
             )
@@ -67,14 +66,13 @@ class RequirementHandler(StageHandler):
             await push_log(
                 pipeline_id,
                 "info",
-                f"调用 ArchitectAgent (file_tree: {len(architect_context.get('file_tree', {}))} items)",
+                f"调用 ArchitectAgent (requirement: {len(requirement)} chars)",
                 stage="REQUIREMENT"
             )
 
             # 调用 ArchitectAgent
             arch_result = await architect_agent.analyze(
                 requirement=architect_context["requirement"],
-                file_tree=architect_context["file_tree"],
                 element_context=architect_context["element_context"],
                 pipeline_id=pipeline_id,
                 project_path=project_path
@@ -112,7 +110,8 @@ class RequirementHandler(StageHandler):
             return StageResult.success_result(
                 message="Requirement analysis completed",
                 output_data=arch_output,
-                status=PipelineStatus.PAUSED
+                status=PipelineStatus.PAUSED,
+                metrics=self._build_metrics(arch_result, architect_context, arch_output)
             )
 
         except Exception as e:
@@ -133,7 +132,14 @@ class RequirementHandler(StageHandler):
             stage = query_result.scalar_one_or_none()
             if stage:
                 stage.output_data = result.output_data
-                stage.status = PipelineStatus.SUCCESS if result.success else PipelineStatus.FAILED
+                from app.core.timezone import now
+                stage.status = StageStatus.SUCCESS if result.success else StageStatus.FAILED
+                stage.completed_at = now()
+                stage.input_tokens = result.metrics.get("input_tokens", 0)
+                stage.output_tokens = result.metrics.get("output_tokens", 0)
+                stage.duration_ms = result.metrics.get("duration_ms", 0)
+                stage.retry_count = result.metrics.get("retry_count", 0)
+                stage.reasoning = result.metrics.get("reasoning")
                 await context.session.commit()
 
         # 更新 Pipeline 状态

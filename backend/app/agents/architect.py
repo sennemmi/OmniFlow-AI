@@ -15,6 +15,7 @@
 
 import json
 import logging
+import time
 from typing import Dict, List, Optional, Any
 
 from app.agents.tool_agent import ToolUsingAgent
@@ -421,15 +422,11 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         构建用户 Prompt（快速索引模式）
 
         Args:
-            state: 包含 requirement, file_tree, element_context, project_path 的状态
+            state: 包含 requirement, element_context, project_path 的状态
         """
         requirement = state.get("requirement", "")
-        file_tree = state.get("file_tree", {})
         element_context = state.get("element_context")
         project_path = state.get("project_path", "/workspace/backend")
-
-        # 【新增】生成项目文件树摘要，帮助 LLM 了解实际存在的文件
-        project_tree_summary = self._format_file_tree(file_tree)
 
         # 【快速索引模式】使用项目契约卡替代原来的 project_summary
         project_card_json = "{}"
@@ -441,9 +438,6 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             except Exception as e:
                 logger.warning(f"[ArchitectAgent] 生成项目契约卡失败: {e}")
                 project_card_json = json.dumps({"error": str(e)})
-        else:
-            # 如果没有工具实例，使用 file_tree 作为备选
-            project_card_json = json.dumps(file_tree, indent=2, ensure_ascii=False)
 
         # 【强制注入方案】获取预加载的文件内容
         preloaded_files = state.get("preloaded_files", {})
@@ -576,10 +570,6 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 
 {project_card_section}
 
-【项目文件树 - 实际存在的文件】
-```
-{project_tree_summary}
-```
 {code_context_section}
 {element_context_str}
 {force_tool_section}
@@ -635,54 +625,9 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             ]
         )
 
-    def _format_file_tree(self, file_tree: Dict[str, Any], max_files: int = 50) -> str:
-        """
-        格式化文件树为可读字符串
-
-        Args:
-            file_tree: 文件树字典
-            max_files: 最大显示文件数
-
-        Returns:
-            str: 格式化后的文件树字符串
-        """
-        if not file_tree:
-            return "(文件树为空)"
-
-        lines = []
-        file_count = 0
-
-        def traverse_tree(tree: Dict[str, Any], prefix: str = ""):
-            nonlocal file_count
-            if file_count >= max_files:
-                return
-
-            # 排序：目录在前，文件在后
-            items = sorted(tree.items(), key=lambda x: (not isinstance(x[1], dict), x[0]))
-
-            for i, (name, value) in enumerate(items):
-                if file_count >= max_files:
-                    lines.append(f"{prefix}... (还有 {len(tree) - i} 个项未显示)")
-                    return
-
-                is_last = i == len(items) - 1
-                connector = "└── " if is_last else "├── "
-                lines.append(f"{prefix}{connector}{name}")
-
-                if isinstance(value, dict):
-                    # 是目录，递归遍历
-                    new_prefix = prefix + ("    " if is_last else "│   ")
-                    traverse_tree(value, new_prefix)
-                else:
-                    file_count += 1
-
-        traverse_tree(file_tree)
-        return "\n".join(lines)
-
     async def analyze(
         self,
         requirement: str,
-        file_tree: Dict[str, Any],
         element_context: Optional[Dict[str, Any]] = None,
         pipeline_id: int = 0,
         project_path: str = "/workspace/backend"
@@ -696,7 +641,6 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 
         Args:
             requirement: 用户需求描述
-            file_tree: 项目文件树字典
             element_context: 页面元素上下文（可选）
             pipeline_id: Pipeline ID
             project_path: 项目路径（用于工具执行）
@@ -705,18 +649,18 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
             Dict: 包含分析结果或错误信息，以及 injected_files（读取的文件内容）
         """
         from app.core.sse_log_buffer import push_log
-        
+        started_at = time.time()
+
         # ============================================================
         # 【第一步：自由探索】让 Agent 自由探索项目，识别 affected_files
         # ============================================================
         logger.info(f"[ArchitectAgent] 第一步：自由探索项目...", extra={"pipeline_id": pipeline_id})
         if pipeline_id:
             await push_log(pipeline_id, "info", "🏗️ ArchitectAgent 第一步：自由探索项目代码...", stage="ARCHITECT")
-        
+
         # 构建探索阶段的 state（不包含预加载文件，让 Agent 自由探索）
         exploration_state = {
             "requirement": requirement,
-            "file_tree": file_tree,
             "element_context": element_context,
             "project_path": project_path,
             "phase": "exploration",  # 标记为探索阶段
@@ -780,7 +724,6 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         # 构建详细设计阶段的 state
         design_state = {
             "requirement": requirement,
-            "file_tree": file_tree,
             "element_context": element_context,
             "project_path": project_path,
             "phase": "design",  # 标记为设计阶段
@@ -841,17 +784,27 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 
         # 【关键】调用工具探索配额检查
         await self._enforce_tool_exploration_quota(design_result, pipeline_id)
+        total_duration_ms = int((time.time() - started_at) * 1000)
+        design_result["duration_ms"] = design_result.get("duration_ms") or total_duration_ms
+        design_result["input_tokens"] = (
+            (exploration_result.get("input_tokens", 0) or 0)
+            + (design_result.get("input_tokens", 0) or 0)
+        )
+        design_result["output_tokens"] = (
+            (exploration_result.get("output_tokens", 0) or 0)
+            + (design_result.get("output_tokens", 0) or 0)
+        )
 
-        # 【关键】验证 required_symbols 中的文件是否存在于 affected_files 或 file_tree 中
+        # 【关键】验证 required_symbols 中的文件是否存在于 affected_files 中
         if design_result.get("success") and design_result.get("output"):
             output = design_result["output"]
             required_symbols = output.get("required_symbols", [])
             affected_files = output.get("affected_files", [])
-            
+
             if required_symbols:
                 # 【简化】合并 P0-1 日志，只保留一条汇总日志
                 symbols_with_contract = [
-                    s for s in required_symbols 
+                    s for s in required_symbols
                     if s.get("return_fields")
                 ]
                 if symbols_with_contract:
@@ -860,46 +813,42 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                         "pipeline_id": pipeline_id,
                         "contract_summary": contract_summary
                     })
-                
+
                 # 构建 affected_files 的集合（标准化路径）
                 affected_set = set()
                 for f in affected_files:
                     clean = normalize_relative_path(f)
                     affected_set.add(clean)
                     affected_set.add(f"backend/{clean}")
-                
+
                 # 验证每个 required_symbol
                 validated_symbols = []
                 for symbol in required_symbols:
                     module = symbol.get("module", "")
                     if not module:
                         continue
-                    
+
                     # 【重构】使用 path_utils 标准化模块路径
                     clean_module = normalize_relative_path(module)
-                    
+
                     # 检查是否在 affected_files 中
                     if clean_module in affected_set or f"backend/{clean_module}" in affected_set:
                         validated_symbols.append(symbol)
                     else:
-                        # 检查是否在 file_tree 中
-                        if self._check_file_in_tree(file_tree, clean_module):
+                        # 【放宽】如果文件在预加载的代码中，也认为是有效的
+                        preloaded = output.get("_preloaded_files", [])
+                        if clean_module in preloaded or f"backend/{clean_module}" in preloaded:
                             validated_symbols.append(symbol)
+                            logger.info(f"[ArchitectAgent] required_symbol 文件在预加载列表中: {module}", extra={
+                                "pipeline_id": pipeline_id,
+                                "symbol": symbol.get("name")
+                            })
                         else:
-                            # 【放宽】如果文件在预加载的代码中，也认为是有效的
-                            preloaded = output.get("_preloaded_files", [])
-                            if clean_module in preloaded or f"backend/{clean_module}" in preloaded:
-                                validated_symbols.append(symbol)
-                                logger.info(f"[ArchitectAgent] required_symbol 文件在预加载列表中: {module}", extra={
-                                    "pipeline_id": pipeline_id,
-                                    "symbol": symbol.get("name")
-                                })
-                            else:
-                                logger.warning(f"[ArchitectAgent] required_symbol 中的文件不存在: {module}", extra={
-                                    "pipeline_id": pipeline_id,
-                                    "symbol": symbol.get("name"),
-                                    "module_path": module
-                                })
+                            logger.warning(f"[ArchitectAgent] required_symbol 中的文件不存在: {module}", extra={
+                                "pipeline_id": pipeline_id,
+                                "symbol": symbol.get("name"),
+                                "module_path": module
+                            })
                 
                 # 更新 required_symbols 为验证后的列表
                 if len(validated_symbols) != len(required_symbols):
@@ -1418,28 +1367,6 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 【输出格式】
 直接输出纯 JSON，不要有任何前缀或后缀。
 """
-
-    def _check_file_in_tree(self, file_tree: Dict[str, Any], file_path: str) -> bool:
-        """
-        检查文件是否存在于文件树中
-
-        Args:
-            file_tree: 文件树字典
-            file_path: 文件路径（如 "app/utils/system_monitor.py"）
-
-        Returns:
-            bool: 是否存在
-        """
-        parts = file_path.replace("\\", "/").split("/")
-        current = file_tree
-        
-        for part in parts:
-            if not isinstance(current, dict) or part not in current:
-                return False
-            current = current[part]
-        
-        # 如果最后一个是字典，说明是目录；如果不是字典，说明是文件
-        return True
 
 
 # 单例实例

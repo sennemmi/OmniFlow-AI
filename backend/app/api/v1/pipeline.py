@@ -315,6 +315,11 @@ def _extract_coding_summary(output_data: dict) -> dict:
         "files_count": 0,
         "file_names": [],
         "summary": "",
+        "input_tokens": output_data.get("input_tokens", 0),
+        "output_tokens": output_data.get("output_tokens", 0),
+        "duration_ms": output_data.get("duration_ms", 0),
+        "retry_count": output_data.get("retry_count", 0),
+        "reasoning": output_data.get("reasoning"),
     }
 
     # 提取 multi_agent_output 中的摘要
@@ -404,7 +409,7 @@ async def get_pipeline_status(
                 stages_data.append(stage_data.model_dump())
         
         # 计算当前阶段索引（用于前端进度显示）
-        stage_order = ["REQUIREMENT", "DESIGN", "CODING"]
+        stage_order = ["REQUIREMENT", "DESIGN", "CODING", "UNIT_TESTING", "CODE_REVIEW", "DELIVERY"]
         current_stage_index = 0
         if pipeline.current_stage:
             try:
@@ -426,29 +431,30 @@ async def get_pipeline_status(
         
         # 如果 Pipeline 已完成 (SUCCESS)，添加交付物摘要
         if pipeline.status.value == "success":
-            coding_stage = None
+            # 【修复】从 DELIVERY 阶段获取交付物信息，而不是 CODING 阶段
+            delivery_stage = None
             for stage in pipeline.stages:
-                if stage.name.value == "CODING":
-                    coding_stage = stage
+                if stage.name.value == "DELIVERY":
+                    delivery_stage = stage
                     break
-            
-            if coding_stage and coding_stage.output_data:
-                output_data = coding_stage.output_data
-                
+
+            if delivery_stage and delivery_stage.output_data:
+                output_data = delivery_stage.output_data
+
                 delivery_info = PipelineDeliveryInfo(
                     git_branch=output_data.get("git_branch"),
                     commit_hash=output_data.get("commit_hash"),
                     pr_url=output_data.get("pr_url"),
                     pr_created=output_data.get("pr_created", False),
-                    summary=output_data.get("coder_output", {}).get("summary", ""),
+                    summary=output_data.get("summary", ""),
                     files_changed=output_data.get("execution_summary", {})
                 )
-                
+
                 # 尝试获取 Git diff 摘要
                 try:
                     from app.service.git_provider import GitProviderService
                     git_service = GitProviderService()
-                    
+
                     branch_name = output_data.get("git_branch")
                     if branch_name:
                         try:
@@ -459,7 +465,7 @@ async def get_pipeline_status(
                             pass
                 except Exception:
                     pass
-                
+
                 response_data["delivery"] = delivery_info.model_dump()
         
         return success_response(
@@ -638,6 +644,72 @@ async def reject_pipeline(
 
 
 @router.post(
+    "/pipeline/{pipeline_id}/approve-code-review",
+    response_model=ResponseModel,
+    summary="审批 CODE_REVIEW 阶段",
+    description="""
+    【新流程】审批 CODE_REVIEW 阶段，支持分别审批 CODER 和 TESTER。
+
+    审批选项：
+    - **approve_coding**: 是否接受 CODING 生成的代码
+    - **approve_testing**: 是否接受 TESTER 生成的测试
+    - **feedback**: 审批意见（拒绝时必须填写）
+
+    审批结果：
+    - 两者都接受：进入 DELIVERY 阶段
+    - 只接受 CODING：重试 TESTING（保留 CODING）
+    - 只接受 TESTING：重试 CODING（保留 TESTING）
+    - 两者都拒绝：同时重试 CODING 和 TESTING
+
+    前端应通过 SSE 日志流监控重试任务进度。
+    """,
+    response_description="审批结果及后续操作"
+)
+async def approve_code_review(
+    request: Request,
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
+    data: dict = None,
+    background_tasks: BackgroundTasks = None,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    审批 CODE_REVIEW 阶段，支持分别审批 CODER 和 TESTER
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        approve_coding = data.get("approve_coding", True) if data else True
+        approve_testing = data.get("approve_testing", True) if data else True
+        feedback = data.get("feedback", "") if data else ""
+
+        result = await PipelineService.approve_code_review(
+            pipeline_id=pipeline_id,
+            approve_coding=approve_coding,
+            approve_testing=approve_testing,
+            feedback=feedback,
+            session=session,
+            background_tasks=background_tasks
+        )
+
+        if not result["success"]:
+            return error_response(
+                error=result.get("error", "Code review approval failed"),
+                request_id=request_id
+            )
+
+        return success_response(
+            data=result["data"],
+            request_id=request_id
+        )
+    except Exception as e:
+        error("审批 CODE_REVIEW 失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(
+            error=f"Failed to approve code review: {str(e)}",
+            request_id=request_id
+        )
+
+
+@router.post(
     "/pipeline/{pipeline_id}/terminate",
     response_model=ResponseModel,
     summary="终止 Pipeline",
@@ -734,7 +806,12 @@ async def get_pipeline_diff(
 
         output = coding_stage.output_data
         multi_agent_output = output.get("multi_agent_output", {})
-        files = multi_agent_output.get("files", [])
+        files = (
+            multi_agent_output.get("files")
+            or output.get("files")
+            or output.get("coder_output", {}).get("files")
+            or []
+        )
 
         # 只返回 diff 需要的字段，不传无关数据
         diff_files = [
@@ -748,7 +825,10 @@ async def get_pipeline_diff(
         ]
 
         return success_response(
-            data={"files": diff_files, "summary": multi_agent_output.get("summary", "")},
+            data={
+                "files": diff_files,
+                "summary": multi_agent_output.get("summary") or output.get("summary") or output.get("coder_output", {}).get("summary", "")
+            },
             request_id=request_id
         )
     except Exception as e:
@@ -962,5 +1042,95 @@ async def retry_pipeline(
         error("重试 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to retry pipeline: {str(e)}",
+            request_id=request_id
+        )
+
+
+class OverrideTestRequest(BaseModel):
+    """人工覆盖测试代码请求模型"""
+    file_path: str = Field(..., description="测试文件路径")
+    content: str = Field(..., description="新的测试代码内容")
+
+
+class OverrideTestResponse(BaseModel):
+    """人工覆盖测试代码响应数据"""
+    pipeline_id: int = Field(..., description="Pipeline ID")
+    action: str = Field(..., description="操作类型: override_test")
+    file_path: str = Field(..., description="测试文件路径")
+    test_run_success: bool = Field(..., description="测试是否通过")
+    message: str = Field(..., description="操作结果消息")
+
+
+@router.post(
+    "/pipeline/{pipeline_id}/override-test",
+    response_model=ResponseModel,
+    summary="人工覆盖测试代码并重跑测试",
+    description="""
+    【测试用例编辑器】允许用户直接修改 AI 生成的测试代码，然后重新运行测试。
+
+    使用场景：
+    - AI 生成的测试断言预期值不正确
+    - 需要微调测试逻辑
+    - 测试覆盖率不足需要补充
+
+    流程：
+    1. 将用户修改的测试代码写入沙箱
+    2. 重新运行测试验证
+    3. 返回测试结果
+
+    注意：此操作会直接覆盖原测试文件，请确保修改正确。
+    """,
+    response_description="覆盖结果及测试执行结果"
+)
+async def override_test_code(
+    request: Request,
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
+    data: OverrideTestRequest = None,
+    background_tasks: BackgroundTasks = None,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    人工覆盖测试代码并重跑测试
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        if not data or not data.file_path or not data.content:
+            return error_response(
+                error="file_path 和 content 不能为空",
+                request_id=request_id
+            )
+
+        # 调用 PipelineService 处理覆盖和重跑
+        result = await PipelineService.override_test_and_rerun(
+            pipeline_id=pipeline_id,
+            file_path=data.file_path,
+            content=data.content,
+            session=session,
+            background_tasks=background_tasks
+        )
+
+        if not result["success"]:
+            return error_response(
+                error=result.get("error", "Override test failed"),
+                request_id=request_id
+            )
+
+        response_data = OverrideTestResponse(
+            pipeline_id=pipeline_id,
+            action="override_test",
+            file_path=data.file_path,
+            test_run_success=result["data"].get("test_run_success", False),
+            message=result["data"].get("message", "Test override completed")
+        )
+
+        return success_response(
+            data=response_data.model_dump(),
+            request_id=request_id
+        )
+    except Exception as e:
+        error("覆盖测试代码失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(
+            error=f"Failed to override test: {str(e)}",
             request_id=request_id
         )

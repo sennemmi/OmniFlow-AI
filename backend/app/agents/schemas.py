@@ -370,8 +370,46 @@ class CoderOutput(BaseAgentOutput):
 class TesterOutput(BaseAgentOutput):
     """
     测试 Agent 输出
-    
+
     负责生成单元测试代码
     """
     test_files: List[TestFile] = Field(default_factory=list, description="测试文件列表")
     coverage_targets: List[str] = Field(default_factory=list, description="计划覆盖的测试目标")
+
+
+class ReviewIssue(BaseModel):
+    """
+    代码审查问题项
+
+    描述代码中的具体问题，包含分类、严重性和修复建议
+    """
+    description: str = Field(description="问题描述")
+    category: str = Field(description="问题分类: bug/security/performance/style/maintainability")
+    severity: str = Field(description="严重性级别: critical/high/medium/low")
+    file_path: Optional[str] = Field(default=None, description="问题所在文件路径")
+    line_number: Optional[int] = Field(default=None, description="问题所在行号")
+    suggestion: str = Field(description="具体的修复建议")
+    code_snippet: Optional[str] = Field(default=None, description="相关代码片段")
+
+
+class ReviewReport(BaseModel):
+    """
+    代码审查报告
+
+    CodeReviewerAgent 的输出模型，包含完整的问题列表和总体评估
+    """
+    issues: List[ReviewIssue] = Field(default_factory=list, description="问题列表")
+    overall_assessment: str = Field(description="总体评估摘要")
+    summary: str = Field(default="", description="执行摘要")
+    improvement_suggestions: List[str] = Field(default_factory=list, description="改进建议列表")
+    risk_level: str = Field(default="low", description="风险等级: low/medium/high/critical")
+    approval_recommendation: str = Field(default="approve", description="审批建议: approve/approve_with_caution/reject")
+
+
+class CodeReviewerOutput(BaseAgentOutput):
+    """
+    代码审查 Agent 输出
+
+    负责分析代码变更并生成审查报告
+    """
+    review_report: ReviewReport = Field(description="代码审查报告")

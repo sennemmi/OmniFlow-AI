@@ -83,8 +83,9 @@ export function Console() {
     setIsModalOpen(true);
   };
 
-  // 计算平均耗时
-  const avgDuration = stats?.avg_duration ? Number(stats.avg_duration.toFixed(2)) : 0;
+  // 计算平均耗时（后端返回秒，转换成分钟显示）
+  const avgDurationSec = stats?.avg_duration ?? 0;
+  const avgDuration = Number((avgDurationSec / 60).toFixed(1));
 
   // 计算成功率
   const completedPipelines = stats?.completed_pipelines || 0;

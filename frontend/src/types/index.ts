@@ -174,3 +174,23 @@ export interface FeatureItem {
   icon: string;
   image?: string;
 }
+
+// ---------- 代码审查报告类型 ----------
+export interface ReviewIssue {
+  description: string;
+  category: 'bug' | 'security' | 'performance' | 'style' | 'maintainability';
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  file_path?: string;
+  line_number?: number;
+  suggestion: string;
+  code_snippet?: string;
+}
+
+export interface ReviewReport {
+  issues: ReviewIssue[];
+  overall_assessment: string;
+  summary: string;
+  improvement_suggestions: string[];
+  risk_level: 'low' | 'medium' | 'high' | 'critical';
+  approval_recommendation: 'approve' | 'approve_with_caution' | 'reject';
+}

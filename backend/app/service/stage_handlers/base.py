@@ -5,6 +5,7 @@
 """
 
 from abc import ABC, abstractmethod
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -134,6 +135,29 @@ class StageHandler(ABC):
             tool_calls=output_data.get("tool_results", []),
             system_prompt=system_prompt
         )
+
+    def _build_metrics(
+        self,
+        agent_result: Dict[str, Any],
+        input_data: Optional[Dict[str, Any]] = None,
+        output_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Normalize agent metrics and estimate token counts when a provider omits usage."""
+        input_tokens = agent_result.get("input_tokens", 0) or 0
+        output_tokens = agent_result.get("output_tokens", 0) or 0
+
+        if input_tokens <= 0 and input_data:
+            input_tokens = max(1, int(len(json.dumps(input_data, ensure_ascii=False)) * 0.3))
+        if output_tokens <= 0 and output_data:
+            output_tokens = max(1, int(len(json.dumps(output_data, ensure_ascii=False)) * 0.3))
+
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "duration_ms": agent_result.get("duration_ms", 0) or 0,
+            "retry_count": agent_result.get("retry_count", 0) or 0,
+            "reasoning": agent_result.get("reasoning"),
+        }
     
     @property
     @abstractmethod

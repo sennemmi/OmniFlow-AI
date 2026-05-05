@@ -764,12 +764,20 @@ async def test_file_upload():
 """
 
         # ── 完整模式：直接生成完整测试 ──────────────────────────────────────────
-        code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
+        # 【兼容并行模式】如果 code_output 为 None，基于接口契约生成测试
+        if code_output:
+            code_str = json.dumps(code_output, indent=2, ensure_ascii=False)
+            code_section = f"【CoderAgent 生成的代码】\n{code_str}"
+        else:
+            code_section = (
+                "【CoderAgent 尚未生成代码，请完全基于以下接口契约编写测试，"
+                "确保测试能够验证契约中声明的所有函数、字段和错误场景】"
+            )
+
         return f"""{fix_section}{evergreen_section}【技术设计方案】
 {design_str}
 
-【CoderAgent 生成的代码】
-{code_str}
+{code_section}
 {allowed_imports_section}
 
 请根据技术设计方案和生成的代码，编写完整的单元测试。
@@ -832,6 +840,21 @@ async def test_file_upload():
             "code_files_count": code_files_count,
             "interface_specs_count": len(interface_specs)
         })
+
+        # 【并行模式安全检查】如果未传入 code_output，检查契约完整性
+        if code_output is None:
+            # 契约完整性检查
+            missing_mocks = any(
+                not spec.get("mock_dependencies") for spec in interface_specs
+                if "dict" in spec.get("return_type", "").lower()
+            )
+            if missing_mocks:
+                logger.warning(
+                    "[TesterAgent] 在无代码模式下生成测试，但部分接口未提供 mock_dependencies，"
+                    "生成的测试可能缺少必要的 mock"
+                )
+            else:
+                logger.info("[TesterAgent] 契约自检通过，开始基于契约盲写测试")
 
         if pipeline_id:
             await push_log(pipeline_id, "info", f"TesterAgent 开始生成测试代码...", stage="TESTING")

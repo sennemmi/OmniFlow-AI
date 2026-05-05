@@ -16,7 +16,6 @@ from app.service.layered_test_runner import LayeredTestRunner
 from app.service.sandbox_file_service import SandboxFileService
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
-from app.service.workspace import async_workspace_context
 from app.service.repair_service import repair_service
 from app.service.sandbox_manager import sandbox_manager
 from app.utils.test_execution import run_preliminary_test, analyze_test_failure
@@ -108,7 +107,7 @@ class TestingHandler(StageHandler):
         while retry_count <= self.MAX_TEST_RETRIES:
             generate_params = {
                 "design_output": design_output,
-                "code_output": code_output,
+                "code_output": None,  # 【并行模式】不传 code_output，TesterAgent 基于 interface_specs 生成测试
                 "target_files": target_files,
                 "pipeline_id": pipeline_id
             }
@@ -533,7 +532,7 @@ Please fix the errors in the test files and regenerate.
         )
 
     async def complete(self, context: StageContext, result: StageResult) -> None:
-        """Complete stage: save results, create CODE_REVIEW stage"""
+        """Complete stage: save results, create CODE_REVIEW stage (if not exists)"""
         from sqlmodel import select
         from app.models.pipeline import PipelineStage
 
@@ -551,6 +550,38 @@ Please fix the errors in the test files and regenerate.
                 metrics=result.metrics
             )
 
+        # 【新流程兼容】检查是否已有 CODE_REVIEW 阶段（由 _run_coding_task_background 创建）
+        statement = select(PipelineStage).where(
+            PipelineStage.pipeline_id == context.pipeline_id,
+            PipelineStage.name == StageName.CODE_REVIEW
+        )
+        query_result = await context.session.execute(statement)
+        existing_review_stage = query_result.scalar_one_or_none()
+
+        if existing_review_stage:
+            # 新流程：CODE_REVIEW 阶段已由 _run_coding_task_background 创建，只需更新日志
+            repair_history = result.output_data.get("repair_history", [])
+            if repair_history:
+                total_rounds = sum(r.get("rounds", 0) for r in repair_history)
+                repair_success = any(r.get("success", False) for r in repair_history)
+                status_icon = "PASS" if repair_success else "WARN"
+                await push_log(
+                    context.pipeline_id,
+                    "info",
+                    f"{status_icon} Unit testing completed (RepairerAgent fixed {total_rounds} rounds)",
+                    stage="UNIT_TESTING"
+                )
+            else:
+                await push_log(
+                    context.pipeline_id,
+                    "info",
+                    "Unit testing completed",
+                    stage="UNIT_TESTING"
+                )
+            await context.session.commit()
+            return
+
+        # 旧流程：创建 CODE_REVIEW 阶段
         coding_output = result.output_data.get("coding_output", {})
         testing_result = result.output_data.get("testing_result", {})
         target_files = result.output_data.get("target_files", {})

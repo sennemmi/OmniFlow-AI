@@ -205,6 +205,109 @@ class AgentTools:
             {
                 "type": "function",
                 "function": {
+                    "name": "grep_ast",
+                    "description": (
+                        "结构化代码搜索（比 grep 更智能）。"
+                        "支持 search_type: 'text'（普通搜索）/ 'function'（找函数定义）/ "
+                        "'class'（找类定义）/ 'callers'（找调用某函数的位置）/ 'import'（找导入某模块的文件）。"
+                        "优先用此工具替代 grep，返回结果包含精确行号和上下文。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "搜索词（函数名、类名、模块名、或文本片段）"
+                            },
+                            "search_path": {
+                                "type": "string",
+                                "description": "搜索范围，默认为项目根目录",
+                                "default": "."
+                            },
+                            "search_type": {
+                                "type": "string",
+                                "enum": ["text", "function", "class", "callers", "import"],
+                                "default": "text",
+                                "description": "搜索类型"
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "default": 15,
+                                "description": "最大返回结果数"
+                            }
+                        },
+                        "required": ["pattern"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "semantic_search",
+                    "description": (
+                        "语义检索：用自然语言描述意图，找到最相关的代码块。"
+                        "不需要猜正则或函数名，直接描述功能，如：\n"
+                        " '处理用户密码验证的函数'\n"
+                        " '数据库连接初始化'\n"
+                        " 'FastAPI 健康检查路由'\n"
+                        "返回最相关的代码块列表（含文件路径和行号）。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "自然语言查询"
+                            },
+                            "top_k": {
+                                "type": "integer",
+                                "default": 5,
+                                "description": "返回最相关的 k 个结果"
+                            }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_chunk",
+                    "description": (
+                        "按 AST 边界读取代码，杜绝硬截断。"
+                        "三种模式：\n"
+                        " 1. 传 symbol_name → 精准读取该函数/类的完整定义\n"
+                        " 2. 传 start_line + end_line → 按行号读取（自动扩展到 AST 边界）\n"
+                        " 3. 都不传 → 返回文件摘要（imports + 顶层符号签名）\n"
+                        "推荐顺序：先用 grep_ast 定位，再用 read_chunk 按 symbol_name 读取完整实现。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "相对路径，如 'app/api/v1/health.py'"
+                            },
+                            "symbol_name": {
+                                "type": "string",
+                                "description": "函数名或类名（最推荐）"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "起始行号（1-based）"
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "结束行号（1-based）"
+                            }
+                        },
+                        "required": ["file_path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "read_file",
                     "description": (
                         "读取文件指定行范围，返回带行号的内容和 read_token。"
@@ -419,11 +522,14 @@ class AgentTools:
         sync_tool_map = {
             "glob": self.glob,
             "grep": self.grep,
-            "read_file": self.read_file
+            "read_file": self.read_file,
+            "grep_ast": self.grep_ast,
+            "read_chunk": self.read_chunk
         }
         async_tool_map = {
             "replace_lines": self.replace_lines,
-            "install_dependency": self.install_dependency
+            "install_dependency": self.install_dependency,
+            "semantic_search": self.semantic_search
         }
 
         if tool_name in sync_tool_map:

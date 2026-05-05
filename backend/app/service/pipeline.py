@@ -8,17 +8,26 @@ Pipeline 业务服务（重构版）
 - 新增阶段只需添加 Handler，无需修改 PipelineService
 """
 
+import asyncio
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 
+from fastapi import BackgroundTasks
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel import select
 
-from app.core.logging import info, op_logger
+from app.core.logging import info, op_logger, error
+from app.core.config import settings
+from app.core.sse_log_buffer import push_log, remove_buffer
+from app.core.database import async_session_factory
 from app.models.pipeline import (
     Pipeline, PipelineRead, PipelineStatus,
     PipelineStage, StageName, StageStatus, PipelineStageRead
 )
+from app.repositories import PipelineRepository
 from app.service.workflow import WorkflowService
 from app.service.stage_handlers import (
     StageContext, StageHandlerRegistry,
@@ -26,7 +35,6 @@ from app.service.stage_handlers import (
     TestingHandler, CodeReviewHandler, DeliveryHandler
 )
 from app.service.sandbox_manager import sandbox_manager
-from app.core.config import settings
 
 
 class PipelineService:
@@ -111,7 +119,6 @@ class PipelineService:
         注意：此方法应在事务提交后调用，避免长时间占用数据库连接
         """
         try:
-            from pathlib import Path
             project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
             sandbox_info = await sandbox_manager.start(pipeline_id, project_path)
             info("Docker Sandbox 启动成功", 
@@ -146,38 +153,7 @@ class PipelineService:
         
         await handler.run(context)
     
-    @classmethod
-    async def create_pipeline(cls, requirement: str, session: AsyncSession) -> PipelineRead:
-        """创建新的 Pipeline（旧版同步方法，保留兼容性）"""
-        # 1. 创建 Pipeline
-        pipeline = Pipeline(
-            description=requirement,
-            status=PipelineStatus.RUNNING,
-            current_stage=StageName.REQUIREMENT
-        )
-        session.add(pipeline)
-        await session.flush()
-        
-        # 2. 创建 REQUIREMENT 阶段
-        stage = PipelineStage(
-            pipeline_id=pipeline.id,
-            name=StageName.REQUIREMENT,
-            status=PipelineStatus.RUNNING,
-            input_data={"requirement": requirement}
-        )
-        session.add(stage)
-        await session.commit()
-        
-        # 3. 触发 ArchitectAgent
-        await cls.run_architect_task(pipeline.id, requirement, None, session)
-        
-        # 4. 返回结果
-        statement = select(Pipeline).where(Pipeline.id == pipeline.id).options(
-            selectinload(Pipeline.stages)
-        )
-        result = await session.execute(statement)
-        pipeline_with_stages = result.scalar_one()
-        return cls._build_pipeline_read(pipeline_with_stages)
+
     
     @classmethod
     def _build_pipeline_read(cls, pipeline: Pipeline) -> PipelineRead:
@@ -323,8 +299,6 @@ class PipelineService:
             session: 数据库 session
             background_tasks: FastAPI BackgroundTasks，用于异步执行耗时任务
         """
-        from fastapi import BackgroundTasks
-
         pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
 
         if not pipeline:
@@ -360,7 +334,7 @@ class PipelineService:
         # 调用 Handler 的 on_approved 方法
         result = await handler.on_approved(context, notes, feedback)
 
-        # 处理 DESIGN 阶段的特殊情况（需要后台任务）
+        # 处理 DESIGN 阶段的特殊情况（需要后台任务执行 CODING）
         if current_stage == StageName.DESIGN and background_tasks:
             if result.output_data.get("requires_background_task"):
                 background_tasks.add_task(cls._run_coding_task_background, pipeline_id)
@@ -419,11 +393,26 @@ class PipelineService:
 
         rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
 
-        # 标记当前阶段需要重新执行
+        # 【新流程】CODING 阶段被驳回时，打回 DESIGN 阶段重试
+        target_stage = current_stage
+        if current_stage == StageName.CODING:
+            target_stage = StageName.DESIGN
+            await push_log(
+                pipeline_id,
+                "info",
+                f"代码被驳回，打回 DESIGN 阶段重新设计",
+                stage="DESIGN"
+            )
+
+        # 标记目标阶段需要重新执行
         await WorkflowService.mark_stage_for_rerun(
-            pipeline_id=pipeline_id, stage_name=current_stage,
+            pipeline_id=pipeline_id, stage_name=target_stage,
             rejection_feedback=rejection_feedback, session=session
         )
+
+        # 【关键】如果是 CODING 被驳回，需要将 Pipeline 当前阶段设为 DESIGN
+        if current_stage == StageName.CODING:
+            pipeline.current_stage = StageName.DESIGN
 
         await WorkflowService.set_pipeline_running(pipeline, session)
         await session.commit()
@@ -435,8 +424,13 @@ class PipelineService:
             input_data={}
         )
 
-        # 调用 Handler 的 on_rejected 方法
-        result = await handler.on_rejected(context, reason, suggested_changes)
+        # 调用 Handler 的 on_rejected 方法（使用目标阶段的 handler）
+        target_handler = service._registry.get(target_stage)
+        if target_handler:
+            result = await target_handler.on_rejected(context, reason, suggested_changes)
+        else:
+            # 如果没有找到 handler，使用当前 handler
+            result = await handler.on_rejected(context, reason, suggested_changes)
 
         # 统一组装响应
         response_data = {
@@ -463,7 +457,125 @@ class PipelineService:
             "success": result.success,
             "data": response_data
         }
-    
+
+    @classmethod
+    async def approve_code_review(
+        cls,
+        pipeline_id: int,
+        approve_coding: bool,
+        approve_testing: bool,
+        feedback: str,
+        session: AsyncSession,
+        background_tasks: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        【新流程】审批 CODE_REVIEW 阶段，支持分别审批 CODER 和 TESTER
+
+        Args:
+            pipeline_id: Pipeline ID
+            approve_coding: 是否接受 CODING 生成的代码
+            approve_testing: 是否接受 TESTER 生成的测试
+            feedback: 审批意见
+            session: 数据库会话
+            background_tasks: 后台任务
+
+        Returns:
+            Dict: 审批结果
+        """
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+        if not pipeline:
+            return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
+
+        if pipeline.status != PipelineStatus.PAUSED:
+            return {"success": False, "error": "Pipeline is not in paused state"}
+
+        if pipeline.current_stage != StageName.CODE_REVIEW:
+            return {"success": False, "error": f"Current stage is {pipeline.current_stage.value}, not CODE_REVIEW"}
+
+        # 四种审批情况
+        if approve_coding and approve_testing:
+            # 两者都接受：进入 DELIVERY 阶段
+            await push_log(pipeline_id, "info", "✅ 代码和测试都已接受，进入交付阶段", stage="DELIVERY")
+
+            # 调用 DELIVERY handler
+            # 【修复】使用 handler.run(context) 而非直接调用 execute()，确保 prepare() 被调用
+            service = cls()
+            handler = service._registry.get(StageName.DELIVERY)
+            if handler:
+                context = StageContext(
+                    pipeline_id=pipeline_id,
+                    session=session,
+                    input_data={}
+                )
+                result = await handler.run(context)
+
+                return {
+                    "success": result.success,
+                    "data": {
+                        "pipeline_id": pipeline_id,
+                        "action": "proceed_to_delivery",
+                        "status": result.status.value,
+                        "message": result.message
+                    }
+                }
+            else:
+                return {"success": False, "error": "No handler for DELIVERY stage"}
+
+        elif approve_coding and not approve_testing:
+            # 只接受 CODING：重试 TESTING
+            await push_log(pipeline_id, "info", "🔄 代码已接受，重新生成测试...", stage="UNIT_TESTING")
+
+            if background_tasks:
+                background_tasks.add_task(cls._retry_testing_only, pipeline_id, feedback)
+
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "action": "retry_testing",
+                    "status": PipelineStatus.RUNNING.value,
+                    "message": "重新生成测试中...",
+                    "async": True
+                }
+            }
+
+        elif not approve_coding and approve_testing:
+            # 只接受 TESTING：重试 CODING
+            await push_log(pipeline_id, "info", "🔄 测试已接受，重新生成代码...", stage="CODING")
+
+            if background_tasks:
+                background_tasks.add_task(cls._retry_coding_only, pipeline_id, feedback)
+
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "action": "retry_coding",
+                    "status": PipelineStatus.RUNNING.value,
+                    "message": "重新生成代码中...",
+                    "async": True
+                }
+            }
+
+        else:
+            # 两者都拒绝：同时重试
+            await push_log(pipeline_id, "info", "🔄 代码和测试都需要重新生成...", stage="CODING")
+
+            if background_tasks:
+                # 先重试 CODING，完成后会自动重试 TESTING
+                background_tasks.add_task(cls._retry_coding_only, pipeline_id, feedback)
+
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "action": "retry_both",
+                    "status": PipelineStatus.RUNNING.value,
+                    "message": "重新生成代码和测试中...",
+                    "async": True
+                }
+            }
+
     # ==================== 后台任务方法 ====================
 
     @classmethod
@@ -484,7 +596,6 @@ class PipelineService:
             await WorkflowService.set_pipeline_failed(pipeline, session)
             # 记录错误信息到当前阶段
             if pipeline.current_stage:
-                from sqlmodel import select
                 statement = select(PipelineStage).where(
                     PipelineStage.pipeline_id == pipeline_id,
                     PipelineStage.name == pipeline.current_stage
@@ -498,7 +609,6 @@ class PipelineService:
                     stage.output_data = current_data
 
                     # 强制告诉 SQLAlchemy 字典被修改了，必须落库保存！
-                    from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(stage, "output_data")
             
             # 【关键修复】Pipeline 失败时停止 Sandbox，避免资源泄漏
@@ -525,9 +635,6 @@ class PipelineService:
         4. 重新启动 Sandbox（如果已停止）
         5. 后台异步重新执行当前阶段
         """
-        from fastapi import BackgroundTasks
-        from app.core.sse_log_buffer import push_log
-
         pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
 
         if not pipeline:
@@ -552,7 +659,6 @@ class PipelineService:
         )
 
         # 1. 重置当前阶段状态为 pending
-        from sqlmodel import select
         statement = select(PipelineStage).where(
             PipelineStage.pipeline_id == pipeline_id,
             PipelineStage.name == current_stage
@@ -585,7 +691,6 @@ class PipelineService:
 
         # 3. 重新启动 Sandbox（如果已停止）
         try:
-            from pathlib import Path
             project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
             sandbox_info = await sandbox_manager.start(pipeline_id, project_path)
             info("Sandbox 重新启动成功",
@@ -687,9 +792,6 @@ class PipelineService:
         Returns:
             终止结果
         """
-        from datetime import datetime
-        from app.core.sse_log_buffer import push_log
-
         pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
 
         if not pipeline:
@@ -744,7 +846,6 @@ class PipelineService:
             info(f"停止 Sandbox 时出错（非关键）: {str(e)}", pipeline_id=pipeline_id)
 
         # 清理 SSE 日志缓冲区
-        from app.core.sse_log_buffer import remove_buffer
         remove_buffer(pipeline_id)
 
     @classmethod
@@ -763,8 +864,6 @@ class PipelineService:
     @classmethod
     async def _run_stage_background(cls, pipeline_id: int, stage_name: str):
         """后台运行指定阶段"""
-        from app.core.database import async_session_factory
-
         async with async_session_factory() as session:
             try:
                 stage_enum = StageName(stage_name)
@@ -785,116 +884,280 @@ class PipelineService:
     @staticmethod
     async def _run_coding_task_background(pipeline_id: int) -> None:
         """
-        后台任务：触发 CODING 阶段和 UNIT_TESTING 阶段，完成后等待 CODE_REVIEW 审批
-        
+        后台任务：并发执行 CODING 和 TESTING 阶段，完成后统一等待审批
+
+        【新流程】CODING + TESTING 并发 → 统一审批
+        - CODING 和 TESTING 同时执行
+        - 两者都完成后，统一进入 CODE_REVIEW 阶段等待审批
+        - 可以分别拒绝 CODING 或 TESTING，各自重写
+
         这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
+        【修复】使用 async with 上下文管理器确保 session 正确关闭
         """
-        from app.core.database import async_session_factory
-        from app.core.sse_log_buffer import push_log
-        from app.core.logging import op_logger, error
+        async with async_session_factory() as session:
+            try:
+                await push_log(pipeline_id, "info", "后台任务启动：并发执行代码生成和单元测试...", stage="CODING")
+                await push_log(pipeline_id, "info", "🚀 CODING 和 TESTING 并发执行中...", stage="UNIT_TESTING")
 
-        session = async_session_factory()
-        try:
-            await push_log(pipeline_id, "info", "后台任务启动：开始执行代码生成...", stage="CODING")
-
-            # 1. 执行 CODING 阶段
-            coding_result = await PipelineService.trigger_coding_phase(
-                pipeline_id=pipeline_id,
-                session=session
-            )
-
-            if coding_result["success"]:
-                await session.commit()
-                await push_log(pipeline_id, "info", "代码生成完成，开始单元测试阶段...", stage="UNIT_TESTING")
-
-                # 2. 执行 UNIT_TESTING 阶段
-                testing_result = await PipelineService._trigger_testing_phase(
+                # 【并发执行】同时启动 CODING 和 TESTING 阶段
+                coding_task = PipelineService.trigger_coding_phase(
+                    pipeline_id=pipeline_id,
+                    session=session
+                )
+                testing_task = PipelineService._trigger_testing_phase(
                     pipeline_id=pipeline_id,
                     session=session
                 )
 
-                if testing_result["success"]:
-                    await session.commit()
+                # 等待两个任务完成
+                coding_result, testing_result = await asyncio.gather(
+                    coding_task,
+                    testing_task,
+                    return_exceptions=True
+                )
+
+                # 处理异常结果
+                if isinstance(coding_result, Exception):
+                    raise coding_result
+                if isinstance(testing_result, Exception):
+                    raise testing_result
+
+                # 检查 CODING 结果
+                if not coding_result.get("success"):
+                    await session.rollback()
+                    op_logger.log_pipeline_status_change(
+                        pipeline_id=pipeline_id,
+                        old_status='running',
+                        new_status='failed',
+                        stage='CODING',
+                        error=coding_result.get("message", "Unknown error")
+                    )
+                    # 更新 pipeline 状态为 failed
+                    try:
+                        async with async_session_factory() as err_session:
+                            await PipelineService.mark_pipeline_failed(
+                                pipeline_id=pipeline_id,
+                                error=coding_result.get("message", "Coding phase failed"),
+                                session=err_session
+                            )
+                            await err_session.commit()
+                    except Exception:
+                        pass
+                    return
+
+                # CODING 成功，提交事务
+                await session.commit()
+
+                # 检查 TESTING 结果
+                test_generated = False
+                test_run_success = False
+                if testing_result.get("success"):
                     test_generated = testing_result.get("test_generated", False)
                     test_run_success = testing_result.get("test_run_success", False)
 
-                    # 3. 推送状态日志，然后等待 CODE_REVIEW 审批（不做自动推进）
-                    if test_generated and test_run_success:
-                        await push_log(
-                            pipeline_id,
-                            "success",
-                            "单元测试通过，等待代码审查",
-                            stage="CODE_REVIEW"
+                # 【关键】将 Pipeline 状态设为 paused，当前阶段设为 CODE_REVIEW，等待统一审批
+                try:
+                    pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
+                    if pipeline:
+                        pipeline.status = PipelineStatus.PAUSED
+                        pipeline.current_stage = StageName.CODE_REVIEW
+
+                        # 【新流程】检查并创建 CODE_REVIEW 阶段（如果不存在）
+                        statement = select(PipelineStage).where(
+                            PipelineStage.pipeline_id == pipeline_id,
+                            PipelineStage.name == StageName.CODE_REVIEW
                         )
-                    elif test_generated:
-                        await push_log(
-                            pipeline_id,
-                            "warning",
-                            "单元测试部分未通过，等待代码审查",
-                            stage="CODE_REVIEW"
-                        )
-                    else:
+                        result = await session.execute(statement)
+                        existing_review_stage = result.scalar_one_or_none()
+
+                        if not existing_review_stage:
+                            # 获取 CODING 和 TESTING 的输出数据
+                            coding_stage = None
+                            testing_stage = None
+                            for stage in pipeline.stages:
+                                if stage.name == StageName.CODING:
+                                    coding_stage = stage
+                                elif stage.name == StageName.UNIT_TESTING:
+                                    testing_stage = stage
+
+                            coding_output = coding_stage.output_data if coding_stage else {}
+                            testing_output = testing_stage.output_data if testing_stage else {}
+
+                            await WorkflowService.create_stage(
+                                pipeline_id=pipeline_id,
+                                stage_name=StageName.CODE_REVIEW,
+                                input_data={
+                                    "coding_output": coding_output.get("coder_output", {}),
+                                    "testing_result": testing_output.get("testing_result", {}),
+                                    "target_files": coding_output.get("target_files", {})
+                                },
+                                session=session
+                            )
+                            await push_log(
+                                pipeline_id,
+                                "info",
+                                "创建 CODE_REVIEW 阶段，等待统一审批",
+                                stage="CODE_REVIEW"
+                            )
+
+                        await session.commit()
+
                         await push_log(
                             pipeline_id,
                             "info",
-                            "代码生成完成，等待代码审查",
+                            "⏸️ 代码生成和单元测试完成，等待统一审批",
                             stage="CODE_REVIEW"
                         )
-                else:
-                    await session.commit()
+                except Exception as e:
+                    error(f"[Pipeline {pipeline_id}] 设置暂停状态失败: {e}")
+
+                # 推送状态日志
+                if test_generated and test_run_success:
+                    await push_log(
+                        pipeline_id,
+                        "success",
+                        "✅ 代码生成和单元测试完成，等待代码审查",
+                        stage="CODE_REVIEW"
+                    )
+                elif test_generated:
                     await push_log(
                         pipeline_id,
                         "warning",
-                        "单元测试阶段异常，等待代码审查",
+                        "⚠️ 代码生成完成，单元测试部分未通过，等待代码审查",
                         stage="CODE_REVIEW"
                     )
-            else:
+                else:
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        "代码生成和单元测试完成，等待代码审查",
+                        stage="CODE_REVIEW"
+                    )
+
+            except Exception as e:
                 await session.rollback()
+                error(
+                    "Pipeline CODING/UNIT_TESTING 阶段失败",
+                    pipeline_id=pipeline_id,
+                    exc_info=True
+                )
                 op_logger.log_pipeline_status_change(
                     pipeline_id=pipeline_id,
                     old_status='running',
                     new_status='failed',
                     stage='CODING',
-                    error=coding_result.get("message", "Unknown error")
+                    error=str(e)
                 )
                 # 更新 pipeline 状态为 failed
                 try:
                     async with async_session_factory() as err_session:
                         await PipelineService.mark_pipeline_failed(
                             pipeline_id=pipeline_id,
-                            error=coding_result.get("message", "Coding phase failed"),
+                            error=str(e),
                             session=err_session
                         )
                         await err_session.commit()
                 except Exception:
                     pass
-        except Exception as e:
-            await session.rollback()
-            error(
-                "Pipeline CODING/UNIT_TESTING 阶段失败",
-                pipeline_id=pipeline_id,
-                exc_info=True
-            )
-            op_logger.log_pipeline_status_change(
-                pipeline_id=pipeline_id,
-                old_status='running',
-                new_status='failed',
-                stage='CODING',
-                error=str(e)
-            )
-            # 更新 pipeline 状态为 failed
+
+    @staticmethod
+    async def _retry_coding_only(pipeline_id: int, feedback: str) -> None:
+        """
+        仅重试 CODING 阶段（TESTING 保持不变）
+
+        当用户拒绝 CODING 但接受 TESTING 时调用
+        【修复】使用 async with 上下文管理器确保 session 正确关闭
+        """
+        async with async_session_factory() as session:
             try:
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=str(e),
-                        session=err_session
-                    )
-                    await err_session.commit()
-            except Exception:
-                pass
-        finally:
-            await session.close()
+                await push_log(pipeline_id, "info", "重新生成代码（保留测试）...", stage="CODING")
+
+                # 重置 CODING 阶段状态
+                statement = select(PipelineStage).where(
+                    PipelineStage.pipeline_id == pipeline_id,
+                    PipelineStage.name == StageName.CODING
+                )
+                result = await session.execute(statement)
+                coding_stage = result.scalar_one_or_none()
+
+                if coding_stage:
+                    coding_stage.status = StageStatus.PENDING
+                    coding_stage.output_data = {"retry_feedback": feedback}
+                    await session.commit()
+
+                # 重新执行 CODING
+                coding_result = await PipelineService.trigger_coding_phase(
+                    pipeline_id=pipeline_id,
+                    session=session,
+                    error_context=feedback
+                )
+
+                if coding_result.get("success"):
+                    await session.commit()
+                    await push_log(pipeline_id, "info", "代码重新生成完成", stage="CODING")
+
+                    # 回到 CODE_REVIEW 等待审批
+                    pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
+                    if pipeline:
+                        pipeline.status = PipelineStatus.PAUSED
+                        pipeline.current_stage = StageName.CODE_REVIEW
+                        await session.commit()
+                else:
+                    await session.rollback()
+                    await push_log(pipeline_id, "error", "代码重新生成失败", stage="CODING")
+
+            except Exception as e:
+                await session.rollback()
+                error(f"[Pipeline {pipeline_id}] 重试 CODING 失败: {e}")
+
+    @staticmethod
+    async def _retry_testing_only(pipeline_id: int, feedback: str) -> None:
+        """
+        仅重试 TESTING 阶段（CODING 保持不变）
+
+        当用户拒绝 TESTING 但接受 CODING 时调用
+        【修复】使用 async with 上下文管理器确保 session 正确关闭
+        """
+        async with async_session_factory() as session:
+            try:
+                await push_log(pipeline_id, "info", "重新生成测试（保留代码）...", stage="UNIT_TESTING")
+
+                # 重置 TESTING 阶段状态
+                statement = select(PipelineStage).where(
+                    PipelineStage.pipeline_id == pipeline_id,
+                    PipelineStage.name == StageName.UNIT_TESTING
+                )
+                result = await session.execute(statement)
+                testing_stage = result.scalar_one_or_none()
+
+                if testing_stage:
+                    testing_stage.status = StageStatus.PENDING
+                    testing_stage.output_data = {"retry_feedback": feedback}
+                    await session.commit()
+
+                # 重新执行 TESTING
+                testing_result = await PipelineService._trigger_testing_phase(
+                    pipeline_id=pipeline_id,
+                    session=session
+                )
+
+                if testing_result.get("success"):
+                    await session.commit()
+                    await push_log(pipeline_id, "info", "测试重新生成完成", stage="UNIT_TESTING")
+
+                    # 回到 CODE_REVIEW 等待审批
+                    pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
+                    if pipeline:
+                        pipeline.status = PipelineStatus.PAUSED
+                        pipeline.current_stage = StageName.CODE_REVIEW
+                        await session.commit()
+                else:
+                    await session.rollback()
+                    await push_log(pipeline_id, "error", "测试重新生成失败", stage="UNIT_TESTING")
+
+            except Exception as e:
+                await session.rollback()
+                error(f"[Pipeline {pipeline_id}] 重试 TESTING 失败: {e}")
 
     @staticmethod
     async def _run_architect_task_background(
@@ -904,50 +1167,46 @@ class PipelineService:
     ) -> None:
         """
         后台任务：运行 ArchitectAgent 分析
-        
-        这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
-        """
-        from app.core.database import async_session_factory
-        from app.core.logging import op_logger, error
 
-        session = async_session_factory()
-        try:
-            await PipelineService.run_architect_task(
-                pipeline_id=pipeline_id,
-                requirement=requirement,
-                element_context=element_context,
-                session=session
-            )
-            # 显式提交
-            await session.commit()
-        except Exception as e:
-            await session.rollback()
-            # 记录结构化日志，同时记录完整堆栈
-            error(
-                "Pipeline REQUIREMENT 阶段失败",
-                pipeline_id=pipeline_id,
-                exc_info=True
-            )
-            op_logger.log_pipeline_status_change(
-                pipeline_id=pipeline_id,
-                old_status='running',
-                new_status='failed',
-                stage='REQUIREMENT',
-                error=str(e)
-            )
-            # 更新 pipeline 状态为 failed，让前端感知
+        这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
+        【修复】使用 async with 上下文管理器确保 session 正确关闭
+        """
+        async with async_session_factory() as session:
             try:
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=str(e),
-                        session=err_session
-                    )
-                    await err_session.commit()
-            except Exception:
-                pass
-        finally:
-            await session.close()
+                await PipelineService.run_architect_task(
+                    pipeline_id=pipeline_id,
+                    requirement=requirement,
+                    element_context=element_context,
+                    session=session
+                )
+                # 显式提交
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                # 记录结构化日志，同时记录完整堆栈
+                error(
+                    "Pipeline REQUIREMENT 阶段失败",
+                    pipeline_id=pipeline_id,
+                    exc_info=True
+                )
+                op_logger.log_pipeline_status_change(
+                    pipeline_id=pipeline_id,
+                    old_status='running',
+                    new_status='failed',
+                    stage='REQUIREMENT',
+                    error=str(e)
+                )
+                # 更新 pipeline 状态为 failed，让前端感知
+                try:
+                    async with async_session_factory() as err_session:
+                        await PipelineService.mark_pipeline_failed(
+                            pipeline_id=pipeline_id,
+                            error=str(e),
+                            session=err_session
+                        )
+                        await err_session.commit()
+                except Exception:
+                    pass
 
     # ==================== 查询方法 ====================
 
@@ -972,3 +1231,164 @@ class PipelineService:
             )
             for p in pipelines
         ]
+
+    # ==================== 测试用例编辑器方法 ====================
+
+    @classmethod
+    async def override_test_and_rerun(
+        cls,
+        pipeline_id: int,
+        file_path: str,
+        content: str,
+        session: AsyncSession,
+        background_tasks: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        【测试用例编辑器】人工覆盖测试代码并重跑测试
+
+        Args:
+            pipeline_id: Pipeline ID
+            file_path: 测试文件路径
+            content: 新的测试代码内容
+            session: 数据库会话
+            background_tasks: 后台任务
+
+        Returns:
+            Dict: 覆盖和重跑结果
+        """
+        from app.service.sandbox_file_service import get_sandbox_file_service
+        from app.service.layered_test_runner import LayeredTestRunner
+
+        # 1. 检查 Pipeline 状态
+        pipeline = await WorkflowService.get_pipeline_with_stages(pipeline_id, session)
+        if not pipeline:
+            return {"success": False, "error": f"Pipeline {pipeline_id} not found"}
+
+        if pipeline.status not in [PipelineStatus.PAUSED, PipelineStatus.RUNNING]:
+            return {"success": False, "error": f"Pipeline 状态为 {pipeline.status.value}，不可修改测试"}
+
+        # 2. 获取沙箱文件服务
+        file_service = get_sandbox_file_service(pipeline_id)
+
+        await push_log(
+            pipeline_id,
+            "info",
+            f"📝 用户正在修改测试文件: {file_path}",
+            stage="UNIT_TESTING"
+        )
+
+        try:
+            # 3. 写入用户修改的测试代码
+            await file_service.write_file(file_path, content)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"✅ 测试文件已更新: {file_path}",
+                stage="UNIT_TESTING"
+            )
+
+            # 4. 获取测试文件列表（用于重跑测试）
+            test_files = [{"file_path": file_path, "content": content}]
+
+            # 5. 重新运行测试
+            await push_log(
+                pipeline_id,
+                "info",
+                "🔄 正在重新运行测试...",
+                stage="UNIT_TESTING"
+            )
+
+            layered_result = await LayeredTestRunner.run(
+                workspace_path="/workspace",
+                new_files=test_files,
+                sandbox_port=None,
+                timeout=120,
+                file_service=file_service
+            )
+
+            # 6. 更新 UNIT_TESTING 阶段的输出数据
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.UNIT_TESTING
+            )
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
+
+            if testing_stage and testing_stage.output_data:
+                # 更新测试文件内容
+                current_test_files = testing_stage.output_data.get("test_files", [])
+                updated_test_files = []
+                for tf in current_test_files:
+                    if tf.get("file_path") == file_path:
+                        updated_test_files.append({"file_path": file_path, "content": content})
+                    else:
+                        updated_test_files.append(tf)
+
+                # 更新测试结果
+                testing_stage.output_data["test_files"] = updated_test_files
+                testing_stage.output_data["testing_result"] = {
+                    **testing_stage.output_data.get("testing_result", {}),
+                    "test_run_success": layered_result.all_passed,
+                    "test_generated": True,
+                    "user_overridden": True,
+                    "override_file": file_path
+                }
+
+                # 标记修改
+                flag_modified(testing_stage, "output_data")
+                await session.commit()
+
+            # 7. 推送测试结果日志
+            if layered_result.all_passed:
+                await push_log(
+                    pipeline_id,
+                    "success",
+                    "✅ 用户修改后的测试全部通过！",
+                    stage="UNIT_TESTING"
+                )
+            else:
+                await push_log(
+                    pipeline_id,
+                    "warning",
+                    f"⚠️ 测试未通过: {layered_result.failure_cause or 'Unknown error'}",
+                    stage="UNIT_TESTING"
+                )
+                for failed_test in layered_result.failed_tests:
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"   - {failed_test}",
+                        stage="UNIT_TESTING"
+                    )
+
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "file_path": file_path,
+                    "test_run_success": layered_result.all_passed,
+                    "message": "测试全部通过" if layered_result.all_passed else f"测试未通过: {layered_result.failure_cause}",
+                    "failed_tests": layered_result.failed_tests,
+                    "layers": [
+                        {
+                            "layer": layer.layer,
+                            "passed": layer.passed,
+                            "summary": layer.summary
+                        }
+                        for layer in layered_result.layers
+                    ]
+                }
+            }
+
+        except Exception as e:
+            error(f"[Pipeline {pipeline_id}] 覆盖测试代码失败: {e}")
+            await push_log(
+                pipeline_id,
+                "error",
+                f"❌ 覆盖测试代码失败: {str(e)}",
+                stage="UNIT_TESTING"
+            )
+            return {
+                "success": False,
+                "error": f"Failed to override test: {str(e)}"
+            }

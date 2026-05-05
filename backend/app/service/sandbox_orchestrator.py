@@ -160,6 +160,9 @@ class SandboxOrchestrator:
                 logger.error(f"[Pipeline {self.pipeline_id}] 文件语法完整性验证失败")
                 return syntax_check_result
 
+            # 6. 【新增】预构建代码索引（为 RAG 语义检索做准备）
+            await self._build_code_index()
+
             self._is_initialized = True
 
             return {
@@ -414,6 +417,77 @@ class SandboxOrchestrator:
             logger.error(f"[Pipeline {self.pipeline_id}] 文件语法完整性检查异常: {e}")
             return {"success": False, "error": str(e)}
 
+    async def _build_code_index(self) -> Dict[str, Any]:
+        """
+        【新增】预构建代码索引（为 RAG 语义检索做准备）
+
+        在 Sandbox 初始化阶段预构建代码索引，避免 ArchitectAgent 首次调用
+        semantic_search 时的长时间等待。
+
+        Returns:
+            Dict: 构建结果
+        """
+        try:
+            await push_log(
+                self.pipeline_id,
+                "info",
+                "🔍 正在预构建代码索引（为 RAG 语义检索做准备）...",
+                stage="REQUIREMENT"
+            )
+
+            from app.service.code_indexer import get_indexer
+            import time
+
+            start_time = time.time()
+
+            # 获取索引服务（使用宿主机工作区路径）
+            indexer = await get_indexer(self.temp_dir, include_tests=False)
+
+            # 检查是否已有有效缓存
+            cached_data = indexer._load_index_cache()
+            if cached_data and not indexer._is_index_stale(cached_data.get('file_hashes', {})):
+                await push_log(
+                    self.pipeline_id,
+                    "info",
+                    "✅ 代码索引已存在且有效，跳过构建",
+                    stage="REQUIREMENT"
+                )
+                return {"success": True, "cached": True}
+
+            # 构建索引
+            chunks = indexer.build_index(force_refresh=False)
+
+            elapsed_time = time.time() - start_time
+
+            await push_log(
+                self.pipeline_id,
+                "info",
+                f"✅ 代码索引构建完成: {len(chunks)} 个代码块 ({elapsed_time:.1f}s)",
+                stage="REQUIREMENT"
+            )
+
+            logger.info(
+                f"[Pipeline {self.pipeline_id}] 代码索引构建完成: {len(chunks)} 个代码块 ({elapsed_time:.1f}s)"
+            )
+
+            return {
+                "success": True,
+                "chunks_count": len(chunks),
+                "elapsed_time": elapsed_time,
+                "cached": False
+            }
+
+        except Exception as e:
+            logger.error(f"[Pipeline {self.pipeline_id}] 代码索引构建失败: {e}")
+            await push_log(
+                self.pipeline_id,
+                "warning",
+                f"⚠️ 代码索引构建失败: {str(e)[:200]}，将使用降级方案",
+                stage="REQUIREMENT"
+            )
+            # 索引构建失败不阻断流程，只是警告
+            return {"success": False, "error": str(e)}
+
     def get_file_service(self) -> Optional[SandboxFileService]:
         """
         获取 SandboxFileService 实例
@@ -438,38 +512,66 @@ class SandboxOrchestrator:
     async def cleanup(self) -> Dict[str, Any]:
         """
         清理 Sandbox（在 Pipeline 结束时调用）
-        
+
+        【安全优化】主动删除 temp_dir，避免磁盘占用
+
         Returns:
             Dict: 清理结果
         """
         try:
             if not self._is_initialized:
                 return {"success": True, "message": "Sandbox 未初始化，无需清理"}
-            
+
             await push_log(
                 self.pipeline_id,
                 "info",
                 "🛑 正在停止 Docker Sandbox...",
                 stage="CLEANUP"
             )
-            
+
             await sandbox_manager.stop(self.pipeline_id)
-            
+
             self._is_initialized = False
             self.sandbox_info = None
             self.file_service = None
-            
+
             logger.info(f"[Pipeline {self.pipeline_id}] Sandbox 已停止")
-            
+
             await push_log(
                 self.pipeline_id,
                 "info",
                 "✅ Sandbox 已停止",
                 stage="CLEANUP"
             )
-            
+
+            # 【安全优化】主动删除临时工作区目录
+            if self.temp_dir and Path(self.temp_dir).exists():
+                try:
+                    await push_log(
+                        self.pipeline_id,
+                        "info",
+                        f"🧹 清理临时工作区...",
+                        stage="CLEANUP"
+                    )
+                    # 使用线程池执行同步的 shutil.rmtree
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: shutil.rmtree(self.temp_dir, ignore_errors=True)
+                    )
+                    logger.info(f"[Pipeline {self.pipeline_id}] 临时工作区已清理: {self.temp_dir}")
+                    await push_log(
+                        self.pipeline_id,
+                        "info",
+                        f"✅ 临时工作区已清理",
+                        stage="CLEANUP"
+                    )
+                except Exception as cleanup_error:
+                    logger.warning(f"[Pipeline {self.pipeline_id}] 清理临时工作区失败: {cleanup_error}")
+                    # 清理失败不阻断流程，只是警告
+
             return {"success": True, "message": "Sandbox 已停止"}
-            
+
         except Exception as e:
             logger.error(f"[Pipeline {self.pipeline_id}] 停止 Sandbox 失败: {e}")
             return {"success": False, "error": str(e)}

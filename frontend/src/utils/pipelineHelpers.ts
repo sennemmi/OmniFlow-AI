@@ -64,6 +64,19 @@ export function extractAllCodeChanges(
     return extractFromFiles(sourceData.files as Array<Record<string, string>>);
   }
 
+  const fallbackSources = [
+    inputData,
+    inputData?.coding_output as Record<string, unknown> | undefined,
+    outputData?.coding_output as Record<string, unknown> | undefined,
+  ];
+
+  for (const fallback of fallbackSources) {
+    if (Array.isArray(fallback?.files) && (fallback.files as unknown[]).length > 0) {
+      const changes = extractFromFiles(fallback.files as Array<Record<string, string>>);
+      if (changes.length > 0) return changes;
+    }
+  }
+
   return [];
 }
 
@@ -73,7 +86,6 @@ export function isCodeStage(stage: PipelineStage | null): boolean {
   const name = stage.name?.toLowerCase() || '';
   return name.includes('code') ||
          name.includes('编码') ||
-         stage.icon === 'coder' ||
          stage.name === 'CODING' ||
          stage.name === 'CODE_REVIEW';
 }

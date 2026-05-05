@@ -10,8 +10,9 @@ from typing import Optional
 
 from app.core.logging import info, error
 from app.core.sse_log_buffer import push_log
+from app.core.contract_validator import ContractValidator
 from app.agents.designer import designer_agent
-from app.models.pipeline import StageName, PipelineStatus
+from app.models.pipeline import StageName, PipelineStatus, StageStatus
 from app.service.stage_handlers.base import StageContext, StageHandler, StageResult
 from app.service.workflow import WorkflowService
 from app.service.agent_coordinator_service import agent_coordinator_service
@@ -69,7 +70,6 @@ class DesignHandler(StageHandler):
             designer_context = await agent_coordinator_service.build_designer_context(
                 requirement=requirement,
                 arch_output=arch_output,
-                file_tree={},  # 空字典，与测试脚本一致
                 pipeline_id=pipeline_id
             )
 
@@ -83,7 +83,6 @@ class DesignHandler(StageHandler):
             # 调用 DesignerAgent
             design_result = await designer_agent.design(
                 architect_output=designer_context["arch_output"],
-                file_tree=designer_context["file_tree"],
                 related_code_context="",  # 空字符串，与测试脚本一致
                 full_files_context=designer_context["injected_files"],
                 pipeline_id=pipeline_id
@@ -109,19 +108,30 @@ class DesignHandler(StageHandler):
             design_output = design_result.get("output", {})
             interface_specs = design_output.get("interface_specs", [])
 
+            # 【契约校验】校验 interface_specs 的完整性
+            contract_errors = ContractValidator.validate_interface_specs(design_output)
+            if contract_errors:
+                error_detail = "; ".join(contract_errors)
+                await push_log(pipeline_id, "error", f"契约校验失败: {error_detail}", stage="DESIGN")
+                return StageResult.failure_result(
+                    message=f"Contract validation failed: {error_detail}",
+                    output_data={"error": error_detail, "design_output": design_output}
+                )
+
             await push_log(
                 pipeline_id,
                 "info",
                 f"技术设计完成，接口契约 ({len(interface_specs)} 项)",
                 stage="DESIGN"
             )
-            await push_log(pipeline_id, "info", "技术设计完成，等待审批", stage="DESIGN")
+            await push_log(pipeline_id, "info", "契约校验通过，等待审批", stage="DESIGN")
 
             # 返回成功，状态为 PAUSED（等待审批）
             return StageResult.success_result(
                 message="Technical design completed",
                 output_data=design_output,
-                status=PipelineStatus.PAUSED
+                status=PipelineStatus.PAUSED,
+                metrics=self._build_metrics(design_result, designer_context, design_output)
             )
 
         except Exception as e:
@@ -142,7 +152,14 @@ class DesignHandler(StageHandler):
             stage = query_result.scalar_one_or_none()
             if stage:
                 stage.output_data = result.output_data
-                stage.status = PipelineStatus.SUCCESS if result.success else PipelineStatus.FAILED
+                from app.core.timezone import now
+                stage.status = StageStatus.SUCCESS if result.success else StageStatus.FAILED
+                stage.completed_at = now()
+                stage.input_tokens = result.metrics.get("input_tokens", 0)
+                stage.output_tokens = result.metrics.get("output_tokens", 0)
+                stage.duration_ms = result.metrics.get("duration_ms", 0)
+                stage.retry_count = result.metrics.get("retry_count", 0)
+                stage.reasoning = result.metrics.get("reasoning")
                 await context.session.commit()
 
         # 更新 Pipeline 状态

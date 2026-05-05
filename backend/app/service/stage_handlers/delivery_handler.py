@@ -7,6 +7,7 @@
 - PR 生成和创建
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, Dict
 
@@ -198,14 +199,12 @@ class DeliveryHandler(StageHandler):
         if pipeline:
             pipeline.current_stage = StageName.DELIVERY
             if result.success:
-                await WorkflowService.set_pipeline_paused(pipeline, context.session)
-                await push_log(context.pipeline_id, "info", "Pipeline 执行完成！", stage="DELIVERY")
+                await WorkflowService.set_pipeline_success(pipeline, context.session)
             else:
                 await WorkflowService.set_pipeline_failed(pipeline, context.session)
 
-        # 清理 SSE 日志缓冲区
-        from app.core.sse_log_buffer import remove_buffer
-        remove_buffer(context.pipeline_id)
+        # 【修复】先发送完成日志，再清理 SSE 缓冲区，避免竞态条件导致最后一条日志丢失
+        await push_log(context.pipeline_id, "info", "✅ Pipeline 执行成功完成！", stage="DELIVERY")
 
         # 【关键修复】Pipeline 完成时停止 Sandbox
         try:
@@ -215,6 +214,11 @@ class DeliveryHandler(StageHandler):
             await push_log(context.pipeline_id, "warning", f"停止 Sandbox 时出错: {str(e)}", stage="DELIVERY")
 
         await context.session.commit()
+
+        # 【修复】确保所有日志发送完成后再清理 SSE 日志缓冲区
+        await asyncio.sleep(0.5)
+        from app.core.sse_log_buffer import remove_buffer
+        remove_buffer(context.pipeline_id)
 
     async def handle_error(
         self,

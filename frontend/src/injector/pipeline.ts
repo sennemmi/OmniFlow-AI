@@ -15,7 +15,6 @@ import type { ElementInfo } from './types';
  * Pipeline 管理器
  */
 class PipelineManager {
-  private pollTimer: number | null = null;
   private isProcessing = false; // 防止重复提交的标志
   private lastInstruction = ''; // 保存最后一次修改指令
   private lastSummary = '';     // 保存最后一次 AI 生成的摘要
@@ -116,25 +115,7 @@ class PipelineManager {
     });
   }
 
-  /**
-   * 构建 LLM 上下文
-   */
-  private buildLLMContext(elementInfo: ElementInfo, userInstruction: string): Record<string, unknown> {
-    return {
-      file: elementInfo.sourceFile,
-      line: elementInfo.sourceLine,
-      column: elementInfo.sourceColumn,
-      component: elementInfo.componentName,
-      selected_html: elementInfo.outerHTML.slice(0, 500),
-      surrounding_code: '',
-      user_instruction: userInstruction,
-      element_type: elementInfo.tag,
-      element_id: elementInfo.id,
-      element_class: elementInfo.class,
-      xpath: elementInfo.xpath,
-      selector: elementInfo.selector,
-    };
-  }
+
 
   /**
    * 核心算法：在前端执行搜索替换
@@ -512,141 +493,7 @@ class PipelineManager {
     }
   }
 
-  /**
-   * 传统 Pipeline 修改（带轮询）
-   */
-  async handleModify(elementInfo: ElementInfo, feedback: string): Promise<void> {
-    bus.emit('ui:progress:show', {});
 
-    try {
-      const llmContext = this.buildLLMContext(elementInfo, feedback);
-      const requirement = `修复: ${elementInfo.componentName || elementInfo.tag}${elementInfo.id ? `#${elementInfo.id}` : ''}\n\n${feedback}`;
-
-      let sourceContext = null;
-      if (elementInfo.sourceFile && elementInfo.sourceLine > 0) {
-        sourceContext = {
-          file: elementInfo.sourceFile,
-          line: elementInfo.sourceLine,
-          column: elementInfo.sourceColumn,
-          relativePath: elementInfo.sourceFile.includes('src/')
-            ? elementInfo.sourceFile.substring(elementInfo.sourceFile.indexOf('src/'))
-            : elementInfo.sourceFile,
-        };
-      }
-
-      const payload = {
-        requirement,
-        elementContext: {
-          tag: elementInfo.tag,
-          id: elementInfo.id,
-          class: elementInfo.class,
-          xpath: elementInfo.xpath,
-          selector: elementInfo.selector,
-          outerHTML: elementInfo.outerHTML,
-          text: elementInfo.text,
-          componentName: elementInfo.componentName,
-          dataSource: elementInfo.dataSource,
-          dataComponent: elementInfo.dataComponent,
-          dataFile: elementInfo.dataFile,
-          rect: elementInfo.rect,
-        },
-        sourceContext,
-        llmContext,
-      };
-
-      const response = await api.createPipeline(payload);
-
-      if (response.success && response.data?.pipeline_id) {
-        appState.currentPipelineId = response.data.pipeline_id;
-        bus.emit('ui:progress:update', { status: 'Pipeline 已创建，开始执行...', percent: 10 });
-        this.startPolling(response.data.pipeline_id);
-      } else {
-        throw new Error(response.error || '创建 Pipeline 失败');
-      }
-    } catch (error) {
-      console.error('提交失败:', error);
-      bus.emit('ui:progress:update', {
-        status: `错误: ${error instanceof Error ? error.message : '未知错误'}`,
-        percent: 0,
-      });
-      bus.emit('ui:toast', {
-        message: `提交失败: ${error instanceof Error ? error.message : '未知错误'}`,
-        type: 'error',
-      });
-      setTimeout(() => bus.emit('ui:progress:hide', undefined), 3000);
-    }
-  }
-
-  /**
-   * 开始轮询 Pipeline 状态
-   */
-  private startPolling(pipelineId: string): void {
-    appState.isPolling = true;
-
-    const poll = async () => {
-      if (!appState.isPolling) return;
-
-      try {
-        const response = await api.getPipelineStatus(pipelineId);
-
-        if (response.success && response.data) {
-          const { status, current_stage_index, stages } = response.data;
-          const totalStages = stages?.length || 4;
-          const progress = Math.min((current_stage_index / totalStages) * 100, 95);
-
-          const stageNames = ['架构设计', '代码生成', '测试验证', '部署发布'];
-          const currentStage = stageNames[current_stage_index] || '执行中';
-
-          bus.emit('ui:progress:update', {
-            status: `${currentStage}...`,
-            percent: Math.round(progress),
-          });
-
-          if (status === 'success') {
-            appState.isPolling = false;
-            bus.emit('ui:progress:update', { status: '完成！', percent: 100 });
-
-            const prUrl = response.data.delivery?.pr_url || '#';
-
-            setTimeout(() => {
-              bus.emit('ui:progress:hide', undefined);
-              bus.emit('ui:notification:show', { prUrl });
-              bus.emit('pipeline:completed', { success: true, prUrl });
-              stateManager.exitSelectionMode();
-            }, 1500);
-            return;
-          }
-
-          if (status === 'failed') {
-            appState.isPolling = false;
-            bus.emit('ui:progress:update', { status: '执行失败', percent: 0 });
-            bus.emit('ui:toast', { message: 'Pipeline 执行失败', type: 'error' });
-            bus.emit('pipeline:completed', { success: false });
-            setTimeout(() => bus.emit('ui:progress:hide', undefined), 3000);
-            return;
-          }
-
-          this.pollTimer = window.setTimeout(poll, 3000);
-        }
-      } catch (error) {
-        console.error('轮询失败:', error);
-        this.pollTimer = window.setTimeout(poll, 3000);
-      }
-    };
-
-    poll();
-  }
-
-  /**
-   * 停止轮询
-   */
-  stopPolling(): void {
-    appState.isPolling = false;
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
-    }
-  }
 }
 
 // 导出单例

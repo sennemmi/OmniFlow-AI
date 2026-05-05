@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
-import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Sparkles, Pause, Brain } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Sparkles, Pause, Brain, RefreshCw } from 'lucide-react';
 
 // ============================================
 // Agent 终端 - SSE 实时日志流组件（浅色主题）
+// 【修复】增加指数退避重连机制
 // ============================================
 
 interface LogEntry {
@@ -109,17 +110,39 @@ function TypewriterText({ text, speed = 30 }: { text: string; speed?: number }) 
   return <span>{displayText}</span>;
 }
 
+// 重连配置
+const RECONNECT_CONFIG = {
+  initialDelay: 1000,      // 初始重连延迟 1秒
+  maxDelay: 30000,         // 最大重连延迟 30秒
+  maxAttempts: 10,         // 最大重连次数
+  backoffMultiplier: 2,    // 指数退避乘数
+};
+
 export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRunning = true }: ThoughtLogProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [isRunning, setIsRunning] = useState(initialIsRunning);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'reconnecting'>('connecting');
+  // 【修复】添加 UI 显示用的重连次数 state，仅用于展示，不用于逻辑控制
+  const [reconnectAttemptDisplay, setReconnectAttemptDisplay] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const hasPausedRef = useRef(false);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef(RECONNECT_CONFIG.initialDelay);
+  // 【修复】使用 ref 而非 state 存储重连次数，避免触发不必要的重渲染和双重重连
+  const reconnectAttemptRef = useRef(0);
 
-  // SSE 连接
-  useEffect(() => {
+  // 清理重连定时器
+  const clearReconnectTimeout = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  }, []);
+
+  // 建立 SSE 连接
+  const connectSSE = useCallback(() => {
     if (!pipelineId) return;
 
     // 清理之前的连接
@@ -127,8 +150,14 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
       eventSourceRef.current.close();
     }
 
-    setConnectionStatus('connecting');
-    setIsRunning(initialIsRunning);
+    // 如果已完成，不再重连
+    if (status === 'success' || status === 'failed') {
+      setConnectionStatus('disconnected');
+      setIsRunning(false);
+      return;
+    }
+
+    setConnectionStatus(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
 
     // 创建 SSE 连接
     const url = `/api/v1/pipeline/${pipelineId}/logs`;
@@ -137,6 +166,9 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
 
     es.onopen = () => {
       setConnectionStatus('connected');
+      // 【修复】重置 ref 而非 state
+      reconnectAttemptRef.current = 0;
+      reconnectDelayRef.current = RECONNECT_CONFIG.initialDelay;
     };
 
     es.onmessage = (event) => {
@@ -171,22 +203,69 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
       es.close();
       setIsRunning(false);
       setConnectionStatus('disconnected');
+      clearReconnectTimeout();
     });
 
     es.onerror = () => {
-      // SSE 断线时回退到显示最后状态，不崩溃
-      setConnectionStatus('disconnected');
+      // SSE 断线时尝试重连
       es.close();
+      
+      // 如果已完成或已达到最大重试次数，不再重连
+      if (status === 'success' || status === 'failed') {
+        setConnectionStatus('disconnected');
+        return;
+      }
+
+      if (reconnectAttemptRef.current >= RECONNECT_CONFIG.maxAttempts) {
+        setConnectionStatus('disconnected');
+        console.error(`[ThoughtLog] SSE 重连失败，已达到最大重试次数 (${RECONNECT_CONFIG.maxAttempts})`);
+        return;
+      }
+
+      // 指数退避重连
+      reconnectAttemptRef.current += 1;
+      const currentAttempt = reconnectAttemptRef.current;
+      // 【修复】更新 UI 显示用的重连次数
+      setReconnectAttemptDisplay(currentAttempt);
+      setConnectionStatus('reconnecting');
+
+      const delay = Math.min(
+        reconnectDelayRef.current * Math.pow(RECONNECT_CONFIG.backoffMultiplier, currentAttempt - 1),
+        RECONNECT_CONFIG.maxDelay
+      );
+
+      console.log(`[ThoughtLog] SSE 连接断开，${delay}ms 后尝试第 ${currentAttempt} 次重连...`);
+
+      reconnectTimeoutRef.current = setTimeout(() => {
+        connectSSE();
+      }, delay);
     };
+    // 【修复】移除 reconnectAttempt 依赖，避免双重重连
+  }, [pipelineId, status, clearReconnectTimeout]);
+
+  // SSE 连接管理
+  useEffect(() => {
+    connectSSE();
 
     // 清理函数
     return () => {
-      es.close();
-      eventSourceRef.current = null;
+      clearReconnectTimeout();
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
     };
-  }, [pipelineId, initialIsRunning]);
+  }, [pipelineId, initialIsRunning, connectSSE, clearReconnectTimeout]);
+
+  // 手动重连
+  const handleManualReconnect = useCallback(() => {
+    // 【修复】重置 ref 而非 state
+    reconnectAttemptRef.current = 0;
+    reconnectDelayRef.current = RECONNECT_CONFIG.initialDelay;
+    connectSSE();
+  }, [connectSSE]);
 
   // 当状态变为 paused 时，添加暂停提示
+  // 【修复】当状态从 paused 变为 running 时重置 hasPausedRef，支持多次暂停
   useEffect(() => {
     if (status === 'paused' && !hasPausedRef.current) {
       hasPausedRef.current = true;
@@ -200,6 +279,9 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
           details: '流水线已暂停，等待人类主驾驶审批。请点击左侧高亮的节点查看详细方案！',
         },
       ]);
+    } else if (status === 'running' && hasPausedRef.current) {
+      // 【修复】状态从 paused 恢复为 running 时重置 ref
+      hasPausedRef.current = false;
     }
   }, [status]);
 
@@ -236,6 +318,14 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         </span>
       );
     }
+    if (connectionStatus === 'reconnecting') {
+      return (
+        <span className="flex items-center gap-1.5 ml-2">
+          <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          <span className="text-xs text-slate-500">重连中 ({reconnectAttemptDisplay}/{RECONNECT_CONFIG.maxAttempts})...</span>
+        </span>
+      );
+    }
     return null;
   };
 
@@ -253,10 +343,23 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
             {getStatusDisplay()}
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
-          <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
-          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+        <div className="flex items-center gap-2">
+          {/* 重连按钮 - 仅在运行中或暂停状态显示，已完成/失败状态隐藏 */}
+          {connectionStatus === 'disconnected' && status !== 'success' && status !== 'failed' && (status === 'running' || status === 'paused') && (
+            <button
+              onClick={handleManualReconnect}
+              className="flex items-center gap-1 px-2 py-1 text-xs text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded transition-colors"
+              title="重新连接日志流"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              重连
+            </button>
+          )}
+          <div className="flex items-center gap-1.5">
+            <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
+            <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+            <div className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+          </div>
         </div>
       </div>
 
@@ -272,7 +375,9 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
               <Sparkles className="w-6 h-6 text-slate-400" />
             </div>
             <p className="text-sm">
-              {connectionStatus === 'connecting' ? '正在连接日志流...' : '等待 Agent 启动...'}
+              {connectionStatus === 'connecting' ? '正在连接日志流...' : 
+               connectionStatus === 'reconnecting' ? `正在重连 (${reconnectAttemptDisplay}/${RECONNECT_CONFIG.maxAttempts})...` :
+               '等待 Agent 启动...'}
             </p>
           </div>
         ) : (

@@ -298,11 +298,11 @@ class CodeGenerationService:
                                 break
 
                 # 【与原始 E2E 完全一致】调用 run_syntax_fix_loop 修复语法错误
+                # 【修复】SandboxFileService 只需 pipeline_id 参数
                 fixed_files = await run_syntax_fix_loop(
                     syntax_errors=syntax_errors,
                     files_to_check=error_files_with_content,
                     file_service=file_service or SandboxFileService(
-                        workspace_dir=workspace_path or settings.TARGET_PROJECT_PATH,
                         pipeline_id=pipeline_id or 0
                     ),
                     design_output={**design_output, "pipeline_id": pipeline_id},
@@ -625,11 +625,10 @@ class CodeGenerationService:
 
         try:
             # 如果没有 file_service，创建本地文件服务
+            # 【修复】SandboxFileService 只需 pipeline_id 参数
             if not file_service:
                 from app.service.sandbox_file_service import SandboxFileService
-                target_path = workspace_path or settings.TARGET_PROJECT_PATH
                 file_service = SandboxFileService(
-                    workspace_dir=target_path,
                     pipeline_id=pipeline_id or 0
                 )
 

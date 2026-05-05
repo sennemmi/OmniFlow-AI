@@ -115,6 +115,20 @@ class DesignerAgent(LangGraphAgent[DesignerOutput]):
 【接口契约生成要求 - 极其重要】
 你必须输出 `interface_specs`，包含所有新增或修改的公开函数/API 端点，确保 Coder 和 Tester 能基于此清单对齐。
 
+【关键 - 并行测试生成模式】
+TesterAgent 会在 CoderAgent 生成代码之前并行生成测试，这意味着：
+1. TesterAgent **看不到** CoderAgent 生成的代码
+2. TesterAgent **完全依赖** interface_specs 中的契约信息生成测试
+3. 如果 interface_specs 不完整，测试将无法正确验证代码
+
+因此，interface_specs 必须包含完整的信息：
+- ✅ return_fields: 所有返回字段的完整规范（名称、类型、是否必填）
+- ✅ error_responses: 所有可能的错误场景和错误消息格式
+- ✅ mock_dependencies: 所有需要 Mock 的外部依赖（数据库、网络、系统调用等）
+- ✅ expected_behavior: 清晰的行为描述，包括边界条件和异常情况
+
+如果 interface_specs 缺少任何信息，测试将无法生成或无法通过！
+
 【接口契约格式要求 - 绝对禁止违反】
 - symbol_name **只能是模块级的函数名或类名**！
 - 【致命错误防范】绝对禁止将类里面的方法（如静态方法、实例方法）作为独立的 symbol_name 提取出来！
@@ -411,6 +425,13 @@ signature_change_reason: 无需修改，复用现有函数
 - affected_files 必须包含所有需要修改或新增的文件路径
 - **interface_specs 中的每个符号都必须是真实存在的或明确需要新建的**
 - **不要假设某个函数"应该存在"，只列出实际看到的或明确需要创建的**
+
+【输出前强制自检 - 违反将导致设计被拒绝】
+在输出 JSON 之前，你必须逐项确认以下内容并附在 technical_design 字段的最后一行：
+□ 所有 interface_specs 的 return_fields 是否非空（返回 dict 时）？
+□ 所有需要 mock 的函数（如数据库、网络、文件 IO）是否已填写 mock_dependencies？
+□ 所有可能出错的接口是否已定义 error_responses？
+□ 所有 symbol_name 是否都是模块级可导入的（不是类方法名）？
 """
     
     def build_user_prompt(self, state: Dict[str, Any]) -> str:

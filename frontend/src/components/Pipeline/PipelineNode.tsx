@@ -33,8 +33,11 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
   default: Cpu,
 };
 
+// 【修复】统一前后端状态枚举
+// 后端 PipelineStatus: running, paused, success, failed
+// 后端 StageStatus: pending, running, success, failed
 const statusConfig: Record<
-  PipelineStatus,
+  string,
   { icon: React.ComponentType<{ className?: string }>; className: string; label: string; indicatorClass: string }
 > = {
   pending: { 
@@ -49,6 +52,14 @@ const statusConfig: Record<
     label: '执行中',
     indicatorClass: 'running'
   },
+  // 【修复】直接使用 success 状态，与后端保持一致
+  success: { 
+    icon: CheckCircle2, 
+    className: 'text-status-success bg-status-success/10', 
+    label: '已完成',
+    indicatorClass: 'completed'
+  },
+  // 【保留】completed 用于向后兼容
   completed: { 
     icon: CheckCircle2, 
     className: 'text-status-success bg-status-success/10', 

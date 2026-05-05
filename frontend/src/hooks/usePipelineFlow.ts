@@ -4,9 +4,12 @@ import type { Pipeline, PipelineStage } from '@types';
 
 // ============================================
 // Pipeline Flow 状态管理和节点/边构建 Hook
+// 【修复】统一前后端状态枚举，移除 success -> completed 的映射
 // ============================================
 
 // 状态配置 - 与后端 PipelineStatus 枚举保持一致
+// 后端 PipelineStatus: running, paused, success, failed
+// 后端 StageStatus: pending, running, success, failed
 export const statusConfig: Record<string, { 
   icon: string; 
   class: string; 
@@ -42,6 +45,7 @@ export const statusConfig: Record<string, {
     bgClass: 'bg-red-50',
     borderClass: 'border-red-200'
   },
+  // 【移除】completed 状态，直接使用 success
 };
 
 // 阶段配置 - 更新拓扑结构
@@ -75,7 +79,8 @@ export const getLayouts = (nodeWidth: number, horizontalGap: number, verticalGap
   DELIVERY: { x: (nodeWidth + horizontalGap) * 3, y: 0 },
 });
 
-// 获取阶段状态 - 修复状态映射
+// 获取阶段状态 - 支持并发执行（CODING 和 TESTING 同时运行）
+// 【修复】统一使用 success 状态，不再映射到 completed
 export function getStageStatus(
   stageName: string, // 这是前端的节点名称 (REQUIREMENT, DESIGN, CODER, TESTER, DELIVERY)
   backendStages: PipelineStage[],
@@ -100,16 +105,28 @@ export function getStageStatus(
   // 获取当前后端阶段对应的前端节点名称
   const mappedCurrentStage = currentStage ? backendToFrontendMap[currentStage] : null;
 
+  // 【并发执行支持】CODING 和 TESTING 可能同时运行
+  // 检查是否有并发的运行中阶段
+  const runningStages = backendStages.filter(s => s.status === 'running');
+  const isConcurrentRunning = runningStages.length > 1;
+
   // 1. 如果这个节点正是【当前正在进行的节点】
   if (mappedCurrentStage === stageName) {
     if (pipelineStatus === 'paused') return 'paused';
     if (pipelineStatus === 'running') return 'running';
   }
 
+  // 【并发执行】检查该节点是否有正在运行的后端阶段
+  const hasRunningStage = runningStages.some(
+    s => backendToFrontendMap[s.name] === stageName
+  );
+  if (hasRunningStage && pipelineStatus === 'running') {
+    return 'running';
+  }
+
   // 2. 如果后端有这个阶段的明确记录，返回它的真实状态
+  // 【修复】直接使用后端返回的状态，不再映射 success -> completed
   if (backendStage) {
-    // 把后端 "success" 映射到前端 "completed"（PipelineNode 的 statusConfig 用 completed）
-    if (backendStage.status === 'success') return 'completed';
     return backendStage.status;
   }
 
@@ -118,7 +135,8 @@ export function getStageStatus(
   const thisIndex = STAGE_ORDER.indexOf(stageName);
 
   if (currentIndex === -1) return 'pending';
-  if (thisIndex < currentIndex) return 'completed'; // 已完成的阶段用 completed
+  // 【修复】使用 success 而不是 completed
+  if (thisIndex < currentIndex) return 'success';
   return 'pending';
 }
 
@@ -144,14 +162,22 @@ export function buildFlowElements(
     const status = getStageStatus(stageName, backendStages, currentStage, pipelineStatus);
 
     // 查找后端对应的 stage 数据
-    const backendStage = backendStages.find(s => stageMapping[s.name] === stageName);
+    const backendStage = backendStages.slice().reverse().find(s => stageMapping[s.name] === stageName);
 
     // 判断是否是当前阶段
     const isCurrentStage = stageMapping[currentStage || ''] === stageName;
 
+    // 【新流程】CODING 阶段需要审批，TESTER 只展示测试结果，不审批
+    const isCodingStage = currentStage === 'CODING';
+    const isCodeReviewStage = currentStage === 'CODE_REVIEW';
+    const isCoder = stageName === 'CODER';
+    const isTester = stageName === 'TESTER';
+    // 只有 CODER 节点在 CODING 阶段显示为可审批
+    const isPendingApproval = (isCodingStage && isCoder) || (isCodeReviewStage && isCoder);
+
     // 节点样式 - 根据状态设置
     let nodeClassName = '';
-    if (isCurrentStage && pipelineStatus === 'paused') {
+    if ((isCurrentStage && pipelineStatus === 'paused') || isPendingApproval) {
       // 等待审批：静态橙色高亮边框 + 待审批标签
       nodeClassName = 'ring-2 ring-status-warning ring-offset-2';
     } else if (isCurrentStage && pipelineStatus === 'running') {
@@ -166,7 +192,8 @@ export function buildFlowElements(
 
     // 修复：只要有 output_data 就可以点击查看（包括 CODING 自动编码阶段）
     const hasOutputData = !!backendStage?.output_data;
-    const isPending = isCurrentStage && pipelineStatus === 'paused';
+    // TESTER 节点不显示审批状态，只显示可点击
+    const isPending = (isCurrentStage && pipelineStatus === 'paused' && !isTester) || isPendingApproval;
 
     nodes.push({
       id: stageName,
@@ -282,7 +309,8 @@ export function usePipelineFlow(pipeline: Pipeline | null): UsePipelineFlowRetur
     const finishedStageNames = new Set(
       pipeline.stages
         .filter(
-          s => s.status.toLowerCase() === 'success'
+          // 【修复】直接使用 success 状态
+          s => s.status === 'success'
         )
         .map(s => {
           // 将后端阶段名映射到前端节点名，统一统计

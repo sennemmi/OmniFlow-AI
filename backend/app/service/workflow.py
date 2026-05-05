@@ -211,6 +211,15 @@ class WorkflowService:
                 - reasoning: AI 推理过程
         """
         # ★ DEBUG: 打印接收到的 metrics
+        if metrics is None and isinstance(output_data, dict):
+            metrics = {
+                "input_tokens": output_data.get("input_tokens", 0),
+                "output_tokens": output_data.get("output_tokens", 0),
+                "duration_ms": output_data.get("duration_ms", 0),
+                "retry_count": output_data.get("retry_count", 0),
+                "reasoning": output_data.get("reasoning"),
+            }
+
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"[DEBUG] WorkflowService.complete_stage called for {stage.name} with metrics: {metrics}")
@@ -313,19 +322,40 @@ class WorkflowService:
     ) -> None:
         """
         设置 Pipeline 为失败状态
-        
+
         Args:
             pipeline: Pipeline 对象
             session: 数据库会话
         """
         await PipelineRepository.set_failed(pipeline, session)
-        
+
         info(
             "Pipeline 状态更新为 FAILED",
             pipeline_id=pipeline.id,
             current_stage=pipeline.current_stage.value if pipeline.current_stage else None
         )
-    
+
+    @classmethod
+    async def set_pipeline_success(
+        cls,
+        pipeline: Pipeline,
+        session: AsyncSession
+    ) -> None:
+        """
+        设置 Pipeline 为成功状态
+
+        Args:
+            pipeline: Pipeline 对象
+            session: 数据库会话
+        """
+        await PipelineRepository.set_success(pipeline, session)
+
+        info(
+            "Pipeline 状态更新为 SUCCESS",
+            pipeline_id=pipeline.id,
+            current_stage=pipeline.current_stage.value if pipeline.current_stage else None
+        )
+
     @classmethod
     async def terminate_pipeline(
         cls,

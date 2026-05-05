@@ -36,7 +36,9 @@ import {
 import { apiGet, apiPost } from '@utils/axios';
 import { usePipelineStore } from '@stores/pipelineStore';
 import { PipelineNode, ApproveDrawer, ThoughtLog, PipelineSkeleton } from '@components/Pipeline';
-import { usePipelineFlow, statusConfig, STAGE_CONFIG } from '@hooks/usePipelineFlow';
+import { usePipelineFlow, statusConfig, STAGE_CONFIG, STAGE_ORDER } from '@hooks/usePipelineFlow';
+import { usePipelineNotification } from '@hooks/usePipelineNotification';
+import { getStageMetrics } from '@utils/pipelineMetrics';
 import type { Pipeline, PipelineStage } from '@types';
 
 // ============================================
@@ -163,6 +165,9 @@ export function PipelineDetail() {
     isDone,
   } = usePipelineFlow(pipeline);
 
+  // 【修复】启用 Pipeline 完成通知
+  usePipelineNotification(pipelineId ? Number(pipelineId) : null);
+
   // React Flow 状态
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
@@ -185,20 +190,41 @@ export function PipelineDetail() {
     (event, node) => {
       if (!pipeline) return;
 
-      const backendStage = node.data?.backendStage as any;
+      const stageId = node.id as string; // CODER 或 TESTER
       const isClickable = node.data?.isClickable as boolean;
 
-      // 修改这里：只要是 CODING 阶段且有 output_data，无论成功失败，强制允许点击查看！
-      if (backendStage && backendStage.name === 'CODING' && backendStage.output_data) {
-        openApproveDrawer(backendStage);
+      // 【并发执行支持】根据点击的节点查找对应的后端阶段
+      let targetStage: PipelineStage | undefined;
+
+      if (stageId === 'CODER') {
+        // CODER 节点对应 CODING 阶段
+        targetStage = pipeline.stages?.find(s => s.name === 'CODING');
+      } else if (stageId === 'TESTER') {
+        // TESTER 节点对应 UNIT_TESTING 阶段
+        targetStage = pipeline.stages?.find(s => s.name === 'UNIT_TESTING');
+      } else {
+        // 其他节点直接查找
+        targetStage = pipeline.stages?.find(s => {
+          const mapping: Record<string, string> = {
+            'REQUIREMENT': 'REQUIREMENT',
+            'DESIGN': 'DESIGN',
+            'DELIVERY': 'DELIVERY'
+          };
+          return mapping[s.name] === stageId;
+        });
+      }
+
+      // 如果找到对应阶段且有数据，打开抽屉
+      if (targetStage?.output_data) {
+        openApproveDrawer(targetStage);
         return;
       }
 
-      // 如果节点可点击（是当前阶段、pipeline 是 paused、有 output_data）
+      // 兜底：使用节点上的 backendStage
+      const backendStage = node.data?.backendStage as PipelineStage;
       if (isClickable && backendStage) {
         openApproveDrawer(backendStage);
       } else if (backendStage?.output_data) {
-        // 只要有 output_data 就可以查看
         openApproveDrawer(backendStage);
       }
     },
@@ -506,7 +532,7 @@ export function PipelineDetail() {
           {/* 阶段完成数 */}
           <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 rounded-lg flex-shrink-0">
             <span className="text-xs text-slate-500">已完成</span>
-            <span className="text-sm font-semibold text-slate-900">{completedStages}/{pipeline.stages?.length || 0}</span>
+            <span className="text-sm font-semibold text-slate-900">{completedStages}/{STAGE_ORDER.length}</span>
             <span className="text-xs text-slate-400">阶段</span>
           </div>
         </div>
@@ -603,6 +629,16 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
 
   // 计算阶段统计数据
   const getStageStats = (stage: PipelineStage) => {
+    const metrics = getStageMetrics(stage);
+    stage = {
+      ...stage,
+      input_tokens: metrics.inputTokens,
+      output_tokens: metrics.outputTokens,
+      duration_ms: metrics.durationMs,
+      retry_count: metrics.retryCount,
+      reasoning: metrics.reasoning,
+    };
+
     // [注意] 直接从 stage 对象读取 duration_ms，不再依赖 created_at/completed_at 计算
     let durationText = '-';
     let durationSeconds = 0;
@@ -705,7 +741,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
         </span>
       </div>
       
-      <div className="grid grid-cols-5 gap-3">
+      <div className="grid grid-cols-3 lg:grid-cols-6 gap-3">
         {pipeline.stages?.map((stage) => {
           const config = stageConfig[stage.name] || stageConfig['REQUIREMENT'];
           const Icon = config.icon;
@@ -787,7 +823,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
           <span className="text-sm font-semibold text-slate-900">
             {(() => {
               // [注意] 从 stage.duration_ms 累加，不再使用 s.duration
-              const totalMs = pipeline.stages?.reduce((acc, s) => acc + (s.duration_ms || 0), 0) || 0;
+              const totalMs = pipeline.stages?.reduce((acc, s) => acc + getStageMetrics(s).durationMs, 0) || 0;
               const totalSeconds = Math.floor(totalMs / 1000);
               if (totalSeconds > 3600) {
                 return `${Math.floor(totalSeconds / 3600)}h ${Math.floor((totalSeconds % 3600) / 60)}m`;
@@ -803,7 +839,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
           <span className="text-sm font-semibold text-slate-900">
             {(pipeline.stages?.reduce((acc, s) => {
               // [注意] 直接从 stage 对象累加 Token，不再从 output_data 中提取
-              const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
+              const tokens = getStageMetrics(s).totalTokens;
               return acc + (s.status !== 'pending' ? tokens : 0);
             }, 0) || 0).toLocaleString()}
           </span>

@@ -38,7 +38,6 @@ class AgentCoordinatorService:
     async def build_architect_context(
         self,
         requirement: str,
-        file_tree: Optional[Dict[str, Any]] = None,
         element_context: Optional[str] = None,
         pipeline_id: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -47,7 +46,6 @@ class AgentCoordinatorService:
 
         Args:
             requirement: 需求描述
-            file_tree: 文件树（可选）
             element_context: 元素上下文（可选）
             pipeline_id: Pipeline ID
 
@@ -56,7 +54,6 @@ class AgentCoordinatorService:
         """
         context = {
             "requirement": requirement,
-            "file_tree": file_tree or {},
             "element_context": element_context,
             "pipeline_id": pipeline_id,
         }
@@ -65,7 +62,7 @@ class AgentCoordinatorService:
             await push_log(
                 pipeline_id,
                 "info",
-                f"📋 构建 ArchitectAgent 上下文 (file_tree: {len(file_tree or {})} items)",
+                f"📋 构建 ArchitectAgent 上下文 (requirement: {len(requirement)} chars)",
                 stage="REQUIREMENT"
             )
 
@@ -75,7 +72,6 @@ class AgentCoordinatorService:
         self,
         requirement: str,
         arch_output: Dict[str, Any],
-        file_tree: Optional[Dict[str, Any]] = None,
         pipeline_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
@@ -84,7 +80,6 @@ class AgentCoordinatorService:
         Args:
             requirement: 需求描述
             arch_output: ArchitectAgent 输出
-            file_tree: 文件树（可选）
             pipeline_id: Pipeline ID
 
         Returns:
@@ -96,7 +91,6 @@ class AgentCoordinatorService:
         context = {
             "requirement": requirement,
             "arch_output": arch_output,
-            "file_tree": file_tree or {},
             "injected_files": injected_files,
             "pipeline_id": pipeline_id,
         }
