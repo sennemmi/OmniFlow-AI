@@ -12,7 +12,7 @@ import { interaction } from './interaction';
 import { pipeline } from './pipeline';
 import { preview } from './preview';
 import { dom, utils, reactSourceMapper } from './core';
-import { SearchReplaceEngine, searchReplaceEngine } from './searchReplace';
+import { searchReplaceEngine } from './searchReplace';
 
 /**
  * OmniFlowAI Injector 主类

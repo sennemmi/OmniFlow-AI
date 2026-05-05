@@ -10,7 +10,7 @@ const omniFlowOverlayPlugin = (isDev: boolean) => ({
   transformIndexHtml(html: string) {
     // 开发模式直接以 module 方式引入 TS 源文件，生产模式使用打包后的 IIFE 产物
     const scriptSrc = isDev ? '/src/injector/index.ts' : '/omni-injector.iife.js'
-    const typeAttr = isDev ? ' type="module"' : ''
+    const typeAttr = ' type="module"'
 
     return html.replace(
       '</body>',
@@ -72,7 +72,6 @@ export default defineConfig(({ mode }) => {
             }
             return 'assets/[name]-[hash].js'
           },
-          format: 'iife',
         },
       },
     },

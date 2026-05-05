@@ -6,10 +6,20 @@
 import { dom } from './core';
 import { bus } from './events';
 import { api } from './api';
-import { stateManager, appState } from './state';
+import { stateManager } from './state';
 import { ui } from './ui';
 import { SearchReplaceEngine } from './searchReplace';
 import type { ElementInfo } from './types';
+
+interface CreateMrResponse {
+  success: boolean;
+  data?: {
+    pr_url?: string;
+    pr_number?: number;
+    branch?: string;
+  };
+  error?: string;
+}
 
 /**
  * Pipeline 管理器
@@ -55,7 +65,7 @@ class PipelineManager {
       // 新增：请求后端创建 MR
       if (this.lastFilePath && this.lastInstruction) {
         try {
-          const response = await api.request('/api/v1/code/create-mr', {
+          const response = await api.request<CreateMrResponse>('/api/v1/code/create-mr', {
             method: 'POST',
             body: JSON.stringify({
               file_path: this.lastFilePath,
@@ -244,7 +254,7 @@ class PipelineManager {
         console.log('[OmniFlowAI] search_block 长度:', search_block.length);
         console.log('[OmniFlowAI] replace_block 长度:', replace_block.length);
 
-        const replaceResult = SearchReplaceEngine.applySearchReplace(
+        const replaceResult = this.applySearchReplace(
           originalContent,
           search_block,
           replace_block,
@@ -419,7 +429,7 @@ class PipelineManager {
         // 注意：replace_block 可以为空字符串（表示删除）
         if (change_type === 'modify' && search_block !== undefined && search_block !== null && replace_block !== undefined) {
           // 使用搜索替换策略
-          const replaceResult = SearchReplaceEngine.applySearchReplace(
+          const replaceResult = this.applySearchReplace(
             finalContent,
             search_block,
             replace_block

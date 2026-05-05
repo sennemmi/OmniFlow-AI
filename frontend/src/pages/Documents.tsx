@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import {
   Book,
-  FileText,
   Code,
   Terminal,
   HelpCircle,
@@ -10,8 +9,6 @@ import {
   ExternalLink,
   Copy,
   CheckCircle2,
-  Play,
-  AlertTriangle,
   Info,
   Lightbulb,
   Zap,
@@ -114,7 +111,7 @@ export function Documents() {
       <main className="flex-1 bg-bg-primary rounded-xl border border-border-default shadow-feishu-card overflow-hidden">
         <div className="h-full overflow-y-auto">
           {activeSection === 'getting-started' && <GettingStartedContent onCopy={handleCopyCode} copiedCode={copiedCode} />}
-          {activeSection === 'guides' && <GuidesContent onCopy={handleCopyCode} copiedCode={copiedCode} />}
+          {activeSection === 'guides' && <GuidesContent />}
           {activeSection === 'api' && <ApiContent onCopy={handleCopyCode} copiedCode={copiedCode} />}
           {activeSection === 'cli' && <CliContent onCopy={handleCopyCode} copiedCode={copiedCode} />}
           {activeSection === 'best-practices' && <BestPracticesContent />}
@@ -244,7 +241,7 @@ function GettingStartedContent({ onCopy, copiedCode }: { onCopy: (id: string, co
 }
 
 // 使用指南内容
-function GuidesContent({ onCopy, copiedCode }: { onCopy: (id: string, code: string) => void; copiedCode: string | null }) {
+function GuidesContent() {
   const guides = [
     {
       title: '流水线配置指南',

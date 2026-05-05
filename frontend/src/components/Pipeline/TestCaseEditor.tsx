@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Edit3, Save, Play, X, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { Edit3, Play, X, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 import { apiPost } from '@utils/axios';
 import { useUIStore } from '@stores/uiStore';
 
@@ -14,6 +14,12 @@ interface TestCaseEditorProps {
   language?: string;
   onSave?: (newContent: string) => void;
   onTestRun?: (success: boolean, result: any) => void;
+}
+
+interface OverrideTestResult {
+  test_run_success: boolean;
+  message?: string;
+  layers?: Array<{ layer: string; passed: boolean; summary: string }>;
 }
 
 export function TestCaseEditor({
@@ -58,35 +64,28 @@ export function TestCaseEditor({
     setLastResult(null);
 
     try {
-      const response = await apiPost(`/pipeline/${pipelineId}/override-test`, {
+      const response = await apiPost<OverrideTestResult>(`/pipeline/${pipelineId}/override-test`, {
         file_path: filePath,
         content: content
       });
 
-      if (response.success) {
-        const testRunSuccess = response.data?.test_run_success;
-        const message = response.data?.message || '测试执行完成';
-        const layers = response.data?.layers;
+      const testRunSuccess = response.test_run_success;
+      const message = response.message || '测试执行完成';
+      const layers = response.layers;
 
-        setLastResult({
-          success: testRunSuccess,
-          message,
-          layers
-        });
+      setLastResult({
+        success: testRunSuccess,
+        message,
+        layers
+      });
 
-        addToast({
-          type: testRunSuccess ? 'success' : 'warning',
-          message: testRunSuccess ? '测试全部通过！' : message
-        });
+      addToast({
+        type: testRunSuccess ? 'success' : 'warning',
+        message: testRunSuccess ? '测试全部通过！' : message
+      });
 
-        onSave?.(content);
-        onTestRun?.(testRunSuccess, response.data);
-      } else {
-        addToast({
-          type: 'error',
-          message: response.error || '保存测试代码失败'
-        });
-      }
+      onSave?.(content);
+      onTestRun?.(testRunSuccess, response);
     } catch (error) {
       addToast({
         type: 'error',

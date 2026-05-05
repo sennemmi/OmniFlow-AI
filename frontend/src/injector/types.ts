@@ -112,6 +112,8 @@ export interface ModifyResponse {
     new_content: string; // 保留作为回退
     search_block?: string;  // 待搜索的原始代码块
     replace_block?: string; // 替换后的新代码块
+    change_type?: string;
+    summary?: string;
     diff: string;
   };
   error?: string;
@@ -131,6 +133,7 @@ export interface BatchModifyResponse {
       replace_block?: string;
       change_type?: string;
       new_content?: string;
+      summary?: string;
     }>;
   };
   error?: string;
@@ -189,7 +192,7 @@ export interface OmniEvents {
   'ui:dialog:close': void;
   'ui:panel:show': { elements: HTMLElement[] };
   'ui:panel:close': void;
-  'ui:notification:show': { prUrl: string };
+  'ui:notification:show': { prUrl: string; prNumber?: number; branch?: string; filePath?: string };
   'ui:preview-controls:show': { filePath: string; originalContent: string; isBatch?: boolean; successCount?: number; failedCount?: number };
   'ui:preview-controls:hide': void;
 

@@ -9,17 +9,17 @@ afterAll(() => server.close());
 
 // Mock Monaco Editor
 vi.mock('@monaco-editor/react', () => ({
-  default: function MonacoEditor({ value }: { value: string }) {
+  default: function MonacoEditor({ value: _value }: { value: string }) {
     return null;
   },
-  Editor: function Editor({ value }: { value: string }) {
+  Editor: function Editor({ value: _value }: { value: string }) {
     return null;
   },
 }));
 
 // Mock React Flow
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: function ReactFlow({ children }: { children: React.ReactNode }) {
+  ReactFlow: function ReactFlow({ children: _children }: { children: React.ReactNode }) {
     return null;
   },
   Background: function Background() {

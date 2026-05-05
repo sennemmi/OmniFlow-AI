@@ -108,7 +108,6 @@ export function getStageStatus(
   // 【并发执行支持】CODING 和 TESTING 可能同时运行
   // 检查是否有并发的运行中阶段
   const runningStages = backendStages.filter(s => s.status === 'running');
-  const isConcurrentRunning = runningStages.length > 1;
 
   // 1. 如果这个节点正是【当前正在进行的节点】
   if (mappedCurrentStage === stageName) {
@@ -150,7 +149,6 @@ export function buildFlowElements(
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   const nodeWidth = 180;
-  const nodeHeight = 80;
   const horizontalGap = 60;
   const verticalGap = 100;
 
@@ -296,7 +294,7 @@ export function usePipelineFlow(pipeline: Pipeline | null): UsePipelineFlowRetur
   }, [pipeline]);
 
   // 计算进度 - 使用固定总阶段数（STAGE_ORDER 长度）
-  const { totalStages, completedStages, progress } = useMemo(() => {
+  const { completedStages, progress } = useMemo(() => {
     // 固定总阶段数为 5 (即 STAGE_ORDER 的长度)
     const total = STAGE_ORDER.length;
 

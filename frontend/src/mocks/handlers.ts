@@ -1,46 +1,27 @@
 import { http, HttpResponse } from 'msw';
-import type { Pipeline, PipelineStage } from '@types';
+import type { Pipeline } from '@types';
 
 // Mock 数据
 const mockPipelines: Pipeline[] = [
   {
     id: 1,
     description: '实现用户登录功能',
-    status: 'PAUSED',
+    status: 'paused',
     current_stage: 'REQUIREMENT',
+    current_stage_index: 0,
     created_at: '2024-01-15T10:00:00Z',
     updated_at: '2024-01-15T10:05:00Z',
     stages: [
       {
         id: 1,
         name: 'REQUIREMENT',
-        status: 'SUCCESS',
+        status: 'success',
         input_data: { requirement: '实现用户登录功能' },
         output_data: { feature_description: '用户登录功能' },
         created_at: '2024-01-15T10:00:00Z',
         completed_at: '2024-01-15T10:05:00Z',
       },
     ],
-  },
-];
-
-const mockStages: PipelineStage[] = [
-  {
-    id: 1,
-    name: 'REQUIREMENT',
-    status: 'SUCCESS',
-    input_data: { requirement: '实现用户登录功能' },
-    output_data: { feature_description: '用户登录功能' },
-    created_at: '2024-01-15T10:00:00Z',
-    completed_at: '2024-01-15T10:05:00Z',
-  },
-  {
-    id: 2,
-    name: 'DESIGN',
-    status: 'PENDING',
-    input_data: {},
-    output_data: {},
-    created_at: '2024-01-15T10:05:00Z',
   },
 ];
 
@@ -74,8 +55,9 @@ export const handlers = [
     const newPipeline: Pipeline = {
       id: mockPipelines.length + 1,
       description: body.description,
-      status: 'RUNNING',
+      status: 'running',
       current_stage: 'REQUIREMENT',
+      current_stage_index: 0,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       stages: [],
@@ -96,7 +78,7 @@ export const handlers = [
         { status: 404 }
       );
     }
-    pipeline.status = 'RUNNING';
+    pipeline.status = 'running';
     pipeline.updated_at = new Date().toISOString();
     return HttpResponse.json({
       success: true,
@@ -104,7 +86,7 @@ export const handlers = [
         pipeline_id: pipeline.id,
         previous_stage: pipeline.current_stage,
         next_stage: 'DESIGN',
-        status: 'RUNNING',
+        status: 'running',
       },
     });
   }),
@@ -119,14 +101,14 @@ export const handlers = [
         { status: 404 }
       );
     }
-    pipeline.status = 'RUNNING';
+    pipeline.status = 'running';
     pipeline.updated_at = new Date().toISOString();
     return HttpResponse.json({
       success: true,
       data: {
         pipeline_id: pipeline.id,
         current_stage: pipeline.current_stage,
-        status: 'RUNNING',
+        status: 'running',
         feedback: { reason: body.reason },
       },
     });

@@ -1,9 +1,8 @@
 import { memo } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import {
   Cpu,
   Code,
-  FileCheck,
   Rocket,
   AlertCircle,
   CheckCircle2,
@@ -14,7 +13,7 @@ import {
   GitBranch,
   Hand,
 } from 'lucide-react';
-import type { PipelineNodeData, PipelineStatus } from '@types';
+import type { PipelineNodeData } from '@types';
 
 // ============================================
 // 流水线自定义节点 - React Flow（优化版）
@@ -92,7 +91,9 @@ const statusConfig: Record<
   },
 };
 
-function PipelineNodeComponent({ data, selected }: NodeProps<PipelineNodeData>) {
+type PipelineFlowNode = Node<PipelineNodeData, 'pipelineNode'>;
+
+function PipelineNodeComponent({ data, selected }: NodeProps<PipelineFlowNode>) {
   const { label, icon, status, description, onClick, isPendingApproval } = data;
 
   const IconComponent = iconMap[icon] || iconMap.default;

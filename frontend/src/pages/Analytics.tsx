@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import {
-  BarChart3,
   TrendingUp,
   TrendingDown,
   Clock,
@@ -8,7 +7,6 @@ import {
   XCircle,
   GitBranch,
   Users,
-  Calendar,
   Filter,
   Download,
   ArrowUpRight,
@@ -16,7 +14,6 @@ import {
   Activity,
   Target,
   Zap,
-  MoreHorizontal,
 } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { apiGet } from '@utils/axios';

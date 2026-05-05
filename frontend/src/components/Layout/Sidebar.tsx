@@ -8,7 +8,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Monitor,
-  Home,
   Zap,
 } from 'lucide-react';
 import { useUIStore } from '@stores/uiStore';

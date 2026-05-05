@@ -20,7 +20,6 @@ import {
   Sparkles,
   ChevronRight,
   RefreshCw,
-  Flame,
   Target,
   Zap,
 } from 'lucide-react';
@@ -41,7 +40,6 @@ export function Console() {
   // 获取统计数据
   const {
     data: stats,
-    refetch: refetchStats,
   } = useQuery<SystemStats>({
     queryKey: ['system-stats'],
     queryFn: () => apiGet('/system/stats'),
@@ -52,7 +50,6 @@ export function Console() {
   const {
     data: pipelinesData,
     isLoading: isLoadingPipelines,
-    refetch: refetchPipelines,
   } = useQuery<PipelineListResponse>({
     queryKey: ['pipelines'],
     queryFn: () => apiGet('/pipelines'),

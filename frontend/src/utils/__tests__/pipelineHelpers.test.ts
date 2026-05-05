@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractAllCodeChanges, isCodeStage, type CodeChange } from '../pipelineHelpers';
+import { extractAllCodeChanges, isCodeStage } from '../pipelineHelpers';
 import type { PipelineStage } from '@types';
 
 describe('extractAllCodeChanges', () => {

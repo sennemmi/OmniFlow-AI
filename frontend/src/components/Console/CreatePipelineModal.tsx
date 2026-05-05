@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, LayoutGrid, List, Command, Loader2 } from 'lucide-react';
+import { LayoutGrid, List, Command, Loader2 } from 'lucide-react';
 import { apiPost } from '@utils/axios';
 import { useUIStore } from '@stores/uiStore';
 import { TemplateGrid, type Template } from './TemplateGrid';

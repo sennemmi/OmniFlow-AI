@@ -44,7 +44,7 @@ class APIClient {
   /**
    * 发送 HTTP 请求
    */
-  private async request<T>(
+  async request<T>(
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {

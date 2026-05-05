@@ -10,6 +10,8 @@ import {
   useEdgesState,
   type NodeMouseHandler,
   type NodeTypes,
+  type Node as FlowNode,
+  type Edge,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
@@ -36,7 +38,7 @@ import {
 import { apiGet, apiPost } from '@utils/axios';
 import { usePipelineStore } from '@stores/pipelineStore';
 import { PipelineNode, ApproveDrawer, ThoughtLog, PipelineSkeleton } from '@components/Pipeline';
-import { usePipelineFlow, statusConfig, STAGE_CONFIG, STAGE_ORDER } from '@hooks/usePipelineFlow';
+import { usePipelineFlow, statusConfig, STAGE_CONFIG, STAGE_ORDER, stageMapping } from '@hooks/usePipelineFlow';
 import { usePipelineNotification } from '@hooks/usePipelineNotification';
 import { getStageMetrics } from '@utils/pipelineMetrics';
 import type { Pipeline, PipelineStage } from '@types';
@@ -137,7 +139,7 @@ export function PipelineDetail() {
 
     setIsRetrying(true);
     try {
-      const response = await apiPost(`/pipeline/${pipelineId}/retry`, {});
+      const response = await apiPost<{ success?: boolean; data?: { success?: boolean }; error?: string; message?: string }>(`/pipeline/${pipelineId}/retry`, {});
 
       if (response.success || response.data?.success) {
         alert('重试已启动，Pipeline 将重新开始执行');
@@ -162,15 +164,14 @@ export function PipelineDetail() {
     completedStages,
     progress,
     showApproveButton,
-    isDone,
   } = usePipelineFlow(pipeline);
 
   // 【修复】启用 Pipeline 完成通知
   usePipelineNotification(pipelineId ? Number(pipelineId) : null);
 
   // React Flow 状态
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   // 同步 flowNodes/flowEdges 到 React Flow 状态
   useEffect(() => {
@@ -187,7 +188,7 @@ export function PipelineDetail() {
 
   // 节点点击处理 - 修复抽屉唤起
   const handleNodeClick: NodeMouseHandler = useCallback(
-    (event, node) => {
+    (_event, node) => {
       if (!pipeline) return;
 
       const stageId = node.id as string; // CODER 或 TESTER
@@ -460,7 +461,7 @@ export function PipelineDetail() {
             <div>
               <p className="text-xs text-slate-500">当前阶段</p>
               <p className="text-sm font-medium text-slate-900">
-                {currentStage?.name ? STAGE_CONFIG[currentStage.name]?.label : '等待开始'}
+                {currentStage?.name ? STAGE_CONFIG[stageMapping[currentStage.name] || currentStage.name]?.label : '等待开始'}
               </p>
             </div>
           </div>

@@ -5,14 +5,12 @@ import {
   FileCode,
   FileText,
   ChevronRight,
-  ChevronDown,
   Search,
   RefreshCw,
   FolderOpen,
   File,
   Copy,
   Edit3,
-  Check,
   X,
   Loader2,
   AlertCircle,
@@ -57,7 +55,12 @@ const saveFileContent = async ({ path, content }: { path: string; content: strin
   return apiPost(`/workspace/files/content?path=${encodeURIComponent(path)}`, { content });
 };
 
-const fetchStats = async () => {
+interface WorkspaceStats {
+  total_files: number;
+  total_dirs: number;
+}
+
+const fetchStats = async (): Promise<WorkspaceStats> => {
   return apiGet('/workspace/stats');
 };
 
@@ -148,22 +151,11 @@ export function Workspace() {
   });
 
   // 切换文件夹
-  const toggleFolder = useCallback((path: string) => {
-    setExpandedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }, []);
-
   // 进入文件夹
   const enterFolder = useCallback((folder: FileItem) => {
     if (folder.type === 'folder') {
       setCurrentPath(folder.path);
+      setExpandedFolders((prev) => new Set(prev).add(folder.path));
       setSelectedFile(null);
       setIsEditing(false);
     }

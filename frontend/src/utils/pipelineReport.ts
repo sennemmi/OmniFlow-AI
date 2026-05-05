@@ -4,11 +4,6 @@ import type { Pipeline, PipelineStage } from '@types';
 // Pipeline 报告导出工具 - 生成结构化 Markdown 文档
 // ============================================
 
-interface ReportSection {
-  title: string;
-  content: string;
-}
-
 /**
  * 构建 Pipeline 报告 Markdown 内容
  */
@@ -110,7 +105,7 @@ function buildArchitectSection(outputData?: Record<string, unknown>): string {
   const acceptanceCriteria = outputData.acceptance_criteria as string[] | undefined;
   if (acceptanceCriteria && acceptanceCriteria.length > 0) {
     sections.push('### 2.1 验收标准\n');
-    acceptanceCriteria.forEach((criteria, idx) => {
+    acceptanceCriteria.forEach((criteria) => {
       sections.push(`- [x] ${criteria}`);
     });
     sections.push('');

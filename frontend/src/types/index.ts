@@ -150,12 +150,16 @@ export interface RejectResponse {
 
 // ---------- React Flow 节点类型 ----------
 export interface PipelineNodeData {
+  [key: string]: unknown;
   label: string;
   icon: string;
-  status: PipelineStatus;
+  status: PipelineStatus | StageStatus;
   description?: string;
   stageId: string;
   onClick?: () => void;
+  isClickable?: boolean;
+  isPendingApproval?: boolean;
+  backendStage?: PipelineStage;
 }
 
 // ---------- 导航类型 ----------

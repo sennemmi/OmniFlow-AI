@@ -17,7 +17,7 @@ import {
   Wrench,
   FileCode
 } from 'lucide-react';
-import type { ReviewReport, ReviewIssue } from '@types';
+import type { ReviewReport } from '@types';
 
 // ============================================
 // 代码审查报告面板 - 展示 AI 生成的审查报告
@@ -195,7 +195,6 @@ export function ReviewReportPanel({ report }: ReviewReportPanelProps) {
   };
 
   const RiskIcon = riskLevelConfig[risk_level as keyof typeof riskLevelConfig]?.icon || AlertCircle;
-  const RecIcon = recommendationConfig[approval_recommendation as keyof typeof recommendationConfig]?.icon || Info;
   const riskConfig = riskLevelConfig[risk_level as keyof typeof riskLevelConfig] || riskLevelConfig.low;
   const recConfig = recommendationConfig[approval_recommendation as keyof typeof recommendationConfig] || recommendationConfig.approve;
 
@@ -312,7 +311,7 @@ export function ReviewReportPanel({ report }: ReviewReportPanelProps) {
             )}
           </div>
         ) : (
-          filteredIssues.map((issue, index) => {
+          filteredIssues.map((issue) => {
             const originalIndex = issues.indexOf(issue);
             const isExpanded = expandedIssues.has(originalIndex);
             const severity = severityConfig[issue.severity];
@@ -403,8 +402,8 @@ export function ReviewReportPanel({ report }: ReviewReportPanelProps) {
             改进建议
           </h4>
           <ul className="space-y-2">
-            {improvement_suggestions.map((suggestion, index) => (
-              <li key={index} className="flex items-start gap-2 text-sm text-text-secondary">
+            {improvement_suggestions.map((suggestion) => (
+              <li key={suggestion} className="flex items-start gap-2 text-sm text-text-secondary">
                 <span className="text-brand-primary mt-1">•</span>
                 <span>{suggestion}</span>
               </li>

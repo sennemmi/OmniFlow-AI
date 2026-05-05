@@ -1,11 +1,12 @@
-import { useState, useRef, useMemo, useEffect, useCallback } from 'react';
+import { useState, useRef, useMemo, useEffect } from 'react';
 import { X, CheckCircle2, XCircle, FileText, User, Clock, AlertCircle, Loader2, BarChart3, Download, ShieldCheck } from 'lucide-react';
 import { useQueryClient, useQuery } from '@tanstack/react-query';
 import { usePipelineStore } from '@stores/pipelineStore';
 import { useUIStore } from '@stores/uiStore';
 import { apiPost, apiGet } from '@utils/axios';
-import { getLanguageFromPath, extractTechnicalDesign } from '@utils/formatters';
-import { extractAllCodeChanges, isCodeStage, isTestStage, extractTestCodeChanges } from '@utils/pipelineHelpers';
+import { getLanguageFromPath } from '@utils/formatters';
+import { extractAllCodeChanges, extractTestCodeChanges } from '@utils/pipelineHelpers';
+import { formatMetricDuration, getStageMetrics } from '@utils/pipelineMetrics';
 import { DiffViewer } from './DiffViewer';
 import { TestCaseEditor } from './TestCaseEditor';
 import { RequirementPanel } from './RequirementPanel';
@@ -32,7 +33,6 @@ export function ApproveDrawer() {
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [showDiff, setShowDiff] = useState(true);
   const [selectedFileIndex, setSelectedFileIndex] = useState(0);
   const [selectedTestFileIndex, setSelectedTestFileIndex] = useState(0);
   const [showTimeoutWarning, setShowTimeoutWarning] = useState(false);
@@ -93,11 +93,9 @@ export function ApproveDrawer() {
   }, [selectedPipeline]);
 
   // 判断是否是代码阶段（包括 CODE_REVIEW）
-  const codeStage = isCodeStage(liveSelectedStage);
-  const testStage = isTestStage(liveSelectedStage);
-
   // 判断是否处于 CODE_REVIEW 审批阶段
   const isCodeReviewStage = selectedPipeline?.current_stage === 'CODE_REVIEW';
+  const showUnifiedApproval = isCodeReviewStage;
 
   // 使用 diff 接口获取完整代码数据（解决 API 截断问题）
   const { data: diffData } = useQuery({
@@ -187,8 +185,6 @@ export function ApproveDrawer() {
   if (!isApproveDrawerOpen || !selectedStage) return null;
 
   // 提取技术设计文档
-  const technicalDesignContent = extractTechnicalDesign(selectedStage);
-
   // 【新流程】处理统一审批
   const handleUnifiedApprove = async () => {
     if (!coderDecision || !testerDecision) {
@@ -472,8 +468,6 @@ export function ApproveDrawer() {
   }, [isApproveDrawerOpen, showUnifiedApproval, coderDecision, testerDecision, feedback, selectedPipeline]);
 
   // 判断是否显示统一审批 UI（CODE_REVIEW 阶段）
-  const showUnifiedApproval = isCodeReviewStage;
-
   return (
     <>
       {/* 遮罩层 */}
@@ -819,7 +813,7 @@ export function ApproveDrawer() {
                           // 触发刷新
                           queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
                         }}
-                        onTestRun={(success, result) => {
+                        onTestRun={(success) => {
                           // 更新测试结果状态
                           addToast({
                             type: success ? 'success' : 'warning',
@@ -910,11 +904,11 @@ export function ApproveDrawer() {
 
               {/* 【阶段特定内容】根据阶段名称渲染不同面板 */}
               {selectedStage?.name === 'REQUIREMENT' && (
-                <RequirementPanel outputData={selectedStage.output_data as Record<string, unknown> | undefined} />
+                <RequirementPanel outputData={(liveSelectedStage ?? selectedStage).output_data as Record<string, unknown> | undefined} />
               )}
 
               {selectedStage?.name === 'DESIGN' && (
-                <DesignPanel outputData={selectedStage.output_data as Record<string, unknown> | undefined} />
+                <DesignPanel outputData={(liveSelectedStage ?? selectedStage).output_data as Record<string, unknown> | undefined} />
               )}
 
               {(selectedStage?.name === 'CODING' || selectedStage?.name === 'CODE_REVIEW') && (
@@ -931,7 +925,7 @@ export function ApproveDrawer() {
               )}
 
               {selectedStage?.name === 'DELIVERY' && (
-                <DeliveryPanel outputData={selectedStage.output_data as Record<string, unknown> | undefined} />
+                <DeliveryPanel outputData={(liveSelectedStage ?? selectedStage).output_data as Record<string, unknown> | undefined} />
               )}
 
               {/* 审批意见 */}
@@ -1057,5 +1051,35 @@ export function ApproveDrawer() {
         </div>
       </div>
     </>
+  );
+}
+
+function MetricsPanel({ stage }: { stage: PipelineStage }) {
+  const metrics = getStageMetrics(stage);
+
+  const items = [
+    { label: 'Input tokens', value: metrics.inputTokens.toLocaleString() },
+    { label: 'Output tokens', value: metrics.outputTokens.toLocaleString() },
+    { label: 'Duration', value: formatMetricDuration(metrics.durationMs) },
+    { label: 'Retries', value: metrics.retryCount.toLocaleString() },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      {items.map((item) => (
+        <div key={item.label} className="p-3 bg-bg-secondary rounded-lg border border-border-default">
+          <div className="text-xs text-text-tertiary">{item.label}</div>
+          <div className="mt-1 text-sm font-semibold text-text-primary">{item.value}</div>
+        </div>
+      ))}
+      {metrics.reasoning && (
+        <div className="col-span-2 p-3 bg-bg-secondary rounded-lg border border-border-default">
+          <div className="text-xs text-text-tertiary mb-1">Reasoning</div>
+          <p className="text-xs text-text-secondary whitespace-pre-wrap max-h-24 overflow-y-auto">
+            {metrics.reasoning}
+          </p>
+        </div>
+      )}
+    </div>
   );
 }
