@@ -70,7 +70,12 @@ def get_language_by_extension(filename: str) -> Optional[str]:
     return language_map.get(ext)
 
 
-@router.get("/files", response_model=FileListResponse)
+@router.get(
+    "/files",
+    response_model=FileListResponse,
+    summary="获取文件树",
+    description="获取指定目录下的文件和文件夹列表，支持扁平化展示"
+)
 async def get_file_tree(
     path: str = Query("", description="相对路径，默认为根目录")
 ):
@@ -138,7 +143,12 @@ async def get_file_tree(
         return FileListResponse(success=False, data=[], error=str(e))
 
 
-@router.get("/files/content", response_model=FileContentResponse)
+@router.get(
+    "/files/content",
+    response_model=FileContentResponse,
+    summary="获取文件内容",
+    description="读取指定文件的完整内容，支持语法高亮语言检测"
+)
 async def get_file_content(
     path: str = Query(..., description="文件相对路径（相对于项目根目录）")
 ):
@@ -218,7 +228,12 @@ async def get_file_content(
         return FileContentResponse(success=False, data={}, error=str(e))
 
 
-@router.post("/files/content", response_model=FileContentResponse)
+@router.post(
+    "/files/content",
+    response_model=FileContentResponse,
+    summary="保存文件内容",
+    description="保存文件内容到指定路径，自动创建父目录"
+)
 async def save_file_content(
     path: str = Query(..., description="文件相对路径"),
     request: SaveFileRequest = None
@@ -259,7 +274,11 @@ async def save_file_content(
         return FileContentResponse(success=False, data={}, error=str(e))
 
 
-@router.get("/stats")
+@router.get(
+    "/stats",
+    summary="获取工作区统计",
+    description="获取工作区的文件和目录统计信息"
+)
 async def get_workspace_stats():
     """获取工作区统计信息"""
     try:

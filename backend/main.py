@@ -179,6 +179,15 @@ app = FastAPI(
     * **状态查询**: 实时监控 Pipeline 运行状态
     * **审批管理**: 支持 Pipeline 的审批和驳回操作
     * **系统监控**: 实时查看服务器 CPU 和内存使用情况
+    * **代码修改**: 轻量级代码修改和批量修改
+    * **文件管理**: 工作区文件浏览和编辑
+
+    ## API 分类
+    * **pipeline**: Pipeline 生命周期管理 API
+    * **system**: 系统监控和健康检查 API
+    * **workspace**: 工作区文件管理 API
+    * **code_modify**: 轻量级代码修改 API
+    * **code_modify_batch**: 批量代码修改 API
 
     ## 统一响应格式
     所有 API 返回统一的响应格式：
@@ -190,11 +199,18 @@ app = FastAPI(
         "request_id": "uuid-string"
     }
     ```
+
+    ## 认证
+    当前版本 API 无需认证，后续版本将添加 API Key 认证机制。
     """,
     version="0.1.2",
     contact={
         "name": "OmniFlowAI Team",
         "url": "https://github.com/sennemmi/feishutemp",
+    },
+    license_info={
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT",
     },
     lifespan=lifespan,
 )
