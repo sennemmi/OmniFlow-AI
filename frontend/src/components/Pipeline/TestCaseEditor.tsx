@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import { Edit3, Play, X, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
 import { apiPost } from '@utils/axios';
 import { useUIStore } from '@stores/uiStore';
+import { UserDecisionPanel } from './UserDecisionPanel';
 
 // ============================================
 // 测试用例编辑器 - 允许人工修改 AI 生成的测试代码
@@ -19,6 +20,9 @@ interface TestCaseEditorProps {
 interface OverrideTestResult {
   test_run_success: boolean;
   message?: string;
+  logs?: string;
+  summary?: string;
+  failed_tests?: string[];
   layers?: Array<{ layer: string; passed: boolean; summary: string }>;
 }
 
@@ -214,7 +218,7 @@ export function TestCaseEditor({
               <h4 className={`text-sm font-medium ${
                 lastResult.success ? 'text-status-success' : 'text-status-warning'
               }`}>
-                {lastResult.success ? '✅ 测试全部通过' : '⚠️ 测试未通过'}
+                {lastResult.success ? '✅ 测试通过' : '⚠️ 测试未通过'}
               </h4>
               <p className="text-xs text-text-secondary mt-1">{lastResult.message}</p>
 
@@ -244,6 +248,16 @@ export function TestCaseEditor({
             </div>
           </div>
         </div>
+      )}
+
+      {/* 【新增】测试失败时显示用户决策选项 */}
+      {lastResult && !lastResult.success && (
+        <UserDecisionPanel
+          pipelineId={pipelineId}
+          title="用户修改的测试未通过"
+          message="您修改的测试用例未能通过测试，您可以选择以下操作："
+          suggestion="建议检查测试逻辑是否正确，或选择其他操作"
+        />
       )}
     </div>
   );

@@ -65,31 +65,14 @@ def read_files_with_size_limit(
 def extract_file_paths(file_list: List[Dict]) -> List[str]:
     """
     从文件列表中提取文件路径
-    
+
     Args:
         file_list: 文件信息列表，每个元素包含 "file_path" 键
-        
+
     Returns:
         文件路径列表
     """
     return [f.get("file_path", "") for f in file_list if f.get("file_path")]
-
-
-def merge_files_content(
-    code_files: List[Dict],
-    test_files: List[Dict]
-) -> List[Dict]:
-    """
-    合并代码文件和测试文件列表
-    
-    Args:
-        code_files: 代码文件列表
-        test_files: 测试文件列表
-        
-    Returns:
-        合并后的文件列表
-    """
-    return code_files + test_files
 
 
 def normalize_file_path(

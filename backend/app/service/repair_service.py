@@ -98,14 +98,14 @@ class RepairService:
                 "error": Optional[str],
             }
         """
-        def log(level: str, message: str):
+        async def log(level: str, message: str):
             if log_callback:
                 log_callback(level, message)
             else:
                 getattr(logger, level.lower(), logger.info)(message)
-            push_log(pipeline_id, level.lower(), message, stage="REPAIR")
+            await push_log(pipeline_id, level.lower(), message, stage="REPAIR")
 
-        log("info", "🔧 启动智能修复循环...")
+        await log("info", "🔧 启动智能修复循环...")
 
         # 初始化 FixLoopState
         state = FixLoopState(
@@ -116,16 +116,16 @@ class RepairService:
 
         # 提取失败的测试
         failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
-        log("info", f"📋 发现 {len(failed_tests)} 个失败测试")
+        await log("info", f"📋 发现 {len(failed_tests)} 个失败测试")
 
         while state.attempt < state.max_retries:
             state.attempt += 1
-            log("info", f"🔄 第 {state.attempt}/{state.max_retries} 次修复尝试")
+            await log("info", f"🔄 第 {state.attempt}/{state.max_retries} 次修复尝试")
 
             # 分析错误类型
             error_analysis = self._analyze_errors(test_logs, failed_tests)
             fix_type = determine_fix_type(error_analysis)
-            log("info", f"🎯 检测到错误类型: {fix_type}")
+            await log("info", f"🎯 检测到错误类型: {fix_type}")
 
             # 构建增强的设计输出
             enhanced_design = build_enhanced_design_output(
@@ -141,7 +141,7 @@ class RepairService:
             # 根据错误类型选择修复策略
             if fix_type in ["syntax", "import"]:
                 # 使用 execute_fix_by_type 修复语法/导入错误
-                log("info", f"🔧 使用自动修复策略: {fix_type}")
+                await log("info", f"🔧 使用自动修复策略: {fix_type}")
                 result = await execute_fix_by_type(
                     fix_type=fix_type,
                     state=state,
@@ -162,7 +162,7 @@ class RepairService:
             elif fix_type == "type":
                 # 类型错误修复
                 type_errors = error_analysis.get("type_errors", [])
-                log("info", f"🔧 修复类型错误: {len(type_errors)} 个")
+                await log("info", f"🔧 修复类型错误: {len(type_errors)} 个")
                 fix_success = await self._fix_type_errors(
                     pipeline_id=pipeline_id,
                     type_errors=type_errors,
@@ -174,7 +174,7 @@ class RepairService:
 
             else:
                 # 其他错误，使用 RepairerAgentWithTools
-                log("info", "🎯 路由到 RepairerAgent")
+                await log("info", "🎯 路由到 RepairerAgent")
 
                 missing = self._extract_missing_symbols(test_logs)
                 repair_result = await self._run_repair_with_fix_order(
@@ -206,13 +206,13 @@ class RepairService:
             )
 
             if not fix_success:
-                log("warning", f"❌ 本轮修复失败: {fix_message}")
+                await log("warning", f"❌ 本轮修复失败: {fix_message}")
                 break
 
-            log("success", f"✅ 本轮修复成功: {fix_message}")
+            await log("success", f"✅ 本轮修复成功: {fix_message}")
 
             # 重新运行测试验证修复
-            log("info", "🔄 重新运行测试验证修复...")
+            await log("info", "🔄 重新运行测试验证修复...")
             from app.utils.test_execution import run_pytest_in_sandbox
 
             # 从 test_files 构建测试路径（与 RepairerAgent 保持一致）
@@ -234,7 +234,7 @@ class RepairService:
             else:
                 test_path_str = "backend/tests/ai_generated"
 
-            log("info", f"🧪 运行测试: {test_path_str}")
+            await log("info", f"🧪 运行测试: {test_path_str}")
 
             test_result = await run_pytest_in_sandbox(
                 pipeline_id=pipeline_id,
@@ -243,7 +243,7 @@ class RepairService:
             )
 
             if test_result.get("success"):
-                log("success", "📊 修复后测试通过！")
+                await log("success", "📊 修复后测试通过！")
                 return {
                     "success": True,
                     "repair_rounds": state.attempt,
@@ -252,14 +252,14 @@ class RepairService:
                     "fix_history": state.fix_history,
                 }
             else:
-                log("warning", "📊 修复后测试仍有失败，继续下一轮...")
+                await log("warning", "📊 修复后测试仍有失败，继续下一轮...")
 
             # 更新测试日志和失败测试列表
             test_logs = test_result.get("logs", "")
             failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
 
         # 达到最大重试次数
-        log("error", f"🚨 已达到最大重试次数 ({state.max_retries})")
+        await log("error", f"🚨 已达到最大重试次数 ({state.max_retries})")
 
         return {
             "success": False,

@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.core.database import get_session, async_session_factory
 from app.core.response import ResponseModel, success_response, error_response
 from app.core.sse_log_buffer import get_or_create_buffer, remove_buffer
-from app.core.logging import error, info
+from app.core.logging import error, info, warning
 from app.service.pipeline import PipelineService
 
 router = APIRouter()
@@ -263,17 +263,9 @@ async def create_pipeline(
         )
 
         # 【关键修复】确保事务提交，数据持久化到数据库
-        # 这样前端跳转后查询时数据一定存在
         await session.commit()
 
-        # 【关键修复】在事务提交后启动 Docker Sandbox
-        # 避免长时间占用数据库连接导致 SQLite 锁定
-        background_tasks.add_task(
-            PipelineService.start_sandbox_for_pipeline,
-            pipeline_id=pipeline.id
-        )
-
-        # 2. 添加后台任务运行 ArchitectAgent
+        # 2. 添加后台任务运行 ArchitectAgent（内部使用预热池获取 Sandbox）
         background_tasks.add_task(
             PipelineService._run_architect_task_background,
             pipeline_id=pipeline.id,
@@ -417,6 +409,18 @@ async def get_pipeline_status(
             except ValueError:
                 current_stage_index = 0
         
+        # 【新增】检查容器状态（如果 Pipeline 正在运行）
+        container_status = "not_required"
+        if pipeline.status.value in ["running", "paused"]:
+            from app.service.sandbox_manager import sandbox_manager
+            sandbox_info = sandbox_manager.get_info(pipeline_id)
+            if sandbox_info:
+                container_status = "running"
+            else:
+                container_status = "missing"
+                # 容器丢失，添加警告信息
+                warning(f"Pipeline {pipeline_id} 的容器已丢失", pipeline_id=pipeline_id)
+
         # 构建基础响应数据
         response_data = {
             "id": pipeline.id,
@@ -426,7 +430,8 @@ async def get_pipeline_status(
             "current_stage_index": current_stage_index,
             "created_at": pipeline.created_at.isoformat() if pipeline.created_at else None,
             "updated_at": pipeline.updated_at.isoformat() if pipeline.updated_at else None,
-            "stages": stages_data
+            "stages": stages_data,
+            "container_status": container_status  # 【新增】容器状态
         }
         
         # 如果 Pipeline 已完成 (SUCCESS)，添加交付物摘要
@@ -551,10 +556,10 @@ async def list_pipelines(
 )
 async def approve_pipeline(
     request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
     pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
-    data: PipelineApproveRequest = None,
-    background_tasks: BackgroundTasks = None,
-    session: AsyncSession = Depends(get_session)
+    data: PipelineApproveRequest = None
 ):
     """
     审批 Pipeline，允许进入下一阶段
@@ -667,10 +672,10 @@ async def reject_pipeline(
 )
 async def approve_code_review(
     request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
     pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
-    data: dict = None,
-    background_tasks: BackgroundTasks = None,
-    session: AsyncSession = Depends(get_session)
+    data: dict = None
 ):
     """
     审批 CODE_REVIEW 阶段，支持分别审批 CODER 和 TESTER
@@ -730,10 +735,10 @@ async def approve_code_review(
 )
 async def terminate_pipeline(
     request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
     pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
-    data: PipelineTerminateRequest = None,
-    background_tasks: BackgroundTasks = None,
-    session: AsyncSession = Depends(get_session)
+    data: PipelineTerminateRequest = None
 ):
     """
     终止 Pipeline（用户手动终止）
@@ -1003,9 +1008,9 @@ async def handle_test_decision(
 )
 async def retry_pipeline(
     request: Request,
-    pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
-    background_tasks: BackgroundTasks = None,
-    session: AsyncSession = Depends(get_session)
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1)
 ):
     """
     重试失败的 Pipeline
@@ -1084,10 +1089,10 @@ class OverrideTestResponse(BaseModel):
 )
 async def override_test_code(
     request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
     pipeline_id: int = Path(..., description="Pipeline ID", ge=1),
-    data: OverrideTestRequest = None,
-    background_tasks: BackgroundTasks = None,
-    session: AsyncSession = Depends(get_session)
+    data: OverrideTestRequest = None
 ):
     """
     人工覆盖测试代码并重跑测试
@@ -1132,5 +1137,71 @@ async def override_test_code(
         error("覆盖测试代码失败", pipeline_id=pipeline_id, exc_info=True)
         return error_response(
             error=f"Failed to override test: {str(e)}",
+            request_id=request_id
+        )
+
+
+class PipelineDeleteResponse(BaseModel):
+    """Pipeline 删除响应数据"""
+    pipeline_id: int = Field(..., description="Pipeline ID")
+    action: str = Field(..., description="操作类型: delete")
+    message: str = Field(..., description="操作结果消息")
+
+
+@router.delete(
+    "/pipeline/{pipeline_id}",
+    response_model=ResponseModel,
+    summary="删除 Pipeline",
+    description="""
+    删除 Pipeline 及其关联的所有数据。
+
+    删除内容包括：
+    - Pipeline 基本信息
+    - 所有 Stage 阶段数据
+    - 关联的 Sandbox 容器（如果存在）
+    - 日志缓冲区
+
+    注意：此操作不可恢复，请谨慎使用。
+    """,
+    response_description="删除结果"
+)
+async def delete_pipeline(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+    pipeline_id: int = Path(..., description="Pipeline ID", ge=1)
+):
+    """
+    删除 Pipeline
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        result = await PipelineService.delete_pipeline(
+            pipeline_id=pipeline_id,
+            session=session,
+            background_tasks=background_tasks
+        )
+
+        if not result["success"]:
+            return error_response(
+                error=result.get("error", "Pipeline delete failed"),
+                request_id=request_id
+            )
+
+        response_data = PipelineDeleteResponse(
+            pipeline_id=pipeline_id,
+            action="delete",
+            message=result["data"].get("message", "Pipeline deleted successfully")
+        )
+
+        return success_response(
+            data=response_data.model_dump(),
+            request_id=request_id
+        )
+    except Exception as e:
+        error("删除 Pipeline 失败", pipeline_id=pipeline_id, exc_info=True)
+        return error_response(
+            error=f"Failed to delete pipeline: {str(e)}",
             request_id=request_id
         )

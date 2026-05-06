@@ -59,6 +59,13 @@ class ToolUsingAgent(LangGraphAgent[T]):
         if "repair" in self.agent_name.lower():
             agent_role = "repairer"
 
+        logger.info(
+            f"[{self.agent_name}] _get_agent_tools: agent_name={self.agent_name!r}, "
+            f"agent_role={agent_role!r}, "
+            f"cached_role={self._agent_tools._agent_role if self._agent_tools else None!r}, "
+            f"will_recreate={self._agent_tools is None or self._agent_tools.project_path != project_path or self._agent_tools._pipeline_id != pipeline_id or (self._agent_tools._agent_role != agent_role)}"
+        )
+
         if (self._agent_tools is None or
             self._agent_tools.project_path != project_path or
             self._agent_tools._pipeline_id != pipeline_id or
@@ -69,6 +76,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 pipeline_id=pipeline_id,
                 agent_role=agent_role
             )
+            logger.info(f"[{self.agent_name}] AgentTools 已重新创建, agent_role={agent_role!r}")
         return self._agent_tools
 
     async def _call_llm_with_tools(

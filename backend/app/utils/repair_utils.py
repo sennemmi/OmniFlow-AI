@@ -138,52 +138,7 @@ def build_fix_order(
     }
 
 
-def collect_target_files(
-    all_generated_files: List[Dict],
-    file_service: SandboxFileService,
-    errors_list: Optional[List[Dict]] = None
-) -> Dict[str, str]:
-    """
-    收集目标文件的完整内容
-
-    Args:
-        all_generated_files: 所有生成的文件列表
-        file_service: 文件服务
-        errors_list: 错误列表（用于收集涉及的文件）
-
-    Returns:
-        文件路径到内容的字典
-    """
-    target_files = {}
-
-    # 从 all_generated_files 中提取文件内容
-    for file_info in all_generated_files:
-        file_path = file_info.get("file_path", "")
-        content = file_info.get("content", "")
-        if file_path and content:
-            clean_path = clean_backend_prefix(file_path)
-            target_files[clean_path] = content
-
-    # 从沙箱读取最新内容（覆盖旧内容）
-    files_to_read = set()
-    for file_info in all_generated_files:
-        fp = file_info.get("file_path", "")
-        if fp:
-            clean_fp = clean_backend_prefix(fp)
-            files_to_read.add(clean_fp)
-
-    # 添加错误列表中涉及的文件
-    if errors_list:
-        for err in errors_list:
-            fp = err.get("file_path", "")
-            if fp:
-                clean_fp = clean_backend_prefix(fp)
-                files_to_read.add(clean_fp)
-
-    return target_files
-
-
-async def collect_target_files_async(
+async def collect_target_files(
     all_generated_files: List[Dict],
     file_service: SandboxFileService,
     errors_list: Optional[List[Dict]] = None

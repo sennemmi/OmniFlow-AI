@@ -51,7 +51,11 @@ class AgentToolsCore:
 
         try:
             # project_path (backend) 挂载到 /workspace，所以直接使用 /workspace
-            clean_pattern = pattern.replace('backend/', '').replace('backend\\', '').lstrip('/')
+            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            clean_pattern = pattern
+            while clean_pattern.startswith('backend/') or clean_pattern.startswith('backend\\'):
+                clean_pattern = clean_pattern.replace('backend/', '', 1).replace('backend\\', '', 1)
+            clean_pattern = clean_pattern.lstrip('/')
             WORKSPACE_ROOT = '/workspace'
 
             # 【修复】使用更可靠的查找策略
@@ -160,8 +164,12 @@ class AgentToolsCore:
         from app.service.sandbox_manager import sandbox_manager
 
         try:
-            clean_path = path.replace('backend/', '').replace('backend\\', '').lstrip('/') if path else ''
-            
+            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            clean_path = path
+            while clean_path.startswith('backend/') or clean_path.startswith('backend\\'):
+                clean_path = clean_path.replace('backend/', '', 1).replace('backend\\', '', 1)
+            clean_path = clean_path.lstrip('/')
+
             # 【优化】限制搜索范围，避免全盘扫描
             if clean_path:
                 # 有特定路径，使用该路径
@@ -266,7 +274,11 @@ class AgentToolsCore:
         try:
             MAX_LINES_PER_READ = 100
             auto_limited = False
-            clean_path = file_path.replace('backend/', '').replace('backend\\', '').lstrip('/')
+            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            clean_path = file_path
+            while clean_path.startswith('backend/') or clean_path.startswith('backend\\'):
+                clean_path = clean_path.replace('backend/', '', 1).replace('backend\\', '', 1)
+            clean_path = clean_path.lstrip('/')
 
             if self._sandbox_mode and self._file_service:
                 content, read_token = self._read_file_sandbox(clean_path, file_path)
@@ -370,7 +382,11 @@ class AgentToolsCore:
         pipeline_id: Optional[int] = None
     ) -> str:
         try:
-            clean_path = file_path.replace('backend/', '').replace('backend\\', '').lstrip('/')
+            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            clean_path = file_path
+            while clean_path.startswith('backend/') or clean_path.startswith('backend\\'):
+                clean_path = clean_path.replace('backend/', '', 1).replace('backend\\', '', 1)
+            clean_path = clean_path.lstrip('/')
             cached = self._file_cache.get(file_path)
             if not cached or cached.get("read_token") != read_token:
                 error_msg = "无效的 read_token：文件可能已被修改，请先重新读取文件"

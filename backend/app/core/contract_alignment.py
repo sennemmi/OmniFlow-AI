@@ -11,6 +11,31 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def ensure_main_py_in_affected_files(
+    architect_output: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    当 affected_files 包含 api/v1/ 下的新文件时，
+    强制将 main.py 也加入 affected_files
+    """
+    affected = architect_output.get("affected_files", [])
+    has_new_api = any("api/v1/" in f for f in affected)
+    has_main = any("main.py" in f for f in affected)
+
+    if has_new_api and not has_main:
+        affected.append("backend/main.py")
+        architect_output["affected_files"] = affected
+        # 同时在 technical_design 里追加提示
+        architect_output["technical_design"] = (
+            architect_output.get("technical_design", "") +
+            "\n\n【强制要求】新增 API 路由文件后，必须在 backend/main.py 中"
+            "使用 include_router() 注册该路由，否则路由不生效。"
+        )
+        logger.info("[ContractAlignment] 检测到新增 API 文件，自动将 main.py 加入 affected_files")
+
+    return architect_output
+
+
 class ContractMisalignmentError(Exception):
     """契约对齐错误"""
     

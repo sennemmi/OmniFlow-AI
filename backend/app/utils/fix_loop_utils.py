@@ -51,8 +51,15 @@ class ErrorContextBuilder:
         focused_files = []
 
         for error in syntax_errors:
-            file_path = getattr(error, 'file', None) or error.get('file', '')
-            line_no = getattr(error, 'line', None) or error.get('line', 0)
+            # ErrorInfo 对象直接访问属性，字典使用 .get()
+            if hasattr(error, 'to_dict'):
+                # ErrorInfo 对象
+                file_path = getattr(error, 'file', '')
+                line_no = getattr(error, 'line', 0)
+            else:
+                # 字典类型
+                file_path = error.get('file', '')
+                line_no = error.get('line', 0)
 
             if not file_path:
                 continue
@@ -91,7 +98,11 @@ class ErrorContextBuilder:
         relevant_modules = set()
 
         for error in import_errors:
-            error_msg = getattr(error, 'message', None) or error.get('message', '')
+            # ErrorInfo 对象直接访问属性，字典使用 .get()
+            if hasattr(error, 'to_dict'):
+                error_msg = getattr(error, 'message', '')
+            else:
+                error_msg = error.get('message', '')
 
             # 提取导入的模块名（如 "from app.models.health import HealthStatus"）
             import_matches = re.findall(r'from\s+([\w.]+)\s+import', error_msg)
@@ -272,18 +283,13 @@ async def execute_fix_by_type(
         return FixResult(success=fixed, message="导入错误修复完成")
 
     elif fix_type == "repair":
-        # 【AssertionError 策略】当前策略，但过滤掉体积过大的无关文件
-        logger.info("[FixLoop] 使用 Repair 策略：过滤大文件")
-
-        # 构建精简上下文：过滤掉过大的文件
-        focused_context = await context_builder.build_repair_context()
-
-        # Repair 修复需要调用 RepairerAgent
-        return FixResult(
-            success=False,
-            message="Repair 类型需要调用方处理",
-            new_code_files=focused_context,
-            new_test_files=state.test_files
+        # 【说明】repair 类型不应由 execute_fix_by_type 处理
+        # 调用方（repair_service.py）会直接调用 _run_repair_with_fix_order
+        # 如果执行到这里，说明调用逻辑有误
+        logger.error("[FixLoop] repair 类型不应调用 execute_fix_by_type，请检查调用逻辑")
+        raise ValueError(
+            "repair 类型修复不应通过 execute_fix_by_type 处理，"
+            "请直接调用 RepairerAgentWithTools"
         )
 
     else:

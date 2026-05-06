@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Plus,
   Search,
@@ -20,8 +20,9 @@ import {
   Edit3,
   Pause,
 } from 'lucide-react';
-import { apiGet } from '@utils/axios';
+import { apiGet, apiDelete } from '@utils/axios';
 import { CreatePipelineModal } from '@components/Console/CreatePipelineModal';
+import { useUIStore } from '@stores/uiStore';
 import type { PipelineListItem, PipelineListResponse } from '@types';
 
 // ============================================
@@ -34,7 +35,9 @@ type SortOrder = 'asc' | 'desc';
 
 export function Pipelines() {
   const navigate = useNavigate();
-  
+  const { addToast } = useUIStore();
+  const queryClient = useQueryClient();
+
   // 状态管理
   const [viewMode, setViewMode] = useState<ViewMode>('list');
   const [searchQuery, setSearchQuery] = useState('');
@@ -43,12 +46,72 @@ export function Pipelines() {
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
 
   // 获取流水线列表
   const { data: pipelinesData, isLoading, refetch } = useQuery<PipelineListResponse>({
     queryKey: ['pipelines'],
     queryFn: () => apiGet('/pipelines'),
   });
+
+  // 【新增】删除 Pipeline
+  const handleDelete = async (id: number, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+
+    if (!confirm(`确定要删除流水线 #${id} 吗？此操作不可恢复。`)) {
+      return;
+    }
+
+    setDeletingId(id);
+    try {
+      console.log(`[DEBUG] 开始删除 Pipeline ${id}`);
+      const response = await apiDelete(`/pipeline/${id}`);
+      console.log(`[DEBUG] 删除响应:`, response);
+      
+      if (response.success) {
+        addToast({ message: `流水线 #${id} 已删除`, type: 'success' });
+        
+        // 【关键修复】使用乐观更新，立即从缓存中移除该 Pipeline
+        const currentData = queryClient.getQueryData(['pipelines']);
+        console.log(`[DEBUG] 当前缓存数据:`, currentData);
+        
+        queryClient.setQueryData(['pipelines'], (oldData: PipelineListResponse | undefined) => {
+          console.log(`[DEBUG] setQueryData 回调, oldData:`, oldData);
+          if (!oldData) return oldData;
+          const newData = {
+            ...oldData,
+            pipelines: oldData.pipelines.filter((p) => {
+              console.log(`[DEBUG] 比较 p.id=${p.id} (${typeof p.id}) vs id=${id} (${typeof id}), 结果:`, p.id !== id);
+              return p.id !== id;
+            }),
+          };
+          console.log(`[DEBUG] 新数据:`, newData);
+          return newData;
+        });
+        
+        // 验证更新后的数据
+        const updatedData = queryClient.getQueryData(['pipelines']);
+        console.log(`[DEBUG] 更新后的缓存数据:`, updatedData);
+        
+        // 从选中项中移除
+        setSelectedItems((prev) => {
+          const newSet = new Set(prev);
+          newSet.delete(String(id));
+          return newSet;
+        });
+        
+        // 后台重新获取最新数据
+        queryClient.invalidateQueries({ queryKey: ['pipelines'] });
+      } else {
+        addToast({ message: response.error || '删除失败', type: 'error' });
+      }
+    } catch (error) {
+      console.error(`[DEBUG] 删除失败:`, error);
+      addToast({ message: '删除请求失败', type: 'error' });
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const pipelines = pipelinesData?.pipelines || [];
 
@@ -330,12 +393,16 @@ export function Pipelines() {
             sortOrder={sortOrder}
             statusConfig={statusConfig}
             onNavigate={navigate}
+            onDelete={handleDelete}
+            deletingId={deletingId}
           />
         ) : (
           <GridView
             pipelines={filteredPipelines}
             statusConfig={statusConfig}
             onNavigate={navigate}
+            onDelete={handleDelete}
+            deletingId={deletingId}
           />
         )}
       </div>
@@ -427,6 +494,8 @@ interface ListViewProps {
   sortOrder: SortOrder;
   statusConfig: Record<string, any>;
   onNavigate: (path: string) => void;
+  onDelete: (id: number, e?: React.MouseEvent) => void;
+  deletingId: number | null;
 }
 
 function ListView({
@@ -439,6 +508,8 @@ function ListView({
   sortOrder,
   statusConfig,
   onNavigate,
+  onDelete,
+  deletingId,
 }: ListViewProps) {
   const allSelected = selectedItems.size === pipelines.length && pipelines.length > 0;
 
@@ -577,6 +648,14 @@ function ListView({
                   查看
                   <ArrowUpRight className="w-4 h-4" />
                 </button>
+                <button
+                  onClick={(e) => onDelete(pipeline.id as unknown as number, e)}
+                  disabled={deletingId === pipeline.id}
+                  className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all disabled:opacity-50"
+                  title="删除"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
               </div>
             </div>
           );
@@ -593,7 +672,7 @@ interface GridViewProps {
   onNavigate: (path: string) => void;
 }
 
-function GridView({ pipelines, statusConfig, onNavigate }: GridViewProps) {
+function GridView({ pipelines, statusConfig, onNavigate, onDelete, deletingId }: GridViewProps & { onDelete: (id: number, e?: React.MouseEvent) => void; deletingId: number | null }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {pipelines.map((pipeline) => {
@@ -652,10 +731,22 @@ function GridView({ pipelines, statusConfig, onNavigate }: GridViewProps) {
                 </span>
               </div>
               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all">
-                  <Edit3 className="w-4 h-4" />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onNavigate(`/console/pipelines/${pipeline.id}`);
+                  }}
+                  className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
+                  title="查看"
+                >
+                  <ArrowUpRight className="w-4 h-4" />
                 </button>
-                <button className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all">
+                <button
+                  onClick={(e) => onDelete(pipeline.id as unknown as number, e)}
+                  disabled={deletingId === pipeline.id}
+                  className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all disabled:opacity-50"
+                  title="删除"
+                >
                   <Trash2 className="w-4 h-4" />
                 </button>
               </div>

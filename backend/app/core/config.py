@@ -39,13 +39,11 @@ class Config(BaseSettings):
     # ============================================
 
     # LLM Provider 选择
-    # 可选值: modelscope | openai | mimo
-    LLM_PROVIDER: str = "modelscope"
+    # 可选值: openai | mimo | deepseek
+    LLM_PROVIDER: str = "deepseek"
 
-    # ModelScope (魔搭) 配置
-    MODELSCOPE_API_KEY: Optional[str] = None
-    MODELSCOPE_API_BASE: str = "https://api-inference.modelscope.cn/v1"
-    DEFAULT_MODEL: str = "Qwen/Qwen2.5-72B-Instruct"
+    # 默认模型配置
+    DEFAULT_MODEL: str = "deepseek-chat"
 
     # OpenAI 配置
     OPENAI_API_KEY: Optional[str] = None
@@ -55,6 +53,11 @@ class Config(BaseSettings):
     MIMO_API_KEY: Optional[str] = None
     MIMO_API_BASE: str = "https://api.xiaomimimo.com/v1"
     MIMO_DEFAULT_MODEL: str = "mimo-v2.5-pro"
+
+    # DeepSeek 配置
+    DEEPSEEK_API_KEY: Optional[str] = None
+    DEEPSEEK_API_BASE: str = "https://api.deepseek.com/v1"
+    DEEPSEEK_DEFAULT_MODEL: str = "deepseek-chat"
 
     # ============================================
     # 计算属性
@@ -68,8 +71,9 @@ class Config(BaseSettings):
             return self.MIMO_API_KEY
         elif provider == "openai":
             return self.OPENAI_API_KEY
-        else:
-            return self.MODELSCOPE_API_KEY
+        elif provider == "deepseek":
+            return self.DEEPSEEK_API_KEY
+        return None
 
     @property
     def llm_api_base(self) -> str:
@@ -79,8 +83,9 @@ class Config(BaseSettings):
             return self.MIMO_API_BASE
         elif provider == "openai":
             return self.OPENAI_API_BASE
-        else:
-            return self.MODELSCOPE_API_BASE
+        elif provider == "deepseek":
+            return self.DEEPSEEK_API_BASE
+        return ""
 
     @property
     def llm_model(self) -> str:
@@ -88,6 +93,8 @@ class Config(BaseSettings):
         provider = self.LLM_PROVIDER.lower()
         if provider == "mimo":
             return self.MIMO_DEFAULT_MODEL
+        elif provider == "deepseek":
+            return self.DEEPSEEK_DEFAULT_MODEL
         return self.DEFAULT_MODEL
 
     # ============================================

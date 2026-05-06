@@ -131,6 +131,53 @@ class CodingHandler(StageHandler):
             else:
                 await push_log(pipeline_id, "warning", "⚠️ Linting 检查有警告", stage="CODING")
 
+            # 【新增】契约对齐检查：验证代码是否符合 Designer 的契约
+            from app.core.contract_validator import ContractValidator
+            design_output = context.input_data.get("design_output", {})
+            interface_specs = design_output.get("interface_specs", [])
+
+            if interface_specs and code_files:
+                contract_errors = ContractValidator.validate_code_against_contract(
+                    code_files, interface_specs
+                )
+                if contract_errors:
+                    # 过滤出警告和错误
+                    warnings = [e for e in contract_errors if e.startswith("[警告]")]
+                    errors = [e for e in contract_errors if not e.startswith("[警告]")]
+
+                    if warnings:
+                        for warning in warnings:
+                            await push_log(pipeline_id, "warning", f"⚠️ {warning}", stage="CODING")
+
+                    if errors:
+                        for error in errors:
+                            await push_log(pipeline_id, "error", f"❌ {error}", stage="CODING")
+                        # 契约不一致，返回失败
+                        return StageResult.failure_result(
+                            message=f"代码与契约不一致: {'; '.join(errors)}",
+                            output_data={
+                                "error": "Contract mismatch",
+                                "contract_errors": errors,
+                                "code_files": code_files,
+                            }
+                        )
+
+                await push_log(pipeline_id, "info", "✅ 契约对齐检查通过", stage="CODING")
+
+                # 【新增】验证 router 是否在 main.py 中注册
+                main_py = await file_service.read_file("main.py")
+                if main_py.exists:
+                    router_errors = ContractValidator.validate_router_registration(
+                        main_py.content, interface_specs
+                    )
+                    if router_errors:
+                        for err in router_errors:
+                            await push_log(pipeline_id, "error", f"❌ {err}", stage="CODING")
+                        return StageResult.failure_result(
+                            message=f"路由未注册: {'; '.join(router_errors)}",
+                            output_data={"error": "Router not registered", "router_errors": router_errors}
+                        )
+
             # 【架构优化】记录修改的文件列表，供 DELIVERY 阶段使用
             modified_files = [f.get("file_path", "") for f in code_files if f.get("file_path")]
 

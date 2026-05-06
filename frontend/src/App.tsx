@@ -34,9 +34,6 @@ function App() {
             <Route path="settings" element={<Settings />} />
           </Route>
 
-          {/* 文档页面 */}
-          <Route path="/docs" element={<div className="p-8 text-text-secondary">文档页面开发中...</div>} />
-
           {/* 404 重定向 */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

@@ -127,7 +127,7 @@ class CodeReviewHandler(StageHandler):
 
     async def _generate_review_report(self, context: StageContext) -> dict:
         """
-        调用 CodeReviewerAgent 生成审查报告
+        调用 CodeReviewerAgent 生成审查报告（或复用已有的审查报告）
 
         Args:
             context: 阶段上下文，包含 CODING 和 TESTING 的输出数据
@@ -136,6 +136,34 @@ class CodeReviewHandler(StageHandler):
             dict: 审查报告数据
         """
         try:
+            # 【优化】先检查是否已有审查报告（在 UNIT_TESTING 完成后已生成）
+            from sqlmodel import select
+            from app.models.pipeline import PipelineStage
+
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == context.pipeline_id,
+                PipelineStage.name == StageName.CODE_REVIEW
+            )
+            result = await context.session.execute(statement)
+            review_stage = result.scalar_one_or_none()
+
+            if review_stage and review_stage.output_data and "review_report" in review_stage.output_data:
+                await push_log(
+                    context.pipeline_id,
+                    "info",
+                    "复用已生成的 AI 审查报告",
+                    stage="CODE_REVIEW"
+                )
+                return review_stage.output_data["review_report"]
+
+            # 如果没有，则重新生成
+            await push_log(
+                context.pipeline_id,
+                "info",
+                "未找到已生成的审查报告，重新生成...",
+                stage="CODE_REVIEW"
+            )
+
             # 准备输入数据
             file_changes = context.input_data.get("files", [])
             test_results = context.input_data.get("testing_result", {})
@@ -168,7 +196,7 @@ class CodeReviewHandler(StageHandler):
                 await push_log(
                     context.pipeline_id,
                     "thought",
-                    f"审查报告生成成功: {report.get('overall_assessment', '')[:100]}...",
+                    f"审查报告生成成功：{report.get('overall_assessment', '')[:100]}...",
                     stage="CODE_REVIEW"
                 )
                 return report
@@ -177,17 +205,17 @@ class CodeReviewHandler(StageHandler):
                 await push_log(
                     context.pipeline_id,
                     "warning",
-                    f"审查报告生成失败: {error_msg}",
+                    f"审查报告生成失败：{error_msg}",
                     stage="CODE_REVIEW"
                 )
                 return self._create_fallback_report(error_msg)
 
         except Exception as e:
-            error(f"[Pipeline {context.pipeline_id}] 生成审查报告异常: {e}")
+            error(f"[Pipeline {context.pipeline_id}] 生成审查报告异常：{e}")
             await push_log(
                 context.pipeline_id,
                 "error",
-                f"生成审查报告异常: {str(e)}",
+                f"生成审查报告异常：{str(e)}",
                 stage="CODE_REVIEW"
             )
             return self._create_fallback_report(str(e))
@@ -355,7 +383,7 @@ class CodeReviewHandler(StageHandler):
             return StageResult(
                 success=testing_result.success,
                 status=testing_result.status,
-                message="Coding and unit testing re-executed after rejection",
+                message="Coding and layered testing re-executed after rejection",
                 output_data={
                     "previous_stage": StageName.CODE_REVIEW.value,
                     "current_stage": StageName.UNIT_TESTING.value,

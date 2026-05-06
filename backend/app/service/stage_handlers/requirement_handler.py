@@ -35,17 +35,26 @@ class RequirementHandler(StageHandler):
 
         # 阶段记录在 Pipeline 创建时已经创建，这里获取 stage_id
         from app.repositories import PipelineStageRepository
+        from app.models.pipeline import StageStatus
+
         stage = await PipelineStageRepository.get_by_pipeline_and_name(
             context.pipeline_id, self.stage_name, context.session
         )
 
         if stage:
             context.stage_id = stage.id
+            # 【修复】将 stage 状态更新为 RUNNING，前端才能显示"执行中"
+            stage.status = StageStatus.RUNNING
+            await context.session.commit()
 
         return context
 
     async def execute(self, context: StageContext) -> StageResult:
         """执行需求分析（使用 AgentCoordinatorService）"""
+        import time
+        phase_timings = {}
+        t0 = time.perf_counter()
+
         pipeline_id = context.pipeline_id
         requirement = context.get("requirement", "")
         element_context = context.get("element_context")
@@ -57,11 +66,13 @@ class RequirementHandler(StageHandler):
             project_path = settings.TARGET_PROJECT_PATH
 
             # 构建 ArchitectAgent 上下文
+            t1 = time.perf_counter()
             architect_context = await agent_coordinator_service.build_architect_context(
                 requirement=requirement,
                 element_context=element_context,
                 pipeline_id=pipeline_id
             )
+            phase_timings["build_context"] = int((time.perf_counter() - t1) * 1000)
 
             await push_log(
                 pipeline_id,
@@ -70,13 +81,20 @@ class RequirementHandler(StageHandler):
                 stage="REQUIREMENT"
             )
 
+            # 【关键修复】为 ArchitectAgent 注入 SandboxFileService，确保在沙箱模式下执行
+            from app.service.sandbox_file_service import SandboxFileService
+            file_service = SandboxFileService(pipeline_id)
+            architect_agent.set_file_service(file_service)
+
             # 调用 ArchitectAgent
+            t2 = time.perf_counter()
             arch_result = await architect_agent.analyze(
                 requirement=architect_context["requirement"],
                 element_context=architect_context["element_context"],
                 pipeline_id=pipeline_id,
                 project_path=project_path
             )
+            phase_timings["architect_analyze"] = int((time.perf_counter() - t2) * 1000)
 
             # 保存 Agent 调试信息
             self._save_agent_log(
@@ -104,7 +122,22 @@ class RequirementHandler(StageHandler):
                 f"需求分析完成，验收标准: {acceptance_criteria}",
                 stage="REQUIREMENT"
             )
-            await push_log(pipeline_id, "info", "需求分析完成，等待审批", stage="REQUIREMENT")
+            phase_timings["total"] = int((time.perf_counter() - t0) * 1000)
+            await push_log(
+                pipeline_id,
+                "info",
+                f"需求分析完成，等待审批",
+                stage="REQUIREMENT"
+            )
+
+            # 记录分阶段耗时日志
+            info(
+                "REQUIREMENT 阶段耗时分析",
+                pipeline_id=pipeline_id,
+                build_context_ms=phase_timings.get("build_context", 0),
+                architect_analyze_ms=phase_timings.get("architect_analyze", 0),
+                total_ms=phase_timings.get("total", 0),
+            )
 
             # 返回成功，状态为 PAUSED（等待审批）
             return StageResult.success_result(
@@ -123,7 +156,7 @@ class RequirementHandler(StageHandler):
     async def complete(self, context: StageContext, result: StageResult) -> None:
         """完成阶段：保存 Stage 输出并更新 Pipeline 状态"""
         from sqlmodel import select
-        from app.models.pipeline import PipelineStage
+        from app.models.pipeline import PipelineStage, PipelineStatus
 
         # 【关键修复】保存 Stage 的 output_data
         if context.stage_id:
@@ -133,7 +166,19 @@ class RequirementHandler(StageHandler):
             if stage:
                 stage.output_data = result.output_data
                 from app.core.timezone import now
-                stage.status = StageStatus.SUCCESS if result.success else StageStatus.FAILED
+                # 【修复】正确映射 PipelineStatus 到 StageStatus
+                # StageStatus 没有 paused，当 Pipeline 是 paused 时，Stage 应该是 SUCCESS（等待审批）
+                if result.success:
+                    if result.status == PipelineStatus.PAUSED:
+                        stage.status = StageStatus.SUCCESS  # 阶段执行成功，等待审批
+                    elif result.status == PipelineStatus.SUCCESS:
+                        stage.status = StageStatus.SUCCESS
+                    elif result.status == PipelineStatus.RUNNING:
+                        stage.status = StageStatus.RUNNING
+                    else:
+                        stage.status = StageStatus.SUCCESS
+                else:
+                    stage.status = StageStatus.FAILED
                 stage.completed_at = now()
                 stage.input_tokens = result.metrics.get("input_tokens", 0)
                 stage.output_tokens = result.metrics.get("output_tokens", 0)

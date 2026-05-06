@@ -8,19 +8,22 @@ import type { Pipeline, PipelineStage } from '@types';
 interface PipelineState {
   // 当前选中的流水线
   selectedPipeline: Pipeline | null;
-  
+
   // 选中的阶段（用于审批抽屉）
   selectedStage: PipelineStage | null;
-  
+
   // 审批抽屉状态
   isApproveDrawerOpen: boolean;
-  
+
+  // 点击的节点来源（用于 CODE_REVIEW 阶段区分 CODER/TESTER）
+  selectedNodeSource: 'CODER' | 'TESTER' | null;
+
   // Actions
   setSelectedPipeline: (pipeline: Pipeline | null) => void;
   setSelectedStage: (stage: PipelineStage | null) => void;
-  openApproveDrawer: (stage: PipelineStage) => void;
+  openApproveDrawer: (stage: PipelineStage, nodeSource?: 'CODER' | 'TESTER') => void;
   closeApproveDrawer: () => void;
-  
+
   // 更新流水线状态（用于轮询更新）
   updatePipelineStatus: (pipelineId: number, updates: Partial<Pipeline>) => void;
   updateStageStatus: (pipelineId: number, stageId: number, updates: Partial<PipelineStage>) => void;
@@ -30,19 +33,22 @@ export const usePipelineStore = create<PipelineState>((set, get) => ({
   selectedPipeline: null,
   selectedStage: null,
   isApproveDrawerOpen: false,
-  
+  selectedNodeSource: null,
+
   setSelectedPipeline: (pipeline) => set({ selectedPipeline: pipeline }),
-  
+
   setSelectedStage: (stage) => set({ selectedStage: stage }),
-  
-  openApproveDrawer: (stage) => set({
+
+  openApproveDrawer: (stage, nodeSource) => set({
     selectedStage: stage,
     isApproveDrawerOpen: true,
+    selectedNodeSource: nodeSource || null,
   }),
-  
+
   closeApproveDrawer: () => set({
     selectedStage: null,
     isApproveDrawerOpen: false,
+    selectedNodeSource: null,
   }),
   
   updatePipelineStatus: (pipelineId, updates) => {

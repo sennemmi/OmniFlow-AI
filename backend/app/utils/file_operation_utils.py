@@ -133,7 +133,7 @@ async def merge_and_write_files(
     code_files: List[Dict],
     file_service: SandboxFileService,
     retry_callback: Optional[callable] = None
-) -> int:
+) -> tuple[int, List[str]]:
     """
     合并并写入文件（处理 modify 和 add）
 
@@ -143,9 +143,10 @@ async def merge_and_write_files(
         retry_callback: search_block 不匹配时的重试回调函数
 
     Returns:
-        成功写入的文件数
+        (成功写入的文件数, 失败的变更列表)
     """
     written_count = 0
+    failed_changes: List[str] = []
     merged_by_file, add_files = group_files_by_change_type(code_files)
 
     print(f"   [文件写入] 开始处理: {len(merged_by_file)} 个 modify 文件, {len(add_files)} 个 add 文件")
@@ -157,10 +158,12 @@ async def merge_and_write_files(
         if not read_r.exists:
             logger.warning(f"跳过 modify: {fp} (文件不存在)")
             print(f"   ⚠️ 跳过 modify: {fp} (文件不存在)")
+            failed_changes.append(f"modify 失败: {fp} 不存在")
             continue
 
         current_content = read_r.content
         print(f"   [文件写入] 读取原文件: {fp} ({len(current_content)} 字符)")
+        file_modified = False
 
         for i, fc in enumerate(changes, 1):
             search_block = fc.get("search_block", "")
@@ -175,16 +178,24 @@ async def merge_and_write_files(
                 )
                 if success:
                     current_content = new_content
+                    file_modified = True
                     print(f"   ✅ modify(搜索替换): {fp}")
                 else:
-                    print(f"   ⚠️ modify(搜索块不匹配): {fp}")
+                    # 记录失败，不再静默跳过
+                    failed_changes.append(
+                        f"modify 失败: {fp} 的 search_block 无法匹配\n"
+                        f"  search_block 前50字符: {repr(search_block[:50])}"
+                    )
+                    print(f"   ❌ modify(搜索块不匹配): {fp}")
             elif content:
                 current_content = content
+                file_modified = True
                 print(f"   ✅ modify(完整覆盖): {fp}")
 
-        await file_service.write_file(fp, current_content)
-        written_count += 1
-        print(f"   [文件写入] 已写入: {fp} ({len(current_content)} 字符)")
+        if file_modified:
+            await file_service.write_file(fp, current_content)
+            written_count += 1
+            print(f"   [文件写入] 已写入: {fp} ({len(current_content)} 字符)")
 
     # 处理 add 文件
     for fc in add_files:
@@ -197,6 +208,7 @@ async def merge_and_write_files(
         else:
             logger.warning(f"⚠️ 跳过 add: {fp} (无 content)")
             print(f"   ⚠️ 跳过 add: {fp} (无 content)")
+            failed_changes.append(f"add 失败: {fp} 无 content")
 
     # 处理 delete 类型（仅记录，不执行）
     for fc in code_files:
@@ -206,7 +218,9 @@ async def merge_and_write_files(
             print(f"   ⚠️ 跳过 delete: {fp} (测试环境不支持删除)")
 
     print(f"   [文件写入] 总计: {written_count} 个文件写入成功 (合并了 {len(merged_by_file)} 个文件的多项修改)")
-    return written_count
+    if failed_changes:
+        print(f"   [文件写入] 失败: {len(failed_changes)} 个变更")
+    return written_count, failed_changes
 
 
 def extract_function_source(content: str, func_name: str) -> Optional[str]:

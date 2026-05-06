@@ -89,3 +89,4 @@ frontend/repomix-output*.md
 backend/agent_debug_output/
 
 backend/scripts/test_e2e_with_contract_v2.py
+docs/

@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import Editor from '@monaco-editor/react';
 import {
   Folder,
@@ -17,6 +17,7 @@ import {
   Save,
 } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { apiGet, apiPost } from '@utils/axios';
 import { useUIStore } from '@stores/uiStore';
 
@@ -109,6 +110,7 @@ const formatSize = (bytes?: number): string => {
 };
 
 export function Workspace() {
+  const [searchParams] = useSearchParams();
   const [currentPath, setCurrentPath] = useState('');
   const [selectedFile, setSelectedFile] = useState<FileItem | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['']));
@@ -117,6 +119,34 @@ export function Workspace() {
   const [editedContent, setEditedContent] = useState('');
   const { addToast } = useUIStore();
   const queryClient = useQueryClient();
+
+  // 【新增】从 URL 参数获取要打开的文件路径
+  const fileParam = searchParams.get('file');
+
+  // 【新增】根据 URL 参数初始化文件选择
+  useEffect(() => {
+    if (fileParam) {
+      // 提取文件所在目录作为当前路径
+      const lastSlashIndex = fileParam.lastIndexOf('/');
+      const dirPath = lastSlashIndex > 0 ? fileParam.substring(0, lastSlashIndex) : '';
+      setCurrentPath(dirPath);
+
+      // 创建文件对象并选中
+      const fileName = lastSlashIndex >= 0 ? fileParam.substring(lastSlashIndex + 1) : fileParam;
+      setSelectedFile({
+        name: fileName,
+        path: fileParam,
+        type: 'file',
+        size: 0,
+        modified: new Date().toISOString(),
+      });
+
+      // 展开文件所在目录
+      if (dirPath) {
+        setExpandedFolders((prev) => new Set(prev).add(dirPath));
+      }
+    }
+  }, [fileParam]);
 
   // 获取文件列表
   const { data: files, isLoading: isLoadingFiles, error: filesError, refetch: refetchFiles } = useQuery({

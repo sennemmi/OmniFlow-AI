@@ -140,12 +140,10 @@ class E2ETestRunner:
             design_context = await agent_coordinator_service.build_designer_context(
                 requirement=FEATURE_REQUEST,
                 arch_output=arch_output,
-                file_tree={},
                 pipeline_id=PIPELINE_ID
             )
             design_result = await designer_agent.design(
                 architect_output=design_context["arch_output"],
-                file_tree=design_context["file_tree"],
                 related_code_context="",
                 full_files_context=injected_files,  # <--- 修正这里：传入真实的 injected_files
                 pipeline_id=PIPELINE_ID
@@ -195,7 +193,6 @@ class E2ETestRunner:
 
                 retry_input = {
                     "architect_output": retry_design_output,
-                    "file_tree": design_context["file_tree"],
                     "related_code_context": "",
                     "full_files_context": injected_files,
                     "pipeline_id": PIPELINE_ID

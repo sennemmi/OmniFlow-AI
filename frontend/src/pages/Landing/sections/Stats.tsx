@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Users, Building2, TrendingUp, Zap, Globe, Shield } from 'lucide-react';
+import { GitPullRequest, Clock, CheckCircle2, Globe, TrendingUp } from 'lucide-react';
 
 interface StatItemProps {
   icon: React.ReactNode;
@@ -67,10 +67,8 @@ function StatItem({ icon, value, label, suffix = '', delay = 0 }: StatItemProps)
       }`}
       style={{ transitionDelay: `${delay}ms` }}
     >
-
-
       {/* Icon */}
-      <div className="relative mb-6 inline-flex h-14 w-14 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 text-white shadow-lg transition-transform duration-500 group-hover:scale-110">
+      <div className="relative mb-6 inline-flex h-14 w-14 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-blue-600 text-white shadow-lg transition-transform duration-500 group-hover:scale-110">
         {icon}
       </div>
 
@@ -88,7 +86,7 @@ function StatItem({ icon, value, label, suffix = '', delay = 0 }: StatItemProps)
       </div>
 
       {/* Decorative line */}
-      <div className="absolute bottom-0 left-0 h-1 w-0 bg-gradient-to-r from-blue-500 to-purple-600 transition-all duration-500 group-hover:w-full" />
+      <div className="absolute bottom-0 left-0 h-1 w-0 bg-gradient-to-r from-blue-500 to-blue-600 transition-all duration-500 group-hover:w-full" />
     </div>
   );
 }
@@ -96,27 +94,21 @@ function StatItem({ icon, value, label, suffix = '', delay = 0 }: StatItemProps)
 export function Stats() {
   const stats = [
     {
-      icon: <Users className="h-6 w-6" />,
+      icon: <GitPullRequest className="h-6 w-6" />,
       value: '10000',
-      label: '活跃用户',
+      label: '流水线执行',
       suffix: '+',
     },
     {
-      icon: <Building2 className="h-6 w-6" />,
-      value: '500',
-      label: '企业客户',
-      suffix: '+',
+      icon: <Clock className="h-6 w-6" />,
+      value: '3.5',
+      label: '平均构建时间',
+      suffix: 'min',
     },
     {
-      icon: <TrendingUp className="h-6 w-6" />,
+      icon: <CheckCircle2 className="h-6 w-6" />,
       value: '99',
-      label: '客户满意度',
-      suffix: '%',
-    },
-    {
-      icon: <Zap className="h-6 w-6" />,
-      value: '50',
-      label: '效率提升',
+      label: '部署成功率',
       suffix: '%',
     },
     {
@@ -124,12 +116,6 @@ export function Stats() {
       value: '30',
       label: '覆盖国家',
       suffix: '+',
-    },
-    {
-      icon: <Shield className="h-6 w-6" />,
-      value: '99',
-      label: '服务可用性',
-      suffix: '.9%',
     },
   ];
 
@@ -157,7 +143,7 @@ export function Stats() {
         </div>
 
         {/* Stats Grid */}
-        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
           {stats.map((stat, index) => (
             <StatItem
               key={stat.label}
@@ -168,20 +154,6 @@ export function Stats() {
               delay={index * 100}
             />
           ))}
-        </div>
-
-        {/* Bottom CTA */}
-        <div className="mt-16 text-center">
-          <p className="text-gray-500 mb-4">想要了解更多详细数据？</p>
-          <a
-            href="#contact"
-            className="inline-flex items-center gap-2 rounded-full bg-gray-900 px-8 py-3 text-sm font-semibold text-white transition-all hover:bg-gray-800 hover:scale-105 hover:shadow-lg"
-          >
-            联系我们获取详细报告
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
-            </svg>
-          </a>
         </div>
       </div>
     </section>

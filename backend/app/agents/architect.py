@@ -654,6 +654,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         # ============================================================
         # 【第一步：自由探索】让 Agent 自由探索项目，识别 affected_files
         # ============================================================
+        t1 = time.time()
         logger.info(f"[ArchitectAgent] 第一步：自由探索项目...", extra={"pipeline_id": pipeline_id})
         if pipeline_id:
             await push_log(pipeline_id, "info", "🏗️ ArchitectAgent 第一步：自由探索项目代码...", stage="ARCHITECT")
@@ -687,7 +688,8 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
                 "output": exploration_result.get("output")
             }
         
-        logger.info(f"[ArchitectAgent] 探索阶段完成，识别到 {len(affected_files)} 个 affected_files: {affected_files}")
+        exploration_ms = int((time.time() - t1) * 1000)
+        logger.info(f"[ArchitectAgent] 探索阶段完成 (耗时 {exploration_ms}ms)，识别到 {len(affected_files)} 个 affected_files: {affected_files}", extra={"pipeline_id": pipeline_id, "exploration_ms": exploration_ms})
         if pipeline_id:
             await push_log(pipeline_id, "info", f"🔍 识别到 {len(affected_files)} 个可能受影响的文件", stage="ARCHITECT")
             for f in affected_files[:5]:
@@ -698,6 +700,7 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         # ============================================================
         # 【第二步：详细设计】读取 affected_files 完整内容，生成详细方案
         # ============================================================
+        t2 = time.time()
         logger.info(f"[ArchitectAgent] 第二步：读取文件并生成详细设计方案...", extra={"pipeline_id": pipeline_id})
         if pipeline_id:
             await push_log(pipeline_id, "info", "📋 ArchitectAgent 第二步：读取文件内容并生成详细设计方案...", stage="ARCHITECT")
@@ -759,10 +762,18 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
 
         # 合并结果
         if design_result.get("success"):
+            # 【修复】过滤掉内容为空的文件（表示文件不存在），避免 CoderAgent 误用 modify 操作
+            filtered_file_contents = {k: v for k, v in full_file_contents.items() if v}
+            
             # 将 injected_files 添加到结果中
             if design_result.get("output"):
-                design_result["output"]["injected_files"] = full_file_contents
-                design_result["injected_files"] = full_file_contents
+                design_result["output"]["injected_files"] = filtered_file_contents
+                design_result["injected_files"] = filtered_file_contents
+            
+            # 【新增】记录被过滤掉的文件（新文件）
+            new_files = [k for k, v in full_file_contents.items() if not v]
+            if new_files:
+                logger.info(f"[ArchitectAgent] 发现 {len(new_files)} 个新文件（将使用 add 操作）: {new_files}")
 
             # 【关键修复】保存总的工具调用计数
             design_result["tool_calls"] = total_tool_calls
@@ -785,6 +796,19 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
         # 【关键】调用工具探索配额检查
         await self._enforce_tool_exploration_quota(design_result, pipeline_id)
         total_duration_ms = int((time.time() - started_at) * 1000)
+        design_ms = int((time.time() - t2) * 1000)
+
+        # 记录两阶段耗时日志（仅当 pipeline_id 有效时）
+        if pipeline_id:
+            logger.info(
+                f"[ArchitectAgent] 两阶段耗时: 探索={exploration_ms}ms, 设计={design_ms}ms, 总计={total_duration_ms}ms",
+                extra={"pipeline_id": pipeline_id}
+            )
+            await push_log(
+                pipeline_id, "info",
+                f"⏱️ ArchitectAgent 耗时: 探索阶段 {exploration_ms}ms + 设计阶段 {design_ms}ms = {total_duration_ms}ms",
+                stage="ARCHITECT"
+            )
         design_result["duration_ms"] = design_result.get("duration_ms") or total_duration_ms
         design_result["input_tokens"] = (
             (exploration_result.get("input_tokens", 0) or 0)

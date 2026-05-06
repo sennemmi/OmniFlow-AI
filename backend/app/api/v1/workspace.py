@@ -140,13 +140,13 @@ async def get_file_tree(
 
 @router.get("/files/content", response_model=FileContentResponse)
 async def get_file_content(
-    path: str = Query(..., description="文件相对路径")
+    path: str = Query(..., description="文件相对路径（相对于项目根目录）")
 ):
     """
     获取文件内容
 
-    【修复】使用 get_workspace_path("frontend") 获取前端项目路径，
-    而不是使用 PROJECT_ROOT（后端项目路径）
+    【修复】使用项目根目录（get_workspace_path()），而不是 frontend 子目录。
+    因为受影响文件的路径是相对于整个项目根目录的（如 backend/app/main.py）。
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -155,21 +155,22 @@ async def get_file_content(
         # 【调试】记录接收到的参数
         logger.info(f"[DEBUG] get_file_content 接收到的 path: {repr(path)}")
 
-        # 【关键修复】使用前端项目路径，而不是后端项目路径
-        frontend_root = get_workspace_path("frontend")
-        logger.info(f"[DEBUG] frontend_root: {frontend_root}")
-        logger.info(f"[DEBUG] frontend_root exists: {frontend_root.exists()}")
-        logger.info(f"[DEBUG] frontend_root is_dir: {frontend_root.is_dir()}")
+        # 【关键修复】使用项目根目录，而不是 frontend 子目录
+        # 因为路径如 "backend/app/main.py" 是相对于项目根目录的
+        project_root = get_workspace_path()  # 不传参数获取根目录
+        logger.info(f"[DEBUG] project_root: {project_root}")
+        logger.info(f"[DEBUG] project_root exists: {project_root.exists()}")
+        logger.info(f"[DEBUG] project_root is_dir: {project_root.is_dir()}")
 
-        file_path = frontend_root / path
+        file_path = project_root / path
         logger.info(f"[DEBUG] file_path: {file_path}")
         logger.info(f"[DEBUG] file_path.resolve(): {file_path.resolve()}")
-        logger.info(f"[DEBUG] frontend_root.resolve(): {frontend_root.resolve()}")
+        logger.info(f"[DEBUG] project_root.resolve(): {project_root.resolve()}")
 
         # 安全检查
         try:
             resolved_path = file_path.resolve()
-            resolved_root = frontend_root.resolve()
+            resolved_root = project_root.resolve()
             relative = resolved_path.relative_to(resolved_root)
             logger.info(f"[DEBUG] 安全检查通过: {relative}")
         except ValueError as e:

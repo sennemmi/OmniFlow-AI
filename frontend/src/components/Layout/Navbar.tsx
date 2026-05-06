@@ -4,13 +4,12 @@ import { Zap, Menu, X, ChevronRight } from 'lucide-react';
 import { useUIStore } from '@stores/uiStore';
 
 // ============================================
-// 飞书风格导航栏 - 毛玻璃效果
+// 导航栏 - 飞书风格
 // ============================================
 
 const navItems = [
   { label: '首页', path: '/' },
   { label: '控制台', path: '/console' },
-  { label: '文档', path: '/docs' },
 ];
 
 export function Navbar() {
@@ -39,19 +38,19 @@ export function Navbar() {
     <header
       className={`fixed top-0 left-0 right-0 h-16 z-50 transition-all duration-300 ${
         isNavbarScrolled
-          ? 'bg-bg-primary/90 backdrop-blur-xl shadow-feishu-card border-b border-border-default/50'
+          ? 'bg-white/90 backdrop-blur-xl shadow-lg border-b border-gray-200/50'
           : 'bg-transparent'
       }`}
     >
       <div className="container-feishu h-full flex items-center justify-between">
         {/* Logo */}
         <Link to="/" className="flex items-center gap-2 group">
-          <div className="w-9 h-9 rounded-lg bg-brand-primary flex items-center justify-center transition-transform duration-300 group-hover:scale-105">
-            <Zap className="w-5 h-5 text-text-white" />
+          <div className="w-9 h-9 rounded-lg bg-blue-500 flex items-center justify-center transition-transform duration-300 group-hover:scale-105">
+            <Zap className="w-5 h-5 text-white" />
           </div>
           <span
             className={`text-lg font-semibold transition-colors duration-300 ${
-              isNavbarScrolled ? 'text-text-primary' : 'text-text-white'
+              isNavbarScrolled ? 'text-gray-900' : 'text-white'
             }`}
           >
             OmniFlowAI
@@ -67,11 +66,11 @@ export function Navbar() {
               className={`px-4 py-2 rounded-md text-sm font-medium transition-all duration-200 ${
                 isActive(item.path)
                   ? isNavbarScrolled
-                    ? 'text-brand-primary bg-brand-primary-light'
-                    : 'text-text-white bg-text-white/10'
+                    ? 'text-blue-600 bg-blue-50'
+                    : 'text-white bg-white/10'
                   : isNavbarScrolled
-                  ? 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
-                  : 'text-text-white/80 hover:text-text-white hover:bg-text-white/10'
+                  ? 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                  : 'text-white/80 hover:text-white hover:bg-white/10'
               }`}
             >
               {item.label}
@@ -85,8 +84,8 @@ export function Navbar() {
             to="/console"
             className={`inline-flex items-center gap-1.5 px-5 py-2 rounded-lg text-sm font-medium transition-all duration-250 ${
               isNavbarScrolled
-                ? 'bg-brand-primary text-text-white hover:bg-brand-primary-hover hover:-translate-y-0.5 hover:shadow-feishu-button'
-                : 'bg-text-white text-brand-primary hover:bg-text-white/90 hover:-translate-y-0.5'
+                ? 'bg-blue-500 text-white hover:bg-blue-600 hover:-translate-y-0.5 hover:shadow-lg'
+                : 'bg-white text-blue-600 hover:bg-white/90 hover:-translate-y-0.5'
             }`}
           >
             开始使用
@@ -99,8 +98,8 @@ export function Navbar() {
           onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
           className={`md:hidden p-2 rounded-md transition-colors ${
             isNavbarScrolled
-              ? 'text-text-primary hover:bg-bg-secondary'
-              : 'text-text-white hover:bg-text-white/10'
+              ? 'text-gray-900 hover:bg-gray-100'
+              : 'text-white hover:bg-white/10'
           }`}
         >
           {isMobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
@@ -109,7 +108,7 @@ export function Navbar() {
 
       {/* Mobile Menu */}
       {isMobileMenuOpen && (
-        <div className="md:hidden absolute top-16 left-0 right-0 bg-bg-primary border-b border-border-default shadow-feishu">
+        <div className="md:hidden absolute top-16 left-0 right-0 bg-white border-b border-gray-200 shadow-lg">
           <nav className="container-feishu py-4 flex flex-col gap-1">
             {navItems.map((item) => (
               <Link
@@ -118,8 +117,8 @@ export function Navbar() {
                 onClick={() => setIsMobileMenuOpen(false)}
                 className={`px-4 py-3 rounded-md text-sm font-medium transition-colors ${
                   isActive(item.path)
-                    ? 'text-brand-primary bg-brand-primary-light'
-                    : 'text-text-secondary hover:text-text-primary hover:bg-bg-secondary'
+                    ? 'text-blue-600 bg-blue-50'
+                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
                 }`}
               >
                 {item.label}
@@ -128,7 +127,7 @@ export function Navbar() {
             <Link
               to="/console"
               onClick={() => setIsMobileMenuOpen(false)}
-              className="mt-2 px-4 py-3 bg-brand-primary text-text-white rounded-lg text-sm font-medium text-center hover:bg-brand-primary-hover"
+              className="mt-2 px-4 py-3 bg-blue-500 text-white rounded-lg text-sm font-medium text-center hover:bg-blue-600"
             >
               开始使用
             </Link>

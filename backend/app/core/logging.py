@@ -408,6 +408,17 @@ class OperationLogger:
         set_pipeline_id(None)
 
     @staticmethod
+    def log_pipeline_delete(pipeline_id: int, **kwargs):
+        """记录 Pipeline 删除"""
+        set_pipeline_id(pipeline_id)
+        logger.info(
+            "pipeline_deleted",
+            pipeline_id=pipeline_id,
+            **kwargs
+        )
+        set_pipeline_id(None)
+
+    @staticmethod
     def log_agent_complete(
         pipeline_id: int,
         agent_name: str,

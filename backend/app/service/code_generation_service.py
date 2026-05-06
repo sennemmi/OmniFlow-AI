@@ -694,7 +694,11 @@ class CodeGenerationService:
                 return False, current_content
 
             # 使用 merge_and_write_files 写入文件（与 E2E 脚本完全一致）
-            written_count = await merge_and_write_files(files, file_service, retry_callback)
+            written_count, failed_changes = await merge_and_write_files(files, file_service, retry_callback)
+
+            if failed_changes:
+                error_msg = "\n".join(failed_changes)
+                return False, error_msg
 
             if written_count == 0 and files:
                 return False, "No files were written"

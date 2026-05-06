@@ -152,12 +152,25 @@ class GitProviderService:
         """
         # 使用 origin/base_branch 明确指定远程分支，避免歧义
         remote_base = f"origin/{base_branch}"
-        # 先切换到基础分支
-        self._run_git_command(["checkout", remote_base])
-        # 拉取最新代码
-        self._run_git_command(["pull", "origin", base_branch], check=False)
-        # 创建新分支
-        return self._run_git_command(["checkout", "-b", branch_name])
+
+        # 【关键修复】先 stash 本地变更，避免 checkout 冲突
+        # 这在沙箱工作区中特别重要，因为可能有未跟踪的文件
+        self._run_git_command(["stash", "push", "-u", "-m", "auto-stash-before-branch-creation"], check=False)
+
+        try:
+            # 先切换到基础分支
+            self._run_git_command(["checkout", remote_base])
+            # 拉取最新代码
+            self._run_git_command(["pull", "origin", base_branch], check=False)
+            # 创建新分支
+            result = self._run_git_command(["checkout", "-b", branch_name])
+            # 恢复暂存的变更到新分支
+            self._run_git_command(["stash", "pop"], check=False)
+            return result
+        except Exception:
+            # 如果出错，尝试恢复 stash
+            self._run_git_command(["stash", "pop"], check=False)
+            raise
 
     def checkout_branch(self, branch_name: str) -> GitResult:
         """
@@ -619,6 +632,61 @@ class GitProviderService:
         except GitProviderError:
             # 不存在则添加
             return self._run_git_command(["remote", "add", remote_name, remote_url])
+
+    def init_repo(self, remote_url: Optional[str] = None, remote_name: str = "origin") -> GitResult:
+        """
+        初始化 Git 仓库（用于沙箱临时工作区等无 .git 的场景）
+
+        1. git init
+        2. git config user.email / user.name
+        3. git remote add origin <remote_url>（如果提供）
+        4. git fetch origin（如果提供了 remote_url）
+
+        Args:
+            remote_url: 远程仓库 URL
+            remote_name: 远程名称，默认 origin
+
+        Returns:
+            GitResult: 操作结果
+        """
+        # 1. git init
+        result = self._run_git_command(["init"], check=False)
+
+        # 2. 配置 git user
+        self._run_git_command(
+            ["config", "user.email", "omniflowai@ai.bot"],
+            check=False
+        )
+        self._run_git_command(
+            ["config", "user.name", "OmniFlowAI Bot"],
+            check=False
+        )
+
+        # 3. 配置 pull rebase
+        self._run_git_command(
+            ["config", "pull.rebase", "true"],
+            check=False
+        )
+
+        # 4. 添加 remote 并 fetch
+        if remote_url:
+            check_result = self._run_git_command(
+                ["remote", "get-url", remote_name],
+                check=False
+            )
+            if check_result.success:
+                self._run_git_command(
+                    ["remote", "set-url", remote_name, remote_url],
+                    check=False
+                )
+            else:
+                self._run_git_command(
+                    ["remote", "add", remote_name, remote_url],
+                    check=False
+                )
+            self._run_git_command(["fetch", remote_name], check=False)
+
+        return result
 
     def fetch(self, remote: str = "origin") -> GitResult:
         """

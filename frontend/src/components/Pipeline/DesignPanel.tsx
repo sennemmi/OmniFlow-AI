@@ -4,12 +4,19 @@ import { Palette, Code2, FileSignature, GitCompare, AlertCircle } from 'lucide-r
 // 方案设计阶段面板 - 展示 DesignerAgent 输出
 // ============================================
 
+interface MockDependency {
+  patch_target: string;
+  mock_return_value: unknown;
+  is_async: boolean;
+  description?: string;
+}
+
 interface InterfaceSpec {
   symbol_name: string;
   signature: string;
   return_type: string;
   description?: string;
-  mock_dependencies?: string[];
+  mock_dependencies?: MockDependency[];
 }
 
 interface ApiEndpoint {
@@ -19,9 +26,10 @@ interface ApiEndpoint {
 }
 
 interface FunctionChange {
-  file_path: string;
-  change_type: 'add' | 'modify' | 'delete';
-  functions: string[];
+  file: string;
+  function: string;
+  action: 'add' | 'modify' | 'delete';
+  description?: string;
 }
 
 interface DesignPanelProps {
@@ -135,8 +143,9 @@ export function DesignPanel({ outputData }: DesignPanelProps) {
                       <span
                         key={depIdx}
                         className="inline-flex px-2 py-0.5 bg-status-warning/10 text-status-warning text-xs rounded"
+                        title={dep.description || dep.patch_target}
                       >
-                        mock: {dep}
+                        mock: {dep.patch_target}
                       </span>
                     ))}
                   </div>
@@ -176,7 +185,7 @@ export function DesignPanel({ outputData }: DesignPanelProps) {
         <div className="space-y-2">
           <h4 className="text-sm font-medium text-text-primary flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-status-warning" />
-            改动函数 ({functionChanges.length} 个文件)
+            改动函数 ({functionChanges.length} 个)
           </h4>
           <div className="space-y-2">
             {functionChanges.map((change, idx) => (
@@ -184,27 +193,22 @@ export function DesignPanel({ outputData }: DesignPanelProps) {
                 key={idx}
                 className="p-3 bg-bg-secondary rounded-lg border border-border-default"
               >
-                <div className="flex items-center gap-2 mb-2">
+                <div className="flex items-center gap-2 mb-1">
                   <span className={`text-xs px-2 py-0.5 rounded font-medium ${
-                    change.change_type === 'add' ? 'bg-status-success/10 text-status-success' :
-                    change.change_type === 'delete' ? 'bg-status-error/10 text-status-error' :
+                    change.action === 'add' ? 'bg-status-success/10 text-status-success' :
+                    change.action === 'delete' ? 'bg-status-error/10 text-status-error' :
                     'bg-status-warning/10 text-status-warning'
                   }`}>
-                    {change.change_type === 'add' ? '新增' : change.change_type === 'delete' ? '删除' : '修改'}
+                    {change.action === 'add' ? '新增' : change.action === 'delete' ? '删除' : '修改'}
                   </span>
-                  <code className="text-xs font-mono text-text-secondary">{change.file_path}</code>
+                  <code className="text-xs font-mono text-text-secondary">{change.file}</code>
                 </div>
-                {change.functions && change.functions.length > 0 && (
-                  <div className="flex flex-wrap gap-1">
-                    {change.functions.map((func, funcIdx) => (
-                      <span
-                        key={funcIdx}
-                        className="inline-flex px-2 py-0.5 bg-bg-tertiary text-text-secondary text-xs rounded"
-                      >
-                        {func}
-                      </span>
-                    ))}
-                  </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-text-tertiary">函数:</span>
+                  <span className="text-xs font-medium text-text-primary">{change.function}</span>
+                </div>
+                {change.description && (
+                  <p className="mt-1 text-xs text-text-tertiary">{change.description}</p>
                 )}
               </div>
             ))}

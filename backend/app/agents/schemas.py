@@ -371,7 +371,7 @@ class TesterOutput(BaseAgentOutput):
     """
     测试 Agent 输出
 
-    负责生成单元测试代码
+    负责生成分层测试代码
     """
     test_files: List[TestFile] = Field(default_factory=list, description="测试文件列表")
     coverage_targets: List[str] = Field(default_factory=list, description="计划覆盖的测试目标")

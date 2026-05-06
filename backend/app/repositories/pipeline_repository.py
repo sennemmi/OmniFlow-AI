@@ -88,3 +88,29 @@ class PipelineRepository:
     ) -> None:
         """设置 Pipeline 为成功状态"""
         await PipelineRepository.update_status(pipeline, PipelineStatus.SUCCESS, session)
+
+    @staticmethod
+    async def delete(
+        pipeline_id: int,
+        session: AsyncSession
+    ) -> None:
+        """
+        删除 Pipeline（级联删除关联的 Stages）
+
+        Args:
+            pipeline_id: Pipeline ID
+            session: 数据库会话
+        """
+        from app.models.pipeline import PipelineStage
+
+        # 先删除关联的 Stages
+        stages_statement = select(PipelineStage).where(PipelineStage.pipeline_id == pipeline_id)
+        stages_result = await session.execute(stages_statement)
+        stages = stages_result.scalars().all()
+        for stage in stages:
+            await session.delete(stage)
+
+        # 再删除 Pipeline
+        pipeline = await PipelineRepository.get_by_id(pipeline_id, session, load_stages=False)
+        if pipeline:
+            await session.delete(pipeline)

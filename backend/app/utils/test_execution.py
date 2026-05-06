@@ -80,6 +80,20 @@ async def run_pytest_in_sandbox(
             else:
                 log("warning", f"❌ 测试失败: 退出码 {exec_result.exit_code}")
 
+            # 【新增】打印详细的测试日志，便于调试
+            log("warning", "=" * 60)
+            log("warning", "【测试失败详情 - 开始】")
+            log("warning", "=" * 60)
+            # 限制日志长度，避免输出过多
+            max_log_length = 3000
+            if len(logs) > max_log_length:
+                log("warning", logs[:max_log_length] + "\n... (日志已截断)")
+            else:
+                log("warning", logs)
+            log("warning", "=" * 60)
+            log("warning", "【测试失败详情 - 结束】")
+            log("warning", "=" * 60)
+
         return {
             "success": success,
             "logs": logs,

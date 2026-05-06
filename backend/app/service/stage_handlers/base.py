@@ -1,47 +1,50 @@
 """
-阶段处理器基础接口
+Stage Handler Base Interface
 
-定义所有阶段处理器的统一接口
+Defines unified interface for all stage handlers
 """
 
 from abc import ABC, abstractmethod
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
+from app.core.sse_log_buffer import push_error_details, push_stage_start, push_stage_complete
 from app.models.pipeline import StageName, PipelineStatus
 from app.utils.agent_debug_utils import get_agent_debugger
+from app.utils.log_utils import PipelineLogger, LogContext
 
 
 @dataclass
 class StageContext:
-    """阶段执行上下文"""
+    """Stage execution context"""
     pipeline_id: int
     session: AsyncSession
     input_data: Dict[str, Any] = field(default_factory=dict)
     stage_id: Optional[int] = None
     previous_output: Optional[Dict[str, Any]] = None
     rejection_feedback: Optional[Dict[str, Any]] = None
-    error_context: Optional[str] = None  # 用于传递错误上下文（如允许修改测试的授权）
+    error_context: Optional[str] = None  # For passing error context (e.g., authorization to modify tests)
 
     def get(self, key: str, default: Any = None) -> Any:
-        """从 input_data 获取值"""
+        """Get value from input_data"""
         return self.input_data.get(key, default)
 
 
 @dataclass  
 class StageResult:
-    """阶段执行结果"""
+    """Stage execution result"""
     success: bool
     status: PipelineStatus
     message: str
     output_data: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
     
-    # 可选的额外数据
+    # Optional extra data
     git_branch: Optional[str] = None
     commit_hash: Optional[str] = None
     pr_url: Optional[str] = None
@@ -54,7 +57,7 @@ class StageResult:
         status: PipelineStatus = PipelineStatus.SUCCESS,
         **kwargs
     ) -> "StageResult":
-        """创建成功结果"""
+        """Create success result"""
         return cls(
             success=True,
             status=status,
@@ -71,7 +74,7 @@ class StageResult:
         status: PipelineStatus = PipelineStatus.FAILED,
         **kwargs
     ) -> "StageResult":
-        """创建失败结果"""
+        """Create failure result"""
         return cls(
             success=False,
             status=status,
@@ -83,14 +86,22 @@ class StageResult:
 
 class StageHandler(ABC):
     """
-    阶段处理器抽象基类
+    Stage Handler Abstract Base Class
     
-    所有 Pipeline 阶段处理器必须实现此接口
+    All Pipeline stage handlers must implement this interface
     """
     
     def __init__(self):
-        """初始化处理器，使用全局 AgentDebugger 实例"""
+        """Initialize handler with global AgentDebugger instance and logger"""
         self.debugger = get_agent_debugger()
+        self._logger: Optional[PipelineLogger] = None
+        self._start_time: Optional[float] = None
+    
+    def _get_logger(self, pipeline_id: int) -> PipelineLogger:
+        """Get or create PipelineLogger instance"""
+        if self._logger is None or self._logger.pipeline_id != pipeline_id:
+            self._logger = PipelineLogger(pipeline_id, self.stage_name.value)
+        return self._logger
 
     def _save_agent_log(
         self,
@@ -102,17 +113,17 @@ class StageHandler(ABC):
         **kwargs
     ) -> None:
         """
-        【封装】保存 Agent 调用日志
+        [Encapsulated] Save Agent call log
 
-        简化子类中的 Agent 调试记录，减少样板代码
+        Simplifies Agent debugging recording in subclasses, reduces boilerplate code
 
         Args:
-            agent_name: Agent 名称
-            stage: 阶段标识
-            input_data: 输入数据
-            output_data: 输出数据
-            system_prompt: 系统提示词
-            **kwargs: 额外的元数据
+            agent_name: Agent name
+            stage: Stage identifier
+            input_data: Input data
+            output_data: Output data
+            system_prompt: System prompt
+            **kwargs: Extra metadata
         """
         if not self.debugger:
             return
@@ -162,43 +173,43 @@ class StageHandler(ABC):
     @property
     @abstractmethod
     def stage_name(self) -> StageName:
-        """返回处理的阶段名称"""
+        """Return the stage name being processed"""
         pass
     
     @abstractmethod
     async def prepare(self, context: StageContext) -> StageContext:
         """
-        准备阶段：获取输入数据、创建阶段记录
+        Preparation phase: get input data, create stage record
         
         Args:
-            context: 阶段上下文
+            context: Stage context
             
         Returns:
-            StageContext: 更新后的上下文（包含 stage_id）
+            StageContext: Updated context (containing stage_id)
         """
         pass
     
     @abstractmethod
     async def execute(self, context: StageContext) -> StageResult:
         """
-        执行阶段核心逻辑
+        Execute stage core logic
         
         Args:
-            context: 阶段上下文
+            context: Stage context
             
         Returns:
-            StageResult: 执行结果
+            StageResult: Execution result
         """
         pass
     
     @abstractmethod
     async def complete(self, context: StageContext, result: StageResult) -> None:
         """
-        完成阶段：保存结果、更新状态
+        Complete phase: save results, update status
         
         Args:
-            context: 阶段上下文
-            result: 执行结果
+            context: Stage context
+            result: Execution result
         """
         pass
     
@@ -208,15 +219,20 @@ class StageHandler(ABC):
         error: Exception
     ) -> StageResult:
         """
-        错误处理：可被子类覆盖实现自定义错误处理
+        Error handling: can be overridden by subclasses for custom error handling
         
         Args:
-            context: 阶段上下文
-            error: 异常对象
+            context: Stage context
+            error: Exception object
             
         Returns:
-            StageResult: 错误结果
+            StageResult: Error result
         """
+        logger = self._get_logger(context.pipeline_id)
+        
+        # Log detailed error with stack trace
+        await logger.error_details(error, context=f"Stage {self.stage_name.value}")
+        
         return StageResult.failure_result(
             message=f"{self.stage_name.value} phase failed: {str(error)}",
             output_data={"error": str(error), "error_type": type(error).__name__}
@@ -229,18 +245,18 @@ class StageHandler(ABC):
         feedback: Optional[str] = None
     ) -> StageResult:
         """
-        阶段被批准后的处理逻辑
+        Processing logic after stage is approved
         
-        子类可重写此方法实现自定义的审批后逻辑。
-        默认实现返回成功结果，表示直接进入下一阶段。
+        Subclasses can override this method for custom post-approval logic.
+        Default implementation returns success result, indicating direct entry to next stage.
         
         Args:
-            context: 阶段上下文
-            notes: 审批备注
-            feedback: 反馈建议
+            context: Stage context
+            notes: Approval notes
+            feedback: Feedback suggestions
             
         Returns:
-            StageResult: 处理结果
+            StageResult: Processing result
         """
         return StageResult.success_result(
             message=f"{self.stage_name.value} stage approved",
@@ -254,18 +270,18 @@ class StageHandler(ABC):
         suggested_changes: Optional[str] = None
     ) -> StageResult:
         """
-        阶段被驳回后的处理逻辑
+        Processing logic after stage is rejected
         
-        子类可重写此方法实现自定义的驳回后逻辑。
-        默认实现返回成功结果，表示重新执行当前阶段。
+        Subclasses can override this method for custom post-rejection logic.
+        Default implementation returns success result, indicating re-execution of current stage.
         
         Args:
-            context: 阶段上下文
-            reason: 驳回原因
-            suggested_changes: 建议修改
+            context: Stage context
+            reason: Rejection reason
+            suggested_changes: Suggested changes
             
         Returns:
-            StageResult: 处理结果
+            StageResult: Processing result
         """
         return StageResult.success_result(
             message=f"{self.stage_name.value} stage rejected, will rerun",
@@ -274,28 +290,54 @@ class StageHandler(ABC):
     
     async def run(self, context: StageContext) -> StageResult:
         """
-        运行完整阶段流程
+        Run complete stage workflow
         
         Args:
-            context: 阶段上下文
+            context: Stage context
             
         Returns:
-            StageResult: 执行结果
+            StageResult: Execution result
         """
+        logger = self._get_logger(context.pipeline_id)
+        self._start_time = time.perf_counter()
+        
         try:
-            # 1. 准备阶段
+            # 1. Preparation phase - with logging
+            await push_stage_start(context.pipeline_id, self.stage_name.value, context.input_data)
             context = await self.prepare(context)
             
-            # 2. 执行阶段
+            # 2. Execution phase
             result = await self.execute(context)
             
-            # 3. 完成阶段
+            # 3. Completion phase
             await self.complete(context, result)
+            
+            # Log stage completion
+            duration_ms = int((time.perf_counter() - self._start_time) * 1000)
+            await push_stage_complete(
+                context.pipeline_id, 
+                self.stage_name.value, 
+                result.success,
+                result.output_data if result.success else None,
+                duration_ms
+            )
             
             return result
             
         except Exception as e:
-            # 错误处理
+            # Error handling with detailed logging
+            duration_ms = int((time.perf_counter() - self._start_time) * 1000) if self._start_time else 0
+            
+            # Log detailed error
+            await push_error_details(context.pipeline_id, e, context=f"Stage {self.stage_name.value}")
+            await push_stage_complete(
+                context.pipeline_id,
+                self.stage_name.value,
+                False,
+                None,
+                duration_ms
+            )
+            
             result = await self.handle_error(context, e)
             await self.complete(context, result)
             return result

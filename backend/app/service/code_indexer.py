@@ -106,8 +106,12 @@ class CodeIndexerService:
         self.index_dir = Path(index_dir) if index_dir else self.project_path / ".omniflow_index"
         self.index_file = self.index_dir / "code_index.json"
         self.chunks: List[CodeChunk] = []
-        self.file_cache: Dict[str, FileContext] = {}  # 【新增】文件内容缓存
+        self.file_cache: Dict[str, FileContext] = {}
         self.include_tests = include_tests
+        # O(1) 查找索引：chunk_id -> CodeChunk
+        self._chunk_map: Dict[str, CodeChunk] = {}
+        # 缓存的 last_staleness_check 结果
+        self._staleness_checked = False
 
         # 初始化 ChromaDB 向量数据库
         self.chroma_client = None
@@ -146,6 +150,13 @@ class CodeIndexerService:
             print(f"加载索引缓存失败: {e}")
             return None
 
+    def _rebuild_chunk_map(self):
+        """重建 O(1) 查询索引"""
+        self._chunk_map = {
+            f"{c.file_path}:{c.name}:{c.start_line}": c
+            for c in self.chunks
+        }
+
     def _save_index_cache(self, index_data: Dict[str, Any]):
         """保存索引缓存"""
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -156,15 +167,22 @@ class CodeIndexerService:
             print(f"保存索引缓存失败: {e}")
 
     def _is_index_stale(self, cached_hashes: Dict[str, str]) -> bool:
-        """检查索引是否过期（文件是否有变化）"""
+        """
+        检查索引是否过期（文件是否有变化）
+
+        优化：缓存 staleness 检查结果，避免重复遍历项目树。
+        """
+        if self._staleness_checked:
+            return False
         # 基础跳过目录
         skip_dirs = ['.omniflow_index', '__pycache__', '.git']
-        # 根据配置决定是否跳过测试目录
         if not self.include_tests:
             skip_dirs.extend(['tests', 'test'])
 
+        # 快速检查：文件数量是否匹配
+        py_count_in_cache = len(cached_hashes)
+
         for root, _, files in os.walk(self.project_path):
-            # 跳过指定目录
             if any(skip in root for skip in skip_dirs):
                 continue
 
@@ -174,12 +192,12 @@ class CodeIndexerService:
                     rel_path = str(file_path.relative_to(self.project_path))
                     current_hash = self._get_file_hash(file_path)
 
-                    # 如果文件不在缓存中或哈希值不同，说明索引过期
                     if rel_path not in cached_hashes:
                         return True
                     if cached_hashes[rel_path] != current_hash:
                         return True
 
+        self._staleness_checked = True
         return False
 
     def _extract_signature(self, node: ast.AST, content: str) -> str:
@@ -227,6 +245,7 @@ class CodeIndexerService:
                     print("使用缓存的代码索引...")
                     chunks_data = cached_data.get('chunks', [])
                     self.chunks = [CodeChunk(**chunk) for chunk in chunks_data]
+                    self._rebuild_chunk_map()
                     return self.chunks
 
         print("正在重新构建代码索引...")
@@ -302,6 +321,9 @@ class CodeIndexerService:
         }
         self._save_index_cache(index_data)
         print(f"代码索引构建完成: {len(self.chunks)} 个代码块来自 {len(file_hashes)} 个文件")
+
+        # 重建 O(1) 查询索引
+        self._rebuild_chunk_map()
 
         # 同步到向量数据库
         if self.collection:
@@ -451,6 +473,40 @@ class CodeIndexerService:
 
         return score
 
+    async def _get_top_scored_chunks(self, query: str, top_k: int = 5) -> List[CodeChunk]:
+        """
+        获取 top_k 个最相关的代码块（混合检索，与 semantic_search 共享评分逻辑）
+
+        注意：semantic_search 已单独调用获取 formatted string，
+        此方法仅获取原始 chunk 对象用于完整文件内容读取。
+        """
+        if not self.chunks:
+            return []
+
+        # 混合评分
+        scored: Dict[str, tuple] = {}  # chunk_id -> (chunk, score)
+
+        # 关键词评分
+        for chunk in self.chunks:
+            score = self._calculate_keyword_similarity(query, chunk)
+            if score > 0:
+                chunk_id = f"{chunk.file_path}:{chunk.name}:{chunk.start_line}"
+                scored[chunk_id] = (chunk, score * 0.3)
+
+        # 向量评分（可选）
+        if self.collection:
+            vector_results = await self._vector_search(query, top_k * 2)
+            for chunk, similarity in vector_results:
+                chunk_id = f"{chunk.file_path}:{chunk.name}:{chunk.start_line}"
+                if chunk_id in scored:
+                    prev_chunk, prev_score = scored[chunk_id]
+                    scored[chunk_id] = (prev_chunk, prev_score + similarity * 10.0)
+                else:
+                    scored[chunk_id] = (chunk, similarity * 10.0)
+
+        sorted_results = sorted(scored.values(), key=lambda x: x[1], reverse=True)
+        return [chunk for chunk, _ in sorted_results[:top_k]]
+
     async def _vector_search(self, query: str, top_k: int = 10) -> List[Tuple[CodeChunk, float]]:
         """
         向量相似度搜索
@@ -480,17 +536,13 @@ class CodeIndexerService:
             vector_results = []
             if results and results['ids']:
                 for i, chunk_id in enumerate(results['ids'][0]):
-                    metadata = results['metadatas'][0][i]
                     distance = results['distances'][0][i]
 
-                    # 找到对应的 CodeChunk（使用新的 ID 格式匹配）
-                    for chunk in self.chunks:
-                        expected_id = f"{chunk.file_path}:{chunk.name}:{chunk.start_line}"
-                        if expected_id == chunk_id:
-                            # 将距离转换为相似度分数（余弦距离 -> 相似度）
-                            similarity = 1.0 - distance
-                            vector_results.append((chunk, similarity))
-                            break
+                    # O(1) 查找
+                    chunk = self._chunk_map.get(chunk_id)
+                    if chunk is not None:
+                        similarity = 1.0 - distance
+                        vector_results.append((chunk, similarity))
 
             return vector_results
 
@@ -763,27 +815,18 @@ class CodeIndexerService:
                 - file_summaries: 文件摘要列表
                 - related_chunks: 原始代码块列表
         """
-        # 1. 执行语义检索
+        # 1. 执行语义检索（带 formatted string）
         semantic_results = await self.semantic_search(
             query=query,
             top_k=top_k,
             chunk_types=["function", "class", "method"]
         )
 
-        # 2. 获取相关代码块
+        # 2. 获取 top_k 相关代码块（复用 semantic_search 的评分，不再重复扫描）
         if not self.chunks:
             self.extract_code_units()
 
-        # 计算相关性分数
-        scored_chunks = []
-        for chunk in self.chunks:
-            score = self._calculate_keyword_similarity(query, chunk)
-            if score > 0:
-                scored_chunks.append((chunk, score))
-
-        # 按分数排序并取前 K 个
-        scored_chunks.sort(key=lambda x: x[1], reverse=True)
-        top_chunks = [chunk for chunk, _ in scored_chunks[:top_k]]
+        top_chunks = await self._get_top_scored_chunks(query, top_k)
 
         # 3. 获取完整文件内容
         full_files = await self.get_files_by_chunks(top_chunks)

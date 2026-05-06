@@ -164,30 +164,30 @@ export function DeliveryPanel({ outputData }: DeliveryPanelProps) {
           <div className="grid grid-cols-2 gap-3">
             <div className="p-3 bg-bg-secondary rounded-lg border border-border-default text-center">
               <div className="text-2xl font-semibold text-status-success">
-                {executionSummary.success ?? 0}
+                {executionSummary.success}
               </div>
               <div className="text-xs text-text-tertiary mt-1">成功处理文件</div>
             </div>
             <div className="p-3 bg-bg-secondary rounded-lg border border-border-default text-center">
               <div className="text-2xl font-semibold text-text-primary">
-                {executionSummary.total ?? 0}
+                {executionSummary.total}
               </div>
               <div className="text-xs text-text-tertiary mt-1">总文件数</div>
             </div>
           </div>
-          {(executionSummary.total ?? 0) > 0 && (
+          {executionSummary.total > 0 && (
             <div className="p-3 bg-bg-secondary rounded-lg">
               <div className="flex items-center justify-between text-sm">
                 <span className="text-text-secondary">成功率</span>
                 <span className="font-medium text-text-primary">
-                  {Math.round(((executionSummary.success ?? 0) / (executionSummary.total || 1)) * 100)}%
+                  {Math.round((executionSummary.success / executionSummary.total) * 100)}%
                 </span>
               </div>
               <div className="mt-2 h-2 bg-bg-tertiary rounded-full overflow-hidden">
                 <div
                   className="h-full bg-status-success rounded-full transition-all"
                   style={{
-                    width: `${((executionSummary.success ?? 0) / (executionSummary.total || 1)) * 100}%`
+                    width: `${(executionSummary.success / executionSummary.total) * 100}%`
                   }}
                 />
               </div>

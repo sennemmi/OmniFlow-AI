@@ -386,15 +386,21 @@ class LangGraphAgent(ABC, Generic[T]):
         # 1. 强力剥离 Markdown 代码块标记
         clean_response = response.strip()
 
-        # 1.1 先尝试提取 ```json 或 ``` 代码块中的内容
-        # 匹配 ```json...``` 或 ```...``` 包裹的内容
-        code_block_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', clean_response, re.DOTALL)
+        # 1.1 只提取包裹整个响应的 ```json 代码块（从响应开头开始）
+        # 使用 re.match 而非 re.search，确保只匹配从开头开始的代码块
+        # 避免误匹配 JSON 字段值内部嵌套的代码块（如 suggestion 中的 ```python）
+        code_block_match = re.match(
+            r'\s*```(?:json)?\s*\n(.*)\n\s*```\s*$',
+            clean_response, re.DOTALL
+        )
         if code_block_match:
-            clean_response = code_block_match.group(1).strip()
+            inner = code_block_match.group(1).strip()
+            # 安全校验：提取的内容必须以 { 或 [ 开头（确认为 JSON）
+            if inner and inner[0] in ('{', '['):
+                clean_response = inner
         elif clean_response.startswith("```"):
-            # 移除开头的 ```json 或 ```
+            # 兜底：如果开头是 ``` 但不是标准包裹格式，手动清理首尾标记
             clean_response = re.sub(r'^```(?:json)?\s*', '', clean_response)
-            # 移除结尾的 ```
             clean_response = re.sub(r'\s*```$', '', clean_response)
 
         clean_response = clean_response.strip()

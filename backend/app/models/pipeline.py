@@ -25,7 +25,7 @@ class StageName(str, Enum):
     REQUIREMENT = "REQUIREMENT"
     DESIGN = "DESIGN"
     CODING = "CODING"
-    UNIT_TESTING = "UNIT_TESTING"    # 新增：单元测试阶段
+    UNIT_TESTING = "UNIT_TESTING"    # 新增：分层测试阶段
     CODE_REVIEW = "CODE_REVIEW"
     DELIVERY = "DELIVERY"
 

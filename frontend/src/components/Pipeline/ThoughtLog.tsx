@@ -1,18 +1,21 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Sparkles, Pause, Brain, RefreshCw } from 'lucide-react';
+import { Terminal, Cpu, Search, FileCode, AlertTriangle, CheckCircle, Pause, Brain, RefreshCw, Activity, Server, Gauge } from 'lucide-react';
 
 // ============================================
-// Agent 终端 - SSE 实时日志流组件（浅色主题）
-// 【修复】增加指数退避重连机制
+// Agent Terminal - SSE Real-time Log Stream Component
+// Professional light theme terminal design
+// Enhanced with system metrics and error details
 // ============================================
 
 interface LogEntry {
   id: string;
   timestamp: Date;
-  type: 'info' | 'thinking' | 'action' | 'warning' | 'success' | 'error' | 'paused' | 'thought';
+  type: 'info' | 'thinking' | 'action' | 'warning' | 'success' | 'error' | 'paused' | 'thought' | 'system' | 'metrics';
   message: string;
   details?: string;
   isThought?: boolean;
+  source?: string;
+  extra?: Record<string, any>;
 }
 
 interface ThoughtLogProps {
@@ -22,7 +25,7 @@ interface ThoughtLogProps {
   isRunning?: boolean;
 }
 
-// SSE 日志级别映射到 UI 类型
+// SSE log level mapping to UI type
 function levelToType(level: string): LogEntry['type'] {
   const map: Record<string, LogEntry['type']> = {
     debug: 'info',
@@ -31,21 +34,27 @@ function levelToType(level: string): LogEntry['type'] {
     error: 'error',
     success: 'success',
     thought: 'thought',
+    system: 'system',
+    metrics: 'metrics',
   };
   return map[level] ?? 'info';
 }
 
-// 阶段名称映射到显示文本（支持后端阶段名和前端节点名）
+// Stage name mapping to display text
 function stageToLabel(stage: string): string {
   const map: Record<string, string> = {
-    REQUIREMENT: '需求分析',
-    DESIGN: '技术设计',
-    CODING: '代码生成',
-    CODER: '代码生成',
-    UNIT_TESTING: '单元测试',
-    TESTER: '单元测试',
-    CODE_REVIEW: '代码审查',
-    DELIVERY: '代码交付',
+    REQUIREMENT: 'Requirement Analysis',
+    DESIGN: 'Technical Design',
+    CODING: 'Code Generation',
+    CODER: 'Code Generation',
+    UNIT_TESTING: 'Layered Testing',
+    TESTER: 'Layered Testing',
+    CODE_REVIEW: 'Code Review',
+    DELIVERY: 'Code Delivery',
+    SYSTEM: 'System',
+    METRICS: 'Metrics',
+    ERROR: 'Error',
+    STACK_TRACE: 'Stack Trace',
   };
   return map[stage] ?? stage;
 }
@@ -59,6 +68,8 @@ const typeIcons = {
   error: AlertTriangle,
   paused: Pause,
   thought: Brain,
+  system: Server,
+  metrics: Gauge,
 };
 
 const typeColors = {
@@ -70,6 +81,8 @@ const typeColors = {
   error: 'text-red-600',
   paused: 'text-blue-600',
   thought: 'text-purple-600',
+  system: 'text-cyan-600',
+  metrics: 'text-orange-600',
 };
 
 const typeBgColors = {
@@ -81,43 +94,36 @@ const typeBgColors = {
   error: 'bg-red-50',
   paused: 'bg-blue-50',
   thought: 'bg-purple-50',
+  system: 'bg-cyan-50',
+  metrics: 'bg-orange-50',
 };
 
-const typeBorderColors = {
-  info: 'border-slate-200',
-  thinking: 'border-blue-200',
-  action: 'border-amber-200',
-  warning: 'border-amber-200',
-  success: 'border-emerald-200',
-  error: 'border-red-200',
-  paused: 'border-blue-200',
-  thought: 'border-purple-200',
+const typeLabels = {
+  info: 'INFO',
+  thinking: 'THINK',
+  action: 'ACTION',
+  warning: 'WARN',
+  success: 'SUCCESS',
+  error: 'ERROR',
+  paused: 'PAUSED',
+  thought: 'THOUGHT',
+  system: 'SYSTEM',
+  metrics: 'METRICS',
 };
 
-// 打字机效果组件
-function TypewriterText({ text, speed = 30 }: { text: string; speed?: number }) {
-  const [displayText, setDisplayText] = useState('');
-  const [currentIndex, setCurrentIndex] = useState(0);
+// Source colors
+const sourceColors: Record<string, string> = {
+  backend: 'border-l-blue-500',
+  system: 'border-l-cyan-500',
+  frontend: 'border-l-purple-500',
+};
 
-  useEffect(() => {
-    if (currentIndex < text.length) {
-      const timeout = setTimeout(() => {
-        setDisplayText((prev) => prev + text[currentIndex]);
-        setCurrentIndex((prev) => prev + 1);
-      }, speed);
-      return () => clearTimeout(timeout);
-    }
-  }, [currentIndex, text, speed]);
-
-  return <span>{displayText}</span>;
-}
-
-// 重连配置
+// Reconnect configuration
 const RECONNECT_CONFIG = {
-  initialDelay: 1000,      // 初始重连延迟 1秒
-  maxDelay: 30000,         // 最大重连延迟 30秒
-  maxAttempts: 10,         // 最大重连次数
-  backoffMultiplier: 2,    // 指数退避乘数
+  initialDelay: 1000,
+  maxDelay: 30000,
+  maxAttempts: 10,
+  backoffMultiplier: 2,
 };
 
 export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRunning = true }: ThoughtLogProps) {
@@ -125,15 +131,16 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
   const [isTyping, setIsTyping] = useState(false);
   const [isRunning, setIsRunning] = useState(initialIsRunning);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'reconnecting'>('connecting');
+  const [showSystemLogs, setShowSystemLogs] = useState(true);
+  const [showMetrics, setShowMetrics] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const hasPausedRef = useRef(false);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelayRef = useRef(RECONNECT_CONFIG.initialDelay);
-  // 【修复】仅使用 ref 记录重连次数，避免不必要的重渲染和双重重连
   const reconnectAttemptRef = useRef(0);
 
-  // 清理重连定时器
+  // Clear reconnect timeout
   const clearReconnectTimeout = useCallback(() => {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
@@ -141,16 +148,14 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
     }
   }, []);
 
-  // 建立 SSE 连接
+  // Establish SSE connection
   const connectSSE = useCallback(() => {
     if (!pipelineId) return;
 
-    // 清理之前的连接
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
 
-    // 如果已完成，不再重连
     if (status === 'success' || status === 'failed') {
       setConnectionStatus('disconnected');
       setIsRunning(false);
@@ -159,21 +164,27 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
 
     setConnectionStatus(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
 
-    // 创建 SSE 连接
     const url = `/api/v1/pipeline/${pipelineId}/logs`;
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
     es.onopen = () => {
       setConnectionStatus('connected');
-      // 【修复】重置 ref 而非 state
       reconnectAttemptRef.current = 0;
       reconnectDelayRef.current = RECONNECT_CONFIG.initialDelay;
     };
 
     es.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data) as { ts: string; level: string; msg: string; stage: string; is_thought?: boolean };
+        const data = JSON.parse(event.data) as { 
+          ts: string; 
+          level: string; 
+          msg: string; 
+          stage: string; 
+          is_thought?: boolean;
+          source?: string;
+          [key: string]: any;
+        };
 
         const entry: LogEntry = {
           id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
@@ -182,15 +193,17 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
           message: data.msg,
           details: stageToLabel(data.stage),
           isThought: data.is_thought,
+          source: data.source || 'backend',
+          extra: Object.fromEntries(
+            Object.entries(data).filter(([k]) => !['ts', 'level', 'msg', 'stage', 'is_thought', 'source'].includes(k))
+          ),
         };
 
         setLogs((prev) => {
-          // 最多保留 200 条日志
           const newLogs = [...prev, entry];
-          return newLogs.length > 200 ? newLogs.slice(-200) : newLogs;
+          return newLogs.length > 500 ? newLogs.slice(-500) : newLogs;
         });
 
-        // 触发打字机效果
         setIsTyping(true);
         setTimeout(() => setIsTyping(false), 300);
       } catch (e) {
@@ -198,7 +211,6 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
       }
     };
 
-    // 监听 done 事件
     es.addEventListener('done', () => {
       es.close();
       setIsRunning(false);
@@ -207,10 +219,8 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
     });
 
     es.onerror = () => {
-      // SSE 断线时尝试重连
       es.close();
-      
-      // 如果已完成或已达到最大重试次数，不再重连
+
       if (status === 'success' || status === 'failed') {
         setConnectionStatus('disconnected');
         return;
@@ -218,11 +228,10 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
 
       if (reconnectAttemptRef.current >= RECONNECT_CONFIG.maxAttempts) {
         setConnectionStatus('disconnected');
-        console.error(`[ThoughtLog] SSE 重连失败，已达到最大重试次数 (${RECONNECT_CONFIG.maxAttempts})`);
+        console.error(`[ThoughtLog] SSE reconnect failed, max attempts reached (${RECONNECT_CONFIG.maxAttempts})`);
         return;
       }
 
-      // 指数退避重连
       reconnectAttemptRef.current += 1;
       const currentAttempt = reconnectAttemptRef.current;
       setConnectionStatus('reconnecting');
@@ -232,20 +241,18 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
         RECONNECT_CONFIG.maxDelay
       );
 
-      console.log(`[ThoughtLog] SSE 连接断开，${delay}ms 后尝试第 ${currentAttempt} 次重连...`);
+      console.log(`[ThoughtLog] SSE disconnected, reconnecting in ${delay}ms (attempt ${currentAttempt})...`);
 
       reconnectTimeoutRef.current = setTimeout(() => {
         connectSSE();
       }, delay);
     };
-    // 【修复】移除 reconnectAttempt 依赖，避免双重重连
   }, [pipelineId, status, clearReconnectTimeout]);
 
-  // SSE 连接管理
+  // SSE connection management
   useEffect(() => {
     connectSSE();
 
-    // 清理函数
     return () => {
       clearReconnectTimeout();
       if (eventSourceRef.current) {
@@ -254,16 +261,14 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
     };
   }, [pipelineId, initialIsRunning, connectSSE, clearReconnectTimeout]);
 
-  // 手动重连
+  // Manual reconnect
   const handleManualReconnect = useCallback(() => {
-    // 【修复】重置 ref 而非 state
     reconnectAttemptRef.current = 0;
     reconnectDelayRef.current = RECONNECT_CONFIG.initialDelay;
     connectSSE();
   }, [connectSSE]);
 
-  // 当状态变为 paused 时，添加暂停提示
-  // 【修复】当状态从 paused 变为 running 时重置 hasPausedRef，支持多次暂停
+  // Handle paused state
   useEffect(() => {
     if (status === 'paused' && !hasPausedRef.current) {
       hasPausedRef.current = true;
@@ -273,173 +278,194 @@ export function ThoughtLog({ pipelineId, stageId, status, isRunning: initialIsRu
           id: 'paused-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9),
           timestamp: new Date(),
           type: 'paused',
-          message: '【系统提示】分析已完成',
-          details: '流水线已暂停，等待人类主驾驶审批。请点击左侧高亮的节点查看详细方案！',
+          message: 'Analysis complete - awaiting approval',
+          details: 'Pipeline paused. Review the highlighted nodes for detailed proposals.',
+          source: 'system',
         },
       ]);
     } else if (status === 'running' && hasPausedRef.current) {
-      // 【修复】状态从 paused 恢复为 running 时重置 ref
       hasPausedRef.current = false;
     }
   }, [status]);
 
-  // 自动滚动到底部
+  // Auto scroll to bottom
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [logs]);
 
-  // 根据状态显示不同的头部状态
-  const getStatusDisplay = () => {
-    if (status === 'paused') {
-      return (
-        <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-          <span className="text-xs text-slate-500">等待审批</span>
-        </span>
-      );
+  // Get connection status display
+  const getConnectionStatus = () => {
+    switch (connectionStatus) {
+      case 'connected':
+        return { text: 'LIVE', color: 'text-emerald-600', bg: 'bg-emerald-500', animate: true };
+      case 'connecting':
+        return { text: 'CONNECTING', color: 'text-amber-600', bg: 'bg-amber-500', animate: true };
+      case 'reconnecting':
+        return { text: `RECONNECTING ${reconnectAttemptRef.current}/${RECONNECT_CONFIG.maxAttempts}`, color: 'text-amber-600', bg: 'bg-amber-500', animate: true };
+      default:
+        return { text: 'OFFLINE', color: 'text-slate-400', bg: 'bg-slate-400', animate: false };
     }
-    if (isRunning && connectionStatus === 'connected') {
-      return (
-        <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-xs text-slate-500">实时接收中</span>
-        </span>
-      );
-    }
-    if (connectionStatus === 'connecting') {
-      return (
-        <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-          <span className="text-xs text-slate-500">连接中...</span>
-        </span>
-      );
-    }
-    if (connectionStatus === 'reconnecting') {
-      return (
-        <span className="flex items-center gap-1.5 ml-2">
-          <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-          <span className="text-xs text-slate-500">重连中 ({reconnectAttemptRef.current}/{RECONNECT_CONFIG.maxAttempts})...</span>
-        </span>
-      );
-    }
-    return null;
+  };
+
+  const connStatus = getConnectionStatus();
+
+  // Filter logs based on settings
+  const filteredLogs = logs.filter(log => {
+    if (log.type === 'system' && !showSystemLogs) return false;
+    if (log.type === 'metrics' && !showMetrics) return false;
+    return true;
+  });
+
+  // Format extra data for display
+  const formatExtra = (extra?: Record<string, any>): string => {
+    if (!extra) return '';
+    const entries = Object.entries(extra).slice(0, 3);
+    return entries.map(([k, v]) => `${k}=${v}`).join(' | ');
   };
 
   return (
-    // 关键修改点：将 h-full 改为固定高度，并确保 flex-col 布局
-    <div className="h-[600px] flex flex-col bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
-      {/* 终端头部 - 浅色主题，添加 flex-shrink-0 防止被压缩 */}
-      <div className="flex items-center justify-between px-4 py-3 bg-slate-50 border-b border-slate-200 flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center">
-            <Terminal className="w-4 h-4 text-blue-600" />
+    <div className="h-[600px] flex flex-col bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm">
+      {/* Terminal Header */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-slate-500" />
+            <span className="text-sm font-medium text-slate-800">Agent Terminal</span>
           </div>
-          <div>
-            <span className="text-sm font-semibold text-slate-900">Agent 终端</span>
-            {getStatusDisplay()}
+          <div className="h-4 w-px bg-slate-300" />
+          <div className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${connStatus.bg} ${connStatus.animate ? 'animate-pulse' : ''}`} />
+            <span className={`text-xs font-mono ${connStatus.color}`}>{connStatus.text}</span>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {/* 重连按钮 - 仅在运行中或暂停状态显示，已完成/失败状态隐藏 */}
+        <div className="flex items-center gap-3">
+          {/* Filter toggles */}
+          <div className="flex items-center gap-2 mr-2">
+            <button
+              onClick={() => setShowSystemLogs(!showSystemLogs)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${
+                showSystemLogs ? 'bg-cyan-100 text-cyan-700' : 'text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <Server className="w-3 h-3" />
+              <span className="font-mono">SYSTEM</span>
+            </button>
+            <button
+              onClick={() => setShowMetrics(!showMetrics)}
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${
+                showMetrics ? 'bg-orange-100 text-orange-700' : 'text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <Gauge className="w-3 h-3" />
+              <span className="font-mono">METRICS</span>
+            </button>
+          </div>
           {connectionStatus === 'disconnected' && status !== 'success' && status !== 'failed' && (status === 'running' || status === 'paused') && (
             <button
               onClick={handleManualReconnect}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded transition-colors"
-              title="重新连接日志流"
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors"
+              title="Reconnect log stream"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              重连
+              <RefreshCw className="w-3 h-3" />
+              <span className="font-mono">RECONNECT</span>
             </button>
           )}
           <div className="flex items-center gap-1.5">
-            <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
-            <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
-            <div className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+            <div className="w-3 h-3 rounded-full bg-red-400" />
+            <div className="w-3 h-3 rounded-full bg-amber-400" />
+            <div className="w-3 h-3 rounded-full bg-emerald-400" />
           </div>
         </div>
       </div>
 
-      {/* 日志内容区 - 核心滚动区域 */}
-      {/* flex-1 会占据剩余所有空间，overflow-y-auto 负责滚动，min-h-0 确保正确触发滚动 */}
+      {/* Terminal Content */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto p-3 font-mono text-sm space-y-2 scrollbar-hide bg-slate-50/50 min-h-0"
+        className="flex-1 overflow-y-auto p-0 font-mono text-sm bg-white min-h-0 scrollbar-hide"
       >
-        {logs.length === 0 ? (
+        {filteredLogs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-slate-400">
-            <div className="w-12 h-12 rounded-xl bg-slate-100 flex items-center justify-center mb-3">
-              <Sparkles className="w-6 h-6 text-slate-400" />
-            </div>
-            <p className="text-sm">
-              {connectionStatus === 'connecting' ? '正在连接日志流...' :
-               connectionStatus === 'reconnecting' ? `正在重连 (${reconnectAttemptRef.current}/${RECONNECT_CONFIG.maxAttempts})...` :
-               '等待 Agent 启动...'}
+            <Activity className="w-8 h-8 mb-3 opacity-50" />
+            <p className="text-sm font-mono">
+              {connectionStatus === 'connecting' ? 'Connecting to log stream...' :
+               connectionStatus === 'reconnecting' ? `Reconnecting (${reconnectAttemptRef.current}/${RECONNECT_CONFIG.maxAttempts})...` :
+               'Waiting for Agent to start...'}
             </p>
           </div>
         ) : (
-          logs.map((log, index) => {
-            const Icon = typeIcons[log.type];
-            const isLast = index === logs.length - 1;
+          <div className="divide-y divide-slate-100">
+            {filteredLogs.map((log, index) => {
+              const Icon = typeIcons[log.type];
+              const isLast = index === filteredLogs.length - 1;
+              const timeStr = log.timestamp.toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+              });
+              const sourceBorder = sourceColors[log.source || 'backend'] || 'border-l-slate-300';
 
-            return (
-              <div
-                key={log.id}
-                className={`flex items-start gap-3 p-3 rounded-lg border transition-all duration-300 ${
-                  typeBgColors[log.type]
-                } ${typeBorderColors[log.type]} ${
-                  isLast ? 'ring-1 ring-blue-200 shadow-sm' : ''
-                }`}
-              >
-                <div className={`w-6 h-6 rounded-md flex items-center justify-center flex-shrink-0 ${typeBgColors[log.type]}`}>
-                  <Icon className={`w-3.5 h-3.5 ${typeColors[log.type]}`} />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className={`text-sm ${typeColors[log.type]}`}>
-                    {isLast && isTyping && log.type !== 'paused' ? (
-                      <TypewriterText text={log.message} />
-                    ) : (
-                      log.message
+              return (
+                <div
+                  key={log.id}
+                  className={`flex items-start gap-3 px-4 py-2 hover:bg-slate-50 transition-colors border-l-2 ${sourceBorder} ${
+                    isLast ? 'bg-blue-50/50' : ''
+                  } ${log.type === 'error' ? 'bg-red-50/50' : ''}`}
+                >
+                  <span className="text-xs text-slate-400 flex-shrink-0 font-mono mt-0.5 w-16">
+                    {timeStr}
+                  </span>
+                  <div className="flex items-center gap-2 flex-shrink-0 w-24">
+                    <Icon className={`w-3.5 h-3.5 ${typeColors[log.type]}`} />
+                    <span className={`text-xs font-mono font-semibold ${typeColors[log.type]}`}>
+                      {typeLabels[log.type]}
+                    </span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <span className={`text-sm ${typeColors[log.type]} ${log.type === 'error' ? 'font-semibold' : ''}`}>
+                      {log.message}
+                      {isLast && isRunning && log.type !== 'paused' && (
+                        <span className="inline-block w-2 h-4 ml-1 bg-blue-500 animate-pulse" />
+                      )}
+                    </span>
+                    {log.details && log.details !== stageToLabel(log.details) && (
+                      <span className="text-xs text-slate-400 ml-2">
+                        [{log.details}]
+                      </span>
                     )}
-                    {isLast && isRunning && log.type !== 'paused' && (
-                      <span className="inline-block w-1.5 h-4 ml-1 bg-blue-500 animate-pulse rounded-sm" />
+                    {log.extra && Object.keys(log.extra).length > 0 && (
+                      <span className="text-xs text-slate-400 ml-2">
+                        ({formatExtra(log.extra)})
+                      </span>
                     )}
                   </div>
-                  {log.details && (
-                    <div className={`text-xs mt-1 ${
-                      log.type === 'paused' ? 'text-blue-600 font-medium' : 'text-slate-500'
-                    }`}>
-                      {log.details}
-                    </div>
-                  )}
                 </div>
-                <span className="text-xs text-slate-400 flex-shrink-0 font-mono">
-                  {log.timestamp.toLocaleTimeString('zh-CN', {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    second: '2-digit',
-                  })}
-                </span>
-              </div>
-            );
-          })
+              );
+            })}
+          </div>
         )}
       </div>
 
-      {/* 底部状态栏 - 浅色，添加 flex-shrink-0 防止被压缩 */}
-      <div className="flex items-center justify-between px-4 py-2.5 bg-white border-t border-slate-200 text-xs flex-shrink-0">
-        <div className="flex items-center gap-4">
-          <span className="text-slate-500">
-            日志: <span className="text-slate-900 font-medium">{logs.length}</span>
+      {/* Terminal Footer */}
+      <div className="flex items-center justify-between px-4 py-2 bg-slate-50 border-t border-slate-200 text-xs flex-shrink-0">
+        <div className="flex items-center gap-6">
+          <span className="text-slate-500 font-mono">
+            LOGS: <span className="text-slate-700">{logs.length}</span>
+            {logs.length !== filteredLogs.length && (
+              <span className="text-slate-400"> ({filteredLogs.length} shown)</span>
+            )}
           </span>
-          <span className="text-slate-500">
-            阶段: <span className="text-blue-600 font-medium">{stageId ? stageToLabel(stageId) : '初始化'}</span>
+          <span className="text-slate-500 font-mono">
+            STAGE: <span className="text-blue-600">{stageId ? stageToLabel(stageId).toUpperCase() : 'INIT'}</span>
+          </span>
+          <span className="text-slate-500 font-mono">
+            STATUS: <span className={isRunning ? 'text-emerald-600' : 'text-slate-500'}>{isRunning ? 'RUNNING' : 'IDLE'}</span>
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <Search className="w-3 h-3 text-slate-400" />
-          <span className="text-slate-500">实时观测</span>
+        <div className="flex items-center gap-1.5 text-slate-400">
+          <Search className="w-3 h-3" />
+          <span className="font-mono">LIVE STREAM</span>
         </div>
       </div>
     </div>

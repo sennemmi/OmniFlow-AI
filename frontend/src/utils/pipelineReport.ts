@@ -230,9 +230,18 @@ function buildTestingSection(outputData: Record<string, unknown>): string {
   if (testingResult) {
     const testGenerated = testingResult.test_generated as boolean;
     const testRunSuccess = testingResult.test_run_success as boolean;
+    const overallSuccess = testingResult.overall_success as boolean | undefined;
     const testError = testingResult.test_error as string | undefined;
+    const contractCheck = testingResult.contract_check as {
+      passed: boolean;
+      missing_symbols: string[];
+      total_symbols: number;
+    } | undefined;
 
-    if (testRunSuccess) {
+    // 总体结果
+    if (overallSuccess) {
+      sections.push('✅ **契约检查通过且所有测试通过**\n');
+    } else if (testRunSuccess) {
       sections.push('✅ **所有测试通过**\n');
     } else if (testGenerated) {
       sections.push('⚠️ **测试未通过**\n');
@@ -240,9 +249,106 @@ function buildTestingSection(outputData: Record<string, unknown>): string {
       sections.push('❌ **未生成测试文件**\n');
     }
 
+    // 契约检查结果
+    if (contractCheck) {
+      sections.push('### 契约检查\n');
+      if (contractCheck.passed) {
+        sections.push(`✅ **通过** (${contractCheck.total_symbols} 个符号已实现)\n`);
+      } else {
+        sections.push(`❌ **失败** (${contractCheck.missing_symbols.length}/${contractCheck.total_symbols} 个符号未实现)\n`);
+        if (contractCheck.missing_symbols.length > 0) {
+          sections.push('**未实现的符号：**\n');
+          contractCheck.missing_symbols.forEach(sym => {
+            sections.push(`- \`${sym}\``);
+          });
+          sections.push('');
+        }
+      }
+    }
+
+    // 分层测试结果
+    const testRunLayers = testingResult.test_run_layers as Array<{
+      layer: string;
+      passed: boolean;
+      summary: string;
+    }> | undefined;
+    if (testRunLayers && testRunLayers.length > 0) {
+      sections.push('### 分层测试详情\n');
+      sections.push('| 层级 | 状态 | 摘要 |');
+      sections.push('|------|------|------|');
+      testRunLayers.forEach(layer => {
+        const status = layer.passed ? '✅ 通过' : '❌ 失败';
+        sections.push(`| ${layer.layer} | ${status} | ${layer.summary} |`);
+      });
+      sections.push('');
+    }
+
     if (testError) {
       sections.push('### 错误信息\n');
       sections.push('```\n' + testError + '\n```\n');
+    }
+  }
+
+  // 【新增】AI 代码审查报告
+  const reviewReport = outputData.review_report as {
+    issues: Array<{
+      severity: 'high' | 'medium' | 'low';
+      category: string;
+      description: string;
+      suggestion: string;
+      file_path?: string;
+      line_number?: number;
+    }>;
+    overall_assessment: string;
+    summary: string;
+    improvement_suggestions: string[];
+    risk_level: 'high' | 'medium' | 'low';
+    approval_recommendation: 'approve' | 'approve_with_caution' | 'reject';
+  } | undefined;
+
+  if (reviewReport) {
+    sections.push('### AI 代码审查报告\n');
+
+    // 风险等级和审批建议
+    const riskLevelText = reviewReport.risk_level === 'high' ? '🔴 高风险' :
+                         reviewReport.risk_level === 'medium' ? '🟡 中风险' : '🟢 低风险';
+    const approvalText = reviewReport.approval_recommendation === 'approve' ? '✅ 建议批准' :
+                        reviewReport.approval_recommendation === 'approve_with_caution' ? '⚠️ 建议谨慎批准' : '❌ 建议拒绝';
+
+    sections.push(`**风险等级**: ${riskLevelText}`);
+    sections.push(`**审批建议**: ${approvalText}\n`);
+
+    // 总体评估
+    if (reviewReport.overall_assessment) {
+      sections.push('**总体评估**:\n');
+      sections.push(`${reviewReport.overall_assessment}\n`);
+    }
+
+    // 问题列表
+    if (reviewReport.issues && reviewReport.issues.length > 0) {
+      sections.push(`**发现问题** (${reviewReport.issues.length} 个):\n`);
+      reviewReport.issues.forEach((issue, idx) => {
+        const severityEmoji = issue.severity === 'high' ? '🔴' : issue.severity === 'medium' ? '🟡' : '🟢';
+        const severityText = issue.severity === 'high' ? '高' : issue.severity === 'medium' ? '中' : '低';
+        sections.push(`${idx + 1}. ${severityEmoji} **${issue.category}** (${severityText}优先级)`);
+        sections.push(`   - 描述: ${issue.description}`);
+        if (issue.suggestion) {
+          sections.push(`   - 建议: ${issue.suggestion}`);
+        }
+        if (issue.file_path) {
+          sections.push(`   - 文件: \`${issue.file_path}\`${issue.line_number ? `:${issue.line_number}` : ''}`);
+        }
+        sections.push('');
+      });
+    }
+
+    // 改进建议
+    if (reviewReport.improvement_suggestions && reviewReport.improvement_suggestions.length > 0) {
+      sections.push('**改进建议**:\n');
+      reviewReport.improvement_suggestions.forEach((suggestion, idx) => {
+        sections.push(`${idx + 1}. ${suggestion}`);
+      });
+      sections.push('');
     }
   }
 

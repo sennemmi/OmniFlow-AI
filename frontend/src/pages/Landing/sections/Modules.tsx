@@ -3,17 +3,17 @@ import { modules } from '../data';
 
 export function Modules() {
   return (
-    <section className="py-24 bg-bg-primary">
+    <section className="py-24 bg-gray-50">
       <div className="container-feishu">
         <div className="text-center max-w-3xl mx-auto mb-16 animate-on-scroll">
-          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-brand-primary/10 text-brand-primary text-sm font-medium mb-6">
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-blue-50 text-blue-600 text-sm font-medium mb-6">
             <Layers className="w-4 h-4" />
             功能模块
           </div>
-          <h2 className="text-4xl lg:text-5xl font-bold text-text-primary mb-6">
+          <h2 className="text-4xl lg:text-5xl font-bold text-gray-900 mb-6">
             覆盖研发全流程
           </h2>
-          <p className="text-text-secondary text-lg">
+          <p className="text-gray-600 text-lg">
             从架构设计到生产部署，提供完整的企业级研发工具链
           </p>
         </div>
@@ -24,19 +24,19 @@ export function Modules() {
             return (
               <div
                 key={module.title}
-                className="group p-8 rounded-2xl bg-bg-secondary border border-border-default hover:border-brand-primary/30 hover:shadow-xl hover:shadow-brand-primary/5 transition-all duration-300 animate-on-scroll"
+                className="group p-8 rounded-2xl bg-white border border-gray-200 hover:border-blue-300 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300 animate-on-scroll"
                 style={{ transitionDelay: `${index * 50}ms` }}
               >
-                <div className="w-14 h-14 rounded-2xl bg-brand-primary/10 flex items-center justify-center mb-6 group-hover:bg-brand-primary group-hover:scale-110 transition-all duration-300">
-                  <Icon className="w-7 h-7 text-brand-primary group-hover:text-white transition-colors" />
+                <div className="w-14 h-14 rounded-2xl bg-blue-50 flex items-center justify-center mb-6 group-hover:bg-blue-500 group-hover:scale-110 transition-all duration-300">
+                  <Icon className="w-7 h-7 text-blue-500 group-hover:text-white transition-colors" />
                 </div>
-                <h3 className="text-xl font-semibold text-text-primary mb-3">{module.title}</h3>
-                <p className="text-text-secondary mb-6 leading-relaxed">{module.description}</p>
+                <h3 className="text-xl font-semibold text-gray-900 mb-3">{module.title}</h3>
+                <p className="text-gray-600 mb-6 leading-relaxed">{module.description}</p>
                 <div className="flex flex-wrap gap-2">
                   {module.features.map((feature) => (
                     <span
                       key={feature}
-                      className="px-3 py-1 rounded-full bg-bg-tertiary text-text-secondary text-xs"
+                      className="px-3 py-1 rounded-full bg-gray-100 text-gray-600 text-xs"
                     >
                       {feature}
                     </span>

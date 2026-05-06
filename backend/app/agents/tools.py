@@ -440,7 +440,10 @@ class AgentTools:
             }
         ]
 
-        # 【权限控制】RepairerAgent 额外拥有 install_dependency 工具
+        # 【权限控制】RepairerAgent 额外拥有 install_dependency 和 run_tests 工具
+        logger.info(f"[AgentTools] tool_definitions: _agent_role={self._agent_role!r}, "
+                     f"pipeline_id={self._pipeline_id}, "
+                     f"include_repairer_tools={self._agent_role == 'repairer'}")
         if self._agent_role == "repairer":
             tools.append({
                 "type": "function",
@@ -456,6 +459,24 @@ class AgentTools:
                             }
                         },
                         "required": ["package_name"]
+                    }
+                }
+            })
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": "run_tests",
+                    "description": "【RepairerAgent 专用】运行测试验证修复效果。执行 pytest 并返回测试结果、失败信息和日志。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "test_path": {
+                                "type": "string",
+                                "description": "测试路径，默认为 'backend/tests/ai_generated'",
+                                "default": "backend/tests/ai_generated"
+                            }
+                        },
+                        "required": []
                     }
                 }
             })
@@ -518,6 +539,70 @@ class AgentTools:
                 "package": package_name
             })
 
+    async def run_tests(self, test_path: str = "backend/tests/ai_generated") -> str:
+        """
+        【RepairerAgent 专用】运行测试验证修复效果
+
+        Args:
+            test_path: 测试路径，默认为 "backend/tests/ai_generated"
+
+        Returns:
+            str: JSON 格式的测试结果
+        """
+        try:
+            # 获取 pipeline_id
+            pipeline_id = self._pipeline_id
+            if not pipeline_id:
+                return json.dumps({
+                    "success": False,
+                    "error": "Pipeline ID 未设置，无法执行测试"
+                })
+
+            logger.info(f"[AgentTools] 运行测试: {test_path}")
+
+            # 导入测试执行工具
+            from app.utils.test_execution import run_pytest_in_sandbox
+
+            # 运行测试
+            test_result = await run_pytest_in_sandbox(
+                pipeline_id=pipeline_id,
+                test_path=test_path,
+                timeout=120,
+            )
+
+            # 提取关键信息
+            success = test_result.get("success", False)
+            logs = test_result.get("logs", "")
+            failed_count = test_result.get("failed", 0)
+            passed_count = test_result.get("passed", 0)
+
+            # 提取失败的测试名称
+            import re
+            failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+
+            result = {
+                "success": success,
+                "passed": passed_count,
+                "failed": failed_count,
+                "failed_tests": failed_tests,
+                "logs_preview": logs[:2000] if logs else "",  # 限制日志长度
+                "full_logs_available": len(logs) > 2000
+            }
+
+            if success:
+                logger.info(f"[AgentTools] 测试通过: {passed_count} passed")
+            else:
+                logger.warning(f"[AgentTools] 测试失败: {failed_count} failed, 失败的测试: {failed_tests}")
+
+            return json.dumps(result)
+
+        except Exception as e:
+            logger.error(f"[AgentTools] 运行测试时出错: {e}")
+            return json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+
     async def execute_tool(self, tool_name: str, arguments: Dict[str, Any], pipeline_id: Optional[int] = None) -> str:
         sync_tool_map = {
             "glob": self.glob,
@@ -529,7 +614,8 @@ class AgentTools:
         async_tool_map = {
             "replace_lines": self.replace_lines,
             "install_dependency": self.install_dependency,
-            "semantic_search": self.semantic_search
+            "semantic_search": self.semantic_search,
+            "run_tests": self.run_tests
         }
 
         if tool_name in sync_tool_map:

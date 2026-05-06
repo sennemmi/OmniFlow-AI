@@ -69,3 +69,35 @@ test-ci: test-be-ci test-fe-unit
 # 快速冒烟测试（最常用）
 test-smoke:
 	cd backend && python -m pytest tests/unit -m unit -x -q
+
+# ==================== 测试报告生成 ====================
+
+# 生成后端专业测试报告与覆盖率
+test-be-report:
+	cd backend && python -m pytest tests/ \
+		-v \
+		--cov=app \
+		--cov-report=html:../reports/backend/coverage \
+		--cov-report=term-missing \
+		--html=../reports/backend/test_report.html \
+		--self-contained-html
+
+# 生成前端专业测试报告与覆盖率
+test-fe-report:
+	cd frontend && npm run test:coverage
+	@echo "前端覆盖率报告已生成在 frontend/coverage/index.html"
+
+# 运行 E2E 并生成报告
+test-e2e-report:
+	npx playwright test
+	npx playwright show-report
+
+# 一键打包所有报告（终极命令）
+generate-all-reports: test-be-report test-fe-report test-e2e-report
+	@echo "======================================================="
+	@echo "✅ 所有测试与覆盖率报告生成完毕！"
+	@echo "📊 后端测试报告: reports/backend/test_report.html"
+	@echo "📊 后端覆盖率:   reports/backend/coverage/index.html"
+	@echo "📊 前端覆盖率:   frontend/coverage/index.html"
+	@echo "📊 E2E 测试报告: playwright-report/index.html"
+	@echo "======================================================="

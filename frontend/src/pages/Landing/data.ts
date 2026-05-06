@@ -6,15 +6,12 @@ import {
   BarChart3,
   Clock,
   CheckCircle2,
-  Sparkles,
   Code2,
   Layers,
   MousePointer2,
   Users,
   Globe,
   GitPullRequest,
-  TrendingUp,
-  Award,
   ArrowRight,
   Play,
   ChevronRight,
@@ -25,7 +22,7 @@ export const coreFeatures = [
     id: 'ai-driven',
     title: 'AI 驱动研发',
     description: '基于大语言模型的智能代码生成、架构设计和代码审查，让 AI 成为您的研发伙伴',
-    icon: Sparkles,
+    icon: Zap,
     color: 'from-violet-500 to-purple-600',
     stats: { label: '效率提升', value: '3x' },
   },
@@ -72,7 +69,7 @@ export const modules = [
     title: '质量门禁',
     description: '自动化测试、代码扫描、安全检查，确保代码质量',
     icon: CheckCircle2,
-    features: ['单元测试', '代码扫描', '安全审计'],
+    features: ['分层测试', '代码扫描', '安全审计'],
   },
   {
     title: '一键部署',
@@ -101,74 +98,4 @@ export const stats = [
   { label: '企业客户', value: '500+', suffix: '', icon: Globe },
 ];
 
-export const testimonials = [
-  {
-    content: 'OmniFlowAI 让我们的研发效率提升了 3 倍，从需求到上线的时间从 2 周缩短到 3 天。',
-    author: '张明',
-    role: 'CTO',
-    company: '某独角兽企业',
-  },
-  {
-    content: '可视化工作区功能太棒了，产品经理可以直接在页面上标注修改需求，AI 自动完成代码变更。',
-    author: '李华',
-    role: '产品总监',
-    company: '某电商平台',
-  },
-  {
-    content: '企业级安全管控让我们放心地将核心系统接入，合规检查和质量门禁确保了代码质量。',
-    author: '王芳',
-    role: '研发负责人',
-    company: '某金融科技公司',
-  },
-];
-
-export const pricingPlans = [
-  {
-    name: '免费版',
-    description: '适合个人开发者和小团队',
-    price: '0',
-    period: '永久免费',
-    features: [
-      '每月 10 次 AI 代码生成',
-      '基础流水线功能',
-      '社区支持',
-      '1 个工作区',
-    ],
-    cta: '免费开始',
-    popular: false,
-  },
-  {
-    name: '专业版',
-    description: '适合成长型团队',
-    price: '99',
-    period: '/月',
-    features: [
-      '无限 AI 代码生成',
-      '高级流水线编排',
-      '可视化工作区',
-      '优先技术支持',
-      '5 个工作区',
-      '自定义模板',
-    ],
-    cta: '开始试用',
-    popular: true,
-  },
-  {
-    name: '企业版',
-    description: '适合大型企业',
-    price: '定制',
-    period: '',
-    features: [
-      '私有化部署',
-      'SSO 单点登录',
-      '高级安全合规',
-      '专属客户成功经理',
-      '无限工作区',
-      'SLA 保障',
-    ],
-    cta: '联系销售',
-    popular: false,
-  },
-];
-
-export { TrendingUp, Zap, Sparkles, Award, ArrowRight, Play, ChevronRight };
+export { ArrowRight, Play, ChevronRight };

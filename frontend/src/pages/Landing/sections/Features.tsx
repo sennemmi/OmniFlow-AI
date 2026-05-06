@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
 import {
-  Sparkles,
+  Zap,
   MousePointer2,
   Workflow,
   Shield,
   CheckCircle2,
   ChevronRight,
+  TrendingUp,
 } from 'lucide-react';
-import { coreFeatures, TrendingUp } from '../data';
+import { coreFeatures } from '../data';
 
 export function Features() {
   const [activeTab, setActiveTab] = useState(0);
@@ -20,17 +21,17 @@ export function Features() {
   }, []);
 
   return (
-    <section className="py-24">
+    <section className="py-24 bg-white">
       <div className="container-feishu">
         <div className="text-center max-w-3xl mx-auto mb-16 animate-on-scroll">
-          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-brand-primary/10 text-brand-primary text-sm font-medium mb-6">
-            <Sparkles className="w-4 h-4" />
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-blue-50 text-blue-600 text-sm font-medium mb-6">
+            <Zap className="w-4 h-4" />
             主要功能
           </div>
-          <h2 className="text-4xl lg:text-5xl font-bold text-text-primary mb-6">
+          <h2 className="text-4xl lg:text-5xl font-bold text-gray-900 mb-6">
             AI 重新定义研发流程
           </h2>
-          <p className="text-text-secondary text-lg">
+          <p className="text-gray-600 text-lg">
             从需求到部署，每一个环节都有 AI 的智能加持，让研发效率实现质的飞跃
           </p>
         </div>
@@ -47,8 +48,8 @@ export function Features() {
                   onClick={() => setActiveTab(index)}
                   className={`w-full text-left p-6 rounded-2xl border-2 transition-all duration-300 ${
                     isActive
-                      ? 'border-brand-primary bg-brand-primary/5 shadow-lg shadow-brand-primary/10'
-                      : 'border-border-default hover:border-brand-primary/30 hover:bg-bg-primary'
+                      ? 'border-blue-500 bg-blue-50/50 shadow-lg shadow-blue-500/10'
+                      : 'border-gray-200 hover:border-blue-300 hover:bg-gray-50'
                   }`}
                 >
                   <div className="flex items-start gap-4">
@@ -57,11 +58,11 @@ export function Features() {
                     </div>
                     <div className="flex-1">
                       <div className="flex items-center justify-between mb-2">
-                        <h3 className="text-lg font-semibold text-text-primary">{feature.title}</h3>
-                        {isActive && <ChevronRight className="w-5 h-5 text-brand-primary" />}
+                        <h3 className="text-lg font-semibold text-gray-900">{feature.title}</h3>
+                        {isActive && <ChevronRight className="w-5 h-5 text-blue-500" />}
                       </div>
-                      <p className="text-text-secondary text-sm mb-3">{feature.description}</p>
-                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-primary/10 text-brand-primary text-xs font-medium">
+                      <p className="text-gray-600 text-sm mb-3">{feature.description}</p>
+                      <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-50 text-blue-600 text-xs font-medium">
                         <TrendingUp className="w-3 h-3" />
                         {feature.stats.label}: {feature.stats.value}
                       </div>
@@ -78,7 +79,7 @@ export function Features() {
               {activeTab === 0 && (
                 <div className="h-full flex flex-col">
                   <div className="flex items-center gap-3 mb-6">
-                    <Sparkles className="w-8 h-8 text-purple-400" />
+                    <Zap className="w-8 h-8 text-blue-400" />
                     <span className="text-white font-semibold text-xl">AI 代码生成</span>
                   </div>
                   <div className="flex-1 rounded-xl bg-black/40 p-4 font-mono text-sm overflow-hidden">

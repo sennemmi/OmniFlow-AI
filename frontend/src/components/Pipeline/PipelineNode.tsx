@@ -76,9 +76,9 @@ const statusConfig: Record<
     label: '已拒绝',
     indicatorClass: 'failed'
   },
-  paused: { 
-    icon: Hand, 
-    className: 'text-status-warning bg-status-warning/10', 
+  paused: {
+    icon: Hand,
+    className: 'text-status-warning bg-status-warning/10',
     label: '待审批',
     indicatorClass: 'pending'
   },

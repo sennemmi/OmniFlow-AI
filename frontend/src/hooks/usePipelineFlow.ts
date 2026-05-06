@@ -53,7 +53,7 @@ export const STAGE_CONFIG: Record<string, { label: string; icon: string; descrip
   REQUIREMENT: { label: '需求分析', icon: 'FileText', description: 'AI 架构师分析需求' },
   DESIGN: { label: '技术设计', icon: 'Palette', description: 'AI 设计师制定方案' },
   CODER: { label: '自动编码', icon: 'Code', description: 'AI 程序员编写代码' },
-  TESTER: { label: '单元测试', icon: 'CheckCircle2', description: 'AI 测试员生成测试' },
+  TESTER: { label: '分层测试', icon: 'CheckCircle2', description: 'AI 测试员执行分层测试' },
   DELIVERY: { label: '代码交付', icon: 'GitBranch', description: 'Git Commit & PR' },
 };
 
@@ -65,7 +65,7 @@ export const stageMapping: Record<string, string> = {
   'REQUIREMENT': 'REQUIREMENT',
   'DESIGN': 'DESIGN',
   'CODING': 'CODER',
-  'UNIT_TESTING': 'TESTER',  // 新增：单元测试阶段映射到 TESTER 节点
+  'UNIT_TESTING': 'TESTER',  // 新增：分层测试阶段映射到 TESTER 节点
   'CODE_REVIEW': 'CODER',
   'DELIVERY': 'DELIVERY',
 };
@@ -79,21 +79,20 @@ export const getLayouts = (nodeWidth: number, horizontalGap: number, verticalGap
   DELIVERY: { x: (nodeWidth + horizontalGap) * 3, y: 0 },
 });
 
-// 获取阶段状态 - 支持并发执行（CODING 和 TESTING 同时运行）
-// 【修复】统一使用 success 状态，不再映射到 completed
+// 【修复】简化阶段状态获取 - 直接使用后端返回的 stage 状态
 export function getStageStatus(
-  stageName: string, // 这是前端的节点名称 (REQUIREMENT, DESIGN, CODER, TESTER, DELIVERY)
+  stageName: string, // 前端节点名称 (REQUIREMENT, DESIGN, CODER, TESTER, DELIVERY)
   backendStages: PipelineStage[],
-  currentStage: string | null, // 后端当前阶段
+  currentStage: string | null,
   pipelineStatus: string
 ): string {
-  // 建立后端真实名称到前端阶段的映射关系
+  // 建立后端阶段名到前端节点名的映射
   const backendToFrontendMap: Record<string, string> = {
     'REQUIREMENT': 'REQUIREMENT',
     'DESIGN': 'DESIGN',
     'CODING': 'CODER',
-    'UNIT_TESTING': 'TESTER', // 新增：单元测试阶段
-    'CODE_REVIEW': 'CODER', // Code review 也在前端 CODER 节点展示
+    'UNIT_TESTING': 'TESTER',
+    'CODE_REVIEW': 'CODER',
     'DELIVERY': 'DELIVERY'
   };
 
@@ -102,39 +101,17 @@ export function getStageStatus(
     s => backendToFrontendMap[s.name] === stageName
   );
 
-  // 获取当前后端阶段对应的前端节点名称
-  const mappedCurrentStage = currentStage ? backendToFrontendMap[currentStage] : null;
-
-  // 【并发执行支持】CODING 和 TESTING 可能同时运行
-  // 检查是否有并发的运行中阶段
-  const runningStages = backendStages.filter(s => s.status === 'running');
-
-  // 1. 如果这个节点正是【当前正在进行的节点】
-  if (mappedCurrentStage === stageName) {
-    if (pipelineStatus === 'paused') return 'paused';
-    if (pipelineStatus === 'running') return 'running';
-  }
-
-  // 【并发执行】检查该节点是否有正在运行的后端阶段
-  const hasRunningStage = runningStages.some(
-    s => backendToFrontendMap[s.name] === stageName
-  );
-  if (hasRunningStage && pipelineStatus === 'running') {
-    return 'running';
-  }
-
-  // 2. 如果后端有这个阶段的明确记录，返回它的真实状态
-  // 【修复】直接使用后端返回的状态，不再映射 success -> completed
+  // 如果后端有记录，直接返回其状态
   if (backendStage) {
     return backendStage.status;
   }
 
-  // 3. 如果没记录，根据顺序推断
+  // 没有记录时，根据当前阶段推断
+  const mappedCurrentStage = currentStage ? backendToFrontendMap[currentStage] : null;
   const currentIndex = STAGE_ORDER.indexOf(mappedCurrentStage || '');
   const thisIndex = STAGE_ORDER.indexOf(stageName);
 
   if (currentIndex === -1) return 'pending';
-  // 【修复】使用 success 而不是 completed
   if (thisIndex < currentIndex) return 'success';
   return 'pending';
 }
@@ -159,8 +136,18 @@ export function buildFlowElements(
     const config = STAGE_CONFIG[stageName];
     const status = getStageStatus(stageName, backendStages, currentStage, pipelineStatus);
 
-    // 查找后端对应的 stage 数据
-    const backendStage = backendStages.slice().reverse().find(s => stageMapping[s.name] === stageName);
+    // 查找后端对应的 stage 数据 - 区分 CODING 和 CODE_REVIEW
+    let backendStage: PipelineStage | undefined;
+    if (stageName === 'CODER') {
+      // CODER 节点：优先显示 CODING 阶段数据，如果没有则显示 CODE_REVIEW
+      backendStage = backendStages.slice().reverse().find(s => s.name === 'CODING') 
+                  || backendStages.slice().reverse().find(s => s.name === 'CODE_REVIEW');
+    } else if (stageName === 'TESTER') {
+      // TESTER 节点：只显示 UNIT_TESTING 阶段数据
+      backendStage = backendStages.slice().reverse().find(s => s.name === 'UNIT_TESTING');
+    } else {
+      backendStage = backendStages.slice().reverse().find(s => stageMapping[s.name] === stageName);
+    }
 
     // 判断是否是当前阶段
     const isCurrentStage = stageMapping[currentStage || ''] === stageName;
@@ -170,7 +157,7 @@ export function buildFlowElements(
     const isCodeReviewStage = currentStage === 'CODE_REVIEW';
     const isCoder = stageName === 'CODER';
     const isTester = stageName === 'TESTER';
-    // 只有 CODER 节点在 CODING 阶段显示为可审批
+    // CODER 节点在 CODING 或 CODE_REVIEW 阶段都显示为可审批
     const isPendingApproval = (isCodingStage && isCoder) || (isCodeReviewStage && isCoder);
 
     // 节点样式 - 根据状态设置
@@ -190,8 +177,45 @@ export function buildFlowElements(
 
     // 修复：只要有 output_data 就可以点击查看（包括 CODING 自动编码阶段）
     const hasOutputData = !!backendStage?.output_data;
-    // TESTER 节点不显示审批状态，只显示可点击
-    const isPending = (isCurrentStage && pipelineStatus === 'paused' && !isTester) || isPendingApproval;
+    // 【修改】TESTER 节点在测试失败且需要用户决策时也显示待审批提示
+    const testingResult = backendStage?.output_data?.testing_result;
+    const requiresUserDecision = testingResult?.requires_user_decision || testingResult?.warning;
+    const isPending = (isCurrentStage && pipelineStatus === 'paused' && !isTester) || isPendingApproval ||
+                      (isTester && requiresUserDecision); // TESTER 节点需要用户决策时也显示待审批
+
+    // 【新增】为 TESTER 节点构建详细的测试状态描述
+    let nodeDescription = backendStage?.description || config.description;
+    if (stageName === 'TESTER' && backendStage?.output_data) {
+      const testingResult = backendStage.output_data.testing_result || {};
+      const testRunSuccess = backendStage.output_data.test_run_success;
+      const contractCheck = backendStage.output_data.contract_check;
+      const layers = backendStage.output_data.layers || [];
+
+      // 构建测试状态描述
+      const parts: string[] = [];
+
+      // 契约检查状态
+      if (contractCheck) {
+        parts.push(contractCheck.passed ? '✓ 契约检查通过' : '✗ 契约检查失败');
+      }
+
+      // 分层测试状态
+      if (layers.length > 0) {
+        const passedLayers = layers.filter((l: any) => l.passed).length;
+        parts.push(`${passedLayers}/${layers.length} 层测试通过`);
+      }
+
+      // 修复状态
+      if (testRunSuccess === false) {
+        parts.push('修复失败');
+      } else if (testRunSuccess === true && layers.some((l: any) => !l.passed)) {
+        parts.push('✓ 修复成功');
+      }
+
+      if (parts.length > 0) {
+        nodeDescription = parts.join(' | ');
+      }
+    }
 
     nodes.push({
       id: stageName,
@@ -201,7 +225,7 @@ export function buildFlowElements(
         label: config.label,
         icon: config.icon,
         status: status,
-        description: backendStage?.description || config.description,
+        description: nodeDescription,
         stageId: stageName,
         isClickable: isPending || hasOutputData, // 修复：待审批或有数据都可点击
         backendStage: backendStage,
@@ -224,8 +248,17 @@ export function buildFlowElements(
 
   edgeConfigs.forEach(({ source, target }) => {
     const sourceStatus = getStageStatus(source, backendStages, currentStage, pipelineStatus);
-    const isRunning = sourceStatus === 'running' || 
-      (stageMapping[currentStage || ''] === source && pipelineStatus === 'running');
+    const targetStatus = getStageStatus(target, backendStages, currentStage, pipelineStatus);
+
+    // 【修复】边的流动状态判断：
+    // 1. 源阶段正在执行
+    // 2. 源阶段是当前正在执行的阶段的输入阶段（即数据流向当前阶段）
+    // 3. 目标阶段正在执行（表示数据正在流入该阶段）
+    const mappedCurrentStage = currentStage ? stageMapping[currentStage] : null;
+    const isSourceRunning = sourceStatus === 'running';
+    const isTargetRunning = targetStatus === 'running';
+    const isCurrentStageInput = mappedCurrentStage === target && pipelineStatus === 'running';
+    const isRunning = isSourceRunning || isTargetRunning || isCurrentStageInput;
 
     const edgeClass = animationState === 'fast'
       ? 'fast-flow'

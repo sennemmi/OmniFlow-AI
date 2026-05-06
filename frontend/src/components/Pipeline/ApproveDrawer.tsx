@@ -27,7 +27,7 @@ const APPROVE_TIMEOUT = 10000; // 10秒
 // ============================================
 
 export function ApproveDrawer() {
-  const { selectedStage, isApproveDrawerOpen, closeApproveDrawer, selectedPipeline: storedPipeline } = usePipelineStore();
+  const { selectedStage, isApproveDrawerOpen, closeApproveDrawer, selectedPipeline: storedPipeline, selectedNodeSource } = usePipelineStore();
   const { addToast } = useUIStore();
   const queryClient = useQueryClient();
   const [feedback, setFeedback] = useState('');
@@ -42,11 +42,11 @@ export function ApproveDrawer() {
   const [testerDecision, setTesterDecision] = useState<'accept' | 'reject' | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // 修复：用实时查询数据替代 store 快照
+  // 【修复】用实时查询数据替代 store 快照，添加 signal 用于清理
   const pipelineId = storedPipeline?.id;
   const { data: livePipeline } = useQuery<Pipeline>({
     queryKey: ['pipeline', String(pipelineId)],
-    queryFn: () => apiGet<Pipeline>(`/pipeline/${pipelineId}/status`),
+    queryFn: ({ signal }) => apiGet<Pipeline>(`/pipeline/${pipelineId}/status`, { signal }),
     enabled: !!pipelineId && isApproveDrawerOpen,
     refetchInterval: 2000,
     staleTime: 0,
@@ -55,28 +55,11 @@ export function ApproveDrawer() {
   // 优先使用实时数据，fallback 到 store 快照
   const selectedPipeline = livePipeline ?? storedPipeline;
 
-  // 【并发执行支持】根据选中的阶段名称获取对应的后端阶段数据
-  // CODING 和 UNIT_TESTING 是分开的两个阶段，需要分别获取
-  const liveSelectedStage = useMemo(() => {
-    if (!selectedPipeline?.stages || !selectedStage) return selectedStage;
+  // 【修复】简化：直接使用 selectedStage，不再做复杂映射
+  // 后端返回的 stages 数据已经是完整的，selectedStage 包含正确的 output_data
+  const liveSelectedStage = selectedStage;
 
-    // 根据前端阶段名称找到对应的后端阶段
-    const stageNameMap: Record<string, string> = {
-      'CODING': 'CODING',
-      'UNIT_TESTING': 'UNIT_TESTING',
-      'CODE_REVIEW': 'CODING', // CODE_REVIEW 显示 CODING 的数据
-      'REQUIREMENT': 'REQUIREMENT',
-      'DESIGN': 'DESIGN',
-      'DELIVERY': 'DELIVERY'
-    };
-
-    const targetBackendName = stageNameMap[selectedStage.name];
-    return selectedPipeline.stages.slice().reverse().find(
-      (s: PipelineStage) => s.name === targetBackendName
-    ) ?? selectedStage;
-  }, [selectedPipeline, selectedStage]);
-
-  // 获取 CODING 阶段数据
+  // 获取 CODING 阶段数据（用于 CODE_REVIEW 阶段显示代码）
   const codingStage = useMemo(() => {
     if (!selectedPipeline?.stages) return null;
     return selectedPipeline.stages.slice().reverse().find(
@@ -84,7 +67,7 @@ export function ApproveDrawer() {
     );
   }, [selectedPipeline]);
 
-  // 获取 UNIT_TESTING 阶段数据
+  // 获取 UNIT_TESTING 阶段数据（用于 CODE_REVIEW 阶段显示测试）
   const testingStage = useMemo(() => {
     if (!selectedPipeline?.stages) return null;
     return selectedPipeline.stages.slice().reverse().find(
@@ -92,10 +75,12 @@ export function ApproveDrawer() {
     );
   }, [selectedPipeline]);
 
-  // 判断是否是代码阶段（包括 CODE_REVIEW）
+  // 判断是否显示统一审批 UI（CODE_REVIEW 阶段且点击的是 CODER 或 TESTER 节点）
   // 判断是否处于 CODE_REVIEW 审批阶段
   const isCodeReviewStage = selectedPipeline?.current_stage === 'CODE_REVIEW';
-  const showUnifiedApproval = isCodeReviewStage;
+  // 【修复】只有当点击 CODER 或 TESTER 节点时才显示统一审批 UI
+  const isCoderOrTesterNode = selectedStage?.name === 'CODING' || selectedStage?.name === 'CODE_REVIEW' || selectedStage?.name === 'UNIT_TESTING';
+  const showUnifiedApproval = isCodeReviewStage && isCoderOrTesterNode;
 
   // 使用 diff 接口获取完整代码数据（解决 API 截断问题）
   const { data: diffData } = useQuery({
@@ -163,8 +148,14 @@ export function ApproveDrawer() {
     return {
       testGenerated: result?.test_generated ?? false,
       testRunSuccess: result?.test_run_success ?? false,
+      overallSuccess: result?.overall_success as boolean | undefined,
       testError: result?.test_error as string | undefined,
       retryCount: (result?.retry_count as number) ?? 0,
+      contractCheck: result?.contract_check as {
+        passed: boolean;
+        missing_symbols: string[];
+        total_symbols: number;
+      } | undefined,
     };
   }, [testingStage]);
 
@@ -180,9 +171,6 @@ export function ApproveDrawer() {
 
   const currentChange = allCodeChanges[selectedFileIndex];
   const currentTestChange = testCodeChanges[selectedTestFileIndex];
-
-  // 提前返回：如果抽屉未打开或没有选中阶段，不渲染任何内容
-  if (!isApproveDrawerOpen || !selectedStage) return null;
 
   // 提取技术设计文档
   // 【新流程】处理统一审批
@@ -259,6 +247,167 @@ export function ApproveDrawer() {
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  // 【新增】仅批准代码（CODER）
+  const handleApproveCoderOnly = async () => {
+    if (!coderDecision) {
+      addToast({ type: 'warning', message: '请先选择对 CODER 的审批决定' });
+      return;
+    }
+
+    if (coderDecision === 'reject' && !feedback.trim()) {
+      addToast({ type: 'warning', message: '拒绝时必须填写反馈理由' });
+      return;
+    }
+
+    setIsSubmitting(true);
+    setShowTimeoutWarning(false);
+
+    timeoutRef.current = setTimeout(() => {
+      setShowTimeoutWarning(true);
+    }, APPROVE_TIMEOUT);
+
+    try {
+      if (!selectedPipeline) {
+        throw new Error('未选择流水线');
+      }
+
+      const approveCoding = coderDecision === 'accept';
+
+      // 调用统一审批 API，但只批准代码，测试保持原状态
+      const response = await apiPost<any>(`/pipeline/${selectedPipeline.id}/approve-code-review`, {
+        approve_coding: approveCoding,
+        approve_testing: testerDecision === 'accept', // 保持已有决定，如果没有则根据当前状态
+        feedback: feedback,
+        partial_approval: true // 标记为部分审批
+      });
+
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+
+      if (response.async || response.data?.async) {
+        addToast({ type: 'info', message: '代码审批已提交' });
+      } else {
+        addToast({ type: 'success', message: approveCoding ? '代码已批准' : '代码已拒绝' });
+      }
+
+      document.dispatchEvent(new CustomEvent('pipeline:approve', {
+        detail: { stageId: selectedStage?.id, type: 'coder-only' }
+      }));
+
+      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipelines'] });
+
+      // 如果拒绝了代码，关闭抽屉；如果批准了，保持打开可以继续审批测试
+      if (coderDecision === 'reject') {
+        setTimeout(() => {
+          closeApproveDrawer();
+          resetState();
+        }, 300);
+      } else {
+        // 批准了代码，切换到 tester tab 继续审批
+        setActiveTab('tester');
+        addToast({ type: 'info', message: '代码已批准，请继续审批测试' });
+      }
+
+    } catch (error) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      addToast({ type: 'error', message: `审批失败: ${error instanceof Error ? error.message : '请重试'}` });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // 【新增】仅批准测试（TESTER）
+  const handleApproveTesterOnly = async () => {
+    if (!testerDecision) {
+      addToast({ type: 'warning', message: '请先选择对 TESTER 的审批决定' });
+      return;
+    }
+
+    if (testerDecision === 'reject' && !feedback.trim()) {
+      addToast({ type: 'warning', message: '拒绝时必须填写反馈理由' });
+      return;
+    }
+
+    setIsSubmitting(true);
+    setShowTimeoutWarning(false);
+
+    timeoutRef.current = setTimeout(() => {
+      setShowTimeoutWarning(true);
+    }, APPROVE_TIMEOUT);
+
+    try {
+      if (!selectedPipeline) {
+        throw new Error('未选择流水线');
+      }
+
+      const approveTesting = testerDecision === 'accept';
+
+      // 调用统一审批 API，但只批准测试
+      const response = await apiPost<any>(`/pipeline/${selectedPipeline.id}/approve-code-review`, {
+        approve_coding: coderDecision === 'accept', // 保持已有决定
+        approve_testing: approveTesting,
+        feedback: feedback,
+        partial_approval: true // 标记为部分审批
+      });
+
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+
+      if (response.async || response.data?.async) {
+        addToast({ type: 'info', message: '测试审批已提交' });
+      } else {
+        addToast({ type: 'success', message: approveTesting ? '测试已批准' : '测试已拒绝' });
+      }
+
+      document.dispatchEvent(new CustomEvent('pipeline:approve', {
+        detail: { stageId: selectedStage?.id, type: 'tester-only' }
+      }));
+
+      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipelines'] });
+
+      // 如果拒绝了测试，关闭抽屉；如果批准了，切换到 coder tab 继续审批（如果还没审批）
+      if (testerDecision === 'reject') {
+        setTimeout(() => {
+          closeApproveDrawer();
+          resetState();
+        }, 300);
+      } else if (!coderDecision) {
+        // 批准了测试但代码还没审批，切换到 coder tab
+        setActiveTab('coder');
+        addToast({ type: 'info', message: '测试已批准，请继续审批代码' });
+      } else {
+        // 都审批了，关闭抽屉
+        setTimeout(() => {
+          closeApproveDrawer();
+          resetState();
+        }, 300);
+      }
+
+    } catch (error) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      addToast({ type: 'error', message: `审批失败: ${error instanceof Error ? error.message : '请重试'}` });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // 重置状态
+  const resetState = () => {
+    setShowConfirm(false);
+    setFeedback('');
+    setCoderDecision(null);
+    setTesterDecision(null);
+    setActiveTab('coder');
+    setSelectedFileIndex(0);
+    setSelectedTestFileIndex(0);
   };
 
   // 旧版审批（非 CODE_REVIEW 阶段）
@@ -402,17 +551,25 @@ export function ApproveDrawer() {
   };
 
   // 【修复】抽屉打开时重置决策状态，避免残留上次选项
+  // 【新增】根据点击的节点来源自动聚焦到对应 Tab
   useEffect(() => {
     if (isApproveDrawerOpen) {
       setCoderDecision(null);
       setTesterDecision(null);
       setFeedback('');
       setShowConfirm(false);
-      setActiveTab('coder');
+      // 根据点击的节点来源自动聚焦到对应 Tab
+      if (selectedNodeSource === 'TESTER') {
+        setActiveTab('tester');
+      } else if (selectedNodeSource === 'CODER') {
+        setActiveTab('coder');
+      } else {
+        setActiveTab('coder');
+      }
       setSelectedFileIndex(0);
       setSelectedTestFileIndex(0);
     }
-  }, [isApproveDrawerOpen]);
+  }, [isApproveDrawerOpen, selectedNodeSource]);
 
   // 【快捷键支持】Ctrl+Enter 批准, Ctrl+R 驳回
   useEffect(() => {
@@ -468,6 +625,10 @@ export function ApproveDrawer() {
   }, [isApproveDrawerOpen, showUnifiedApproval, coderDecision, testerDecision, feedback, selectedPipeline]);
 
   // 判断是否显示统一审批 UI（CODE_REVIEW 阶段）
+
+  // 如果抽屉未打开或没有选中阶段，不渲染任何内容
+  if (!isApproveDrawerOpen || !selectedStage) return null;
+
   return (
     <>
       {/* 遮罩层 */}
@@ -528,7 +689,7 @@ export function ApproveDrawer() {
                     DESIGN: 'AI 设计师',
                     CODING: 'AI 程序员',
                     CODE_REVIEW: 'AI 程序员 + AI 测试员',
-                    UNIT_TESTING: 'AI 测试员',
+                    UNIT_TESTING: 'AI 测试员（分层测试）',
                     DELIVERY: '交付系统',
                   };
                   return agentNames[selectedStage?.name || ''] || 'AI Agent';
@@ -549,6 +710,46 @@ export function ApproveDrawer() {
           {/* 【新流程】CODE_REVIEW 阶段显示分栏审批 UI */}
           {showUnifiedApproval && (
             <div className="space-y-4">
+              {/* 【新增】执行指标面板 - CODER 和 TESTER 都显示 */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-medium text-text-primary flex items-center gap-2">
+                    <BarChart3 className="w-4 h-4 text-brand-primary" />
+                    执行指标
+                  </h4>
+                  <button
+                    onClick={() => setShowMetrics(!showMetrics)}
+                    className="text-xs text-brand-primary hover:underline"
+                  >
+                    {showMetrics ? '隐藏' : '显示'}
+                  </button>
+                </div>
+                {showMetrics && (
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* CODER 指标 */}
+                    {codingStage && (
+                      <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
+                        <div className="text-xs text-blue-600 font-medium mb-2 flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-blue-500" />
+                          CODER 代码生成
+                        </div>
+                        <MetricsPanel stage={codingStage} />
+                      </div>
+                    )}
+                    {/* TESTER 指标 */}
+                    {testingStage && (
+                      <div className="p-3 bg-amber-50 rounded-lg border border-amber-100">
+                        <div className="text-xs text-amber-600 font-medium mb-2 flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-full bg-status-warning" />
+                          TESTER 分层测试
+                        </div>
+                        <MetricsPanel stage={testingStage} />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
               {/* 分栏 Tab */}
               <div className="flex border-b border-border-default">
                 <button
@@ -747,26 +948,38 @@ export function ApproveDrawer() {
                   {/* 测试结果摘要 */}
                   {testingResult && (
                     <div className={`p-3 rounded-lg text-sm ${
-                      testingResult.testRunSuccess
+                      testingResult.overallSuccess || testingResult.testRunSuccess
                         ? 'bg-status-success/10 text-status-success border border-status-success/30'
                         : testingResult.testGenerated
                         ? 'bg-status-warning/10 text-status-warning border border-status-warning/30'
                         : 'bg-bg-secondary text-text-secondary'
                     }`}>
                       <div className="flex items-center gap-2">
-                        {testingResult.testRunSuccess ? (
+                        {testingResult.overallSuccess || testingResult.testRunSuccess ? (
                           <CheckCircle2 className="w-4 h-4" />
                         ) : (
                           <AlertCircle className="w-4 h-4" />
                         )}
                         <span>
-                          {testingResult.testRunSuccess
+                          {testingResult.overallSuccess
+                            ? '✅ 契约检查通过且所有测试通过'
+                            : testingResult.testRunSuccess
                             ? '✅ 所有测试通过'
                             : testingResult.testGenerated
                             ? `⚠️ 测试未通过${testingResult.testError ? `: ${testingResult.testError}` : ''}`
                             : '❌ 未生成测试文件'}
                         </span>
                       </div>
+                      {testingResult.contractCheck && (
+                        <div className={`text-xs mt-1 ${
+                          testingResult.contractCheck.passed ? 'text-status-success' : 'text-status-error'
+                        }`}>
+                          契约检查: {testingResult.contractCheck.passed ? '通过' : '失败'}
+                          {testingResult.contractCheck.passed
+                            ? ` (${testingResult.contractCheck.total_symbols} 个符号)`
+                            : ` (${testingResult.contractCheck.missing_symbols.length} 个未实现)`}
+                        </div>
+                      )}
                       {testingResult.retryCount > 0 && (
                         <div className="text-xs mt-1 text-text-tertiary">
                           重试次数: {testingResult.retryCount}
@@ -914,6 +1127,7 @@ export function ApproveDrawer() {
               {(selectedStage?.name === 'CODING' || selectedStage?.name === 'CODE_REVIEW') && (
                 <CodingPanel
                   outputData={codingStage?.output_data as Record<string, unknown> | undefined}
+                  codeChanges={allCodeChanges} // 【修复】传入 diff 接口获取的完整代码数据
                 />
               )}
 
@@ -971,7 +1185,7 @@ export function ApproveDrawer() {
             取消
           </button>
 
-          {/* 【新流程】CODE_REVIEW 阶段显示统一审批按钮 */}
+          {/* 【新流程】CODE_REVIEW 阶段显示分别审批按钮 */}
           {showUnifiedApproval ? (
             <>
               <button
@@ -980,19 +1194,54 @@ export function ApproveDrawer() {
                 className="inline-flex items-center gap-2 px-5 py-2.5 border border-status-error text-status-error rounded-lg text-sm font-medium hover:bg-status-error/10 transition-colors disabled:opacity-50"
               >
                 <XCircle className="w-4 h-4" />
-                拒绝
+                全部拒绝
               </button>
-              <button
-                onClick={handleUnifiedApprove}
-                disabled={isSubmitting || !coderDecision || !testerDecision}
-                className="inline-flex items-center gap-2 px-5 py-2.5 bg-brand-primary text-white rounded-lg text-sm font-medium hover:bg-brand-primary-hover transition-all disabled:opacity-50"
-              >
-                {isSubmitting ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
-                ) : (
-                  <><CheckCircle2 className="w-4 h-4" />确认审批</>
-                )}
-              </button>
+
+              {/* 根据当前 Tab 显示对应的单独审批按钮 */}
+              {activeTab === 'coder' && (
+                <button
+                  onClick={handleApproveCoderOnly}
+                  disabled={isSubmitting || !coderDecision}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-all disabled:opacity-50"
+                  title="仅审批代码，测试部分保持当前状态"
+                >
+                  {isSubmitting ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
+                  ) : (
+                    <><CheckCircle2 className="w-4 h-4" />{coderDecision === 'accept' ? '批准代码' : '拒绝代码'}</>
+                  )}
+                </button>
+              )}
+
+              {activeTab === 'tester' && (
+                <button
+                  onClick={handleApproveTesterOnly}
+                  disabled={isSubmitting || !testerDecision}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-amber-600 text-white rounded-lg text-sm font-medium hover:bg-amber-700 transition-all disabled:opacity-50"
+                  title="仅审批测试，代码部分保持当前状态"
+                >
+                  {isSubmitting ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
+                  ) : (
+                    <><CheckCircle2 className="w-4 h-4" />{testerDecision === 'accept' ? '批准测试' : '拒绝测试'}</>
+                  )}
+                </button>
+              )}
+
+              {activeTab === 'review' && (
+                <button
+                  onClick={handleUnifiedApprove}
+                  disabled={isSubmitting || !coderDecision || !testerDecision}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-brand-primary text-white rounded-lg text-sm font-medium hover:bg-brand-primary-hover transition-all disabled:opacity-50"
+                  title="需要先在 CODER 和 TESTER Tab 中分别做出审批决定"
+                >
+                  {isSubmitting ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" />处理中...</>
+                  ) : (
+                    <><CheckCircle2 className="w-4 h-4" />确认审批</>
+                  )}
+                </button>
+              )}
             </>
           ) : (
             /* 原有审批按钮（非 CODE_REVIEW 阶段） */

@@ -45,12 +45,13 @@ class CodeRAGTool:
         self._indexer: Optional[CodeIndexerService] = None
 
     async def _get_indexer(self) -> Optional[CodeIndexerService]:
-        """获取或创建索引服务"""
+        """获取或创建索引服务（带缓存，避免重复构建）"""
         if self._indexer is None:
             try:
                 self._indexer = await get_indexer(self.project_path, include_tests=False)
-                # 确保索引已构建
-                self._indexer.build_index()
+                # 仅当索引未缓存时才构建
+                if not self._indexer.chunks:
+                    self._indexer.build_index()
             except Exception as e:
                 logger.warning(f"[CodeRAGTool] 初始化索引失败: {e}")
                 return None

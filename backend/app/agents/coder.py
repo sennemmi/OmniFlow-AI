@@ -99,9 +99,13 @@ class CoderAgent(LangGraphAgent[CoderOutput]):
 【错误处理铁律 - 强制使用统一响应函数】
 所有 API 端点必须使用 `success_response` 和 `error_response` 函数返回响应，禁止手动构建字典！
 
-正确示例1 - 健康检查 API：
+【关键 - 错误响应必须设置 HTTP 状态码】
+当返回错误响应时，必须使用 `JSONResponse` 包装并设置正确的 HTTP 状态码（如 500, 400, 404 等）：
+
+正确示例1 - 健康检查 API（带状态码）：
 ```python
 from fastapi import Request
+from fastapi.responses import JSONResponse
 from app.core.response import success_response, error_response
 
 @router.get("/health")
@@ -111,7 +115,31 @@ async def health_check(request: Request):  # 【必须引入 request 以获取 r
         status = await check_system()
         return success_response(data=status, request_id=request_id)
     except Exception as e:
-        return error_response(error=f"健康检查失败: {str(e)}", request_id=request_id)
+        # 【关键】错误响应必须设置 HTTP 状态码 500
+        error_data = error_response(error=f"健康检查失败: {str(e)}", request_id=request_id)
+        return JSONResponse(status_code=500, content=error_data.dict())
+```
+
+正确示例2 - 用户 API（带状态码）：
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from app.core.response import success_response, error_response
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: int, request: Request):
+    request_id = getattr(request.state, "request_id", "")
+    try:
+        user = await user_service.get_by_id(user_id)
+        if not user:
+            # 404 错误
+            error_data = error_response(error="用户不存在", request_id=request_id)
+            return JSONResponse(status_code=404, content=error_data.dict())
+        return success_response(data=user, request_id=request_id)
+    except Exception as e:
+        # 500 错误
+        error_data = error_response(error=f"获取用户失败: {str(e)}", request_id=request_id)
+        return JSONResponse(status_code=500, content=error_data.dict())
 ```
 
 正确示例2 - 用户 API：

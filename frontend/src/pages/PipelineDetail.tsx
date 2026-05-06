@@ -40,7 +40,7 @@ import { usePipelineStore } from '@stores/pipelineStore';
 import { PipelineNode, ApproveDrawer, ThoughtLog, PipelineSkeleton } from '@components/Pipeline';
 import { usePipelineFlow, statusConfig, STAGE_CONFIG, STAGE_ORDER, stageMapping } from '@hooks/usePipelineFlow';
 import { usePipelineNotification } from '@hooks/usePipelineNotification';
-import { getStageMetrics } from '@utils/pipelineMetrics';
+import { formatMetricDuration, getStageMetrics } from '@utils/pipelineMetrics';
 import type { Pipeline, PipelineStage } from '@types';
 
 // ============================================
@@ -194,18 +194,34 @@ export function PipelineDetail() {
       const stageId = node.id as string; // CODER 或 TESTER
       const isClickable = node.data?.isClickable as boolean;
 
+      // 【修复】添加非空保护，使用 ?? [] 兜底
+      const stages = pipeline.stages ?? [];
+
       // 【并发执行支持】根据点击的节点查找对应的后端阶段
       let targetStage: PipelineStage | undefined;
 
+      // 【新增】记录节点来源，用于 CODE_REVIEW 阶段自动聚焦对应 Tab
+      let nodeSource: 'CODER' | 'TESTER' | undefined;
+
       if (stageId === 'CODER') {
-        // CODER 节点对应 CODING 阶段
-        targetStage = pipeline.stages?.find(s => s.name === 'CODING');
+        nodeSource = 'CODER';
+        // CODER 节点：根据当前阶段决定显示哪个阶段的数据
+        if (pipeline.current_stage === 'CODE_REVIEW') {
+          // CODE_REVIEW 阶段：显示 CODE_REVIEW 阶段（用于审批）
+          targetStage = stages.slice().reverse().find(s => s.name === 'CODE_REVIEW')
+                     || stages.slice().reverse().find(s => s.name === 'CODING');
+        } else {
+          // 其他阶段：显示 CODING 阶段（用于查看代码）
+          targetStage = stages.slice().reverse().find(s => s.name === 'CODING')
+                     || stages.slice().reverse().find(s => s.name === 'CODE_REVIEW');
+        }
       } else if (stageId === 'TESTER') {
+        nodeSource = 'TESTER';
         // TESTER 节点对应 UNIT_TESTING 阶段
-        targetStage = pipeline.stages?.find(s => s.name === 'UNIT_TESTING');
+        targetStage = stages.slice().reverse().find(s => s.name === 'UNIT_TESTING');
       } else {
         // 其他节点直接查找
-        targetStage = pipeline.stages?.find(s => {
+        targetStage = stages.slice().reverse().find(s => {
           const mapping: Record<string, string> = {
             'REQUIREMENT': 'REQUIREMENT',
             'DESIGN': 'DESIGN',
@@ -217,16 +233,16 @@ export function PipelineDetail() {
 
       // 如果找到对应阶段且有数据，打开抽屉
       if (targetStage?.output_data) {
-        openApproveDrawer(targetStage);
+        openApproveDrawer(targetStage, nodeSource);
         return;
       }
 
       // 兜底：使用节点上的 backendStage
       const backendStage = node.data?.backendStage as PipelineStage;
       if (isClickable && backendStage) {
-        openApproveDrawer(backendStage);
+        openApproveDrawer(backendStage, nodeSource);
       } else if (backendStage?.output_data) {
-        openApproveDrawer(backendStage);
+        openApproveDrawer(backendStage, nodeSource);
       }
     },
     [pipeline, openApproveDrawer]
@@ -235,8 +251,10 @@ export function PipelineDetail() {
   // 打开当前阶段的审批抽屉
   const handleOpenCurrentStageDrawer = useCallback(() => {
     if (!pipeline) return;
-    
-    const currentStage = pipeline.stages?.find(s => s.name === pipeline.current_stage);
+
+    // 【修复】添加非空保护
+    const stages = pipeline.stages ?? [];
+    const currentStage = stages.find(s => s.name === pipeline.current_stage);
     if (currentStage) {
       openApproveDrawer(currentStage);
     }
@@ -438,7 +456,7 @@ export function PipelineDetail() {
 
         {/* 右侧：Agent 终端 */}
         {showThoughtLog && (
-          <div className="w-96 flex-shrink-0 min-h-0 h-full">
+          <div className="w-[480px] flex-shrink-0 min-h-0 h-full">
             <ThoughtLog
               pipelineId={String(pipelineId)}
               stageId={pipeline.current_stage || currentStage?.name || 'REQUIREMENT'}
@@ -608,7 +626,7 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
       bgColor: 'bg-emerald-50' 
     },
     UNIT_TESTING: { 
-      label: '单元测试', 
+      label: '分层测试', 
       icon: CheckCircle2, 
       color: 'text-cyan-600', 
       bgColor: 'bg-cyan-50' 
@@ -627,70 +645,21 @@ function StageMetrics({ pipeline }: StageMetricsProps) {
     },
   };
 
-  // 计算阶段统计数据
+  // 【修复】简化阶段统计数据计算，直接使用 stage 列字段
   const getStageStats = (stage: PipelineStage) => {
-    const metrics = getStageMetrics(stage);
-    stage = {
-      ...stage,
-      input_tokens: metrics.inputTokens,
-      output_tokens: metrics.outputTokens,
-      duration_ms: metrics.durationMs,
-      retry_count: metrics.retryCount,
-      reasoning: metrics.reasoning,
-    };
+    // 使用 formatMetricDuration 格式化耗时
+    const durationText = formatMetricDuration(stage.duration_ms ?? 0);
+    const durationSeconds = Math.floor((stage.duration_ms ?? 0) / 1000);
 
-    // [注意] 直接从 stage 对象读取 duration_ms，不再依赖 created_at/completed_at 计算
-    let durationText = '-';
-    let durationSeconds = 0;
+    // 直接从 stage 对象读取 Token 用量
+    const tokens = (stage.input_tokens ?? 0) + (stage.output_tokens ?? 0);
 
-    // 优先使用后端返回的 duration_ms
-    if (stage.duration_ms && stage.duration_ms > 0) {
-      durationSeconds = Math.floor(stage.duration_ms / 1000);
-      if (durationSeconds > 3600) {
-        durationText = `${Math.floor(durationSeconds / 3600)}h ${Math.floor((durationSeconds % 3600) / 60)}m`;
-      } else if (durationSeconds > 60) {
-        durationText = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
-      } else {
-        durationText = `${durationSeconds}s`;
-      }
-    } else if (stage.created_at && stage.completed_at) {
-      // 兼容旧数据：使用 created_at 和 completed_at 计算
-      const diffMs = new Date(stage.completed_at).getTime() - new Date(stage.created_at).getTime();
-      durationSeconds = Math.floor(diffMs / 1000);
-      if (durationSeconds > 3600) {
-        durationText = `${Math.floor(durationSeconds / 3600)}h ${Math.floor((durationSeconds % 3600) / 60)}m`;
-      } else if (durationSeconds > 60) {
-        durationText = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
-      } else {
-        durationText = `${durationSeconds}s`;
-      }
-    } else if (stage.created_at && stage.status === 'running') {
-      // 正在运行的阶段，计算从开始到现在的时间
-      const diffMs = Date.now() - new Date(stage.created_at).getTime();
-      durationSeconds = Math.floor(diffMs / 1000);
-      if (durationSeconds > 3600) {
-        durationText = `${Math.floor(durationSeconds / 3600)}h ${Math.floor((durationSeconds % 3600) / 60)}m`;
-      } else if (durationSeconds > 60) {
-        durationText = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
-      } else {
-        durationText = `${durationSeconds}s`;
-      }
-    }
-
-    // [注意] 直接从 stage 对象读取 Token 用量，不再从 output_data 中提取
-    const tokens = (stage.input_tokens || 0) + (stage.output_tokens || 0);
-
-    // 从 output_data 中估算代码行数
+    // 从 output_data 中估算代码行数（这是业务逻辑，保留）
     let lines = 0;
-    const outputData = stage.output_data as Record<string, any> | undefined;
-    if (outputData?.multi_agent_output?.files) {
-      const files = outputData.multi_agent_output.files as Array<{ content?: string }>;
-      lines = files.reduce((acc, file) => {
-        if (file.content) {
-          return acc + file.content.split('\n').length;
-        }
-        return acc;
-      }, 0);
+    const outputData = stage.output_data as Record<string, unknown> | undefined;
+    const files = outputData?.multi_agent_output?.files as Array<{ content?: string }> | undefined;
+    if (files) {
+      lines = files.reduce((acc, file) => acc + (file.content?.split('\n').length ?? 0), 0);
     }
 
     return {

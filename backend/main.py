@@ -21,6 +21,8 @@ if sys.platform == 'win32':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import uuid
+import atexit
+import signal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -50,6 +52,59 @@ async def _periodic_buffer_cleanup():
             _cleanup_expired_buffers()
         except Exception:
             error("SSE Buffer 清理任务异常", exc_info=True)
+
+
+def _sync_cleanup_sandbox_pool():
+    """
+    【新增】同步清理 Sandbox 预热池容器
+
+    使用 atexit 注册，确保程序退出时（包括 KeyboardInterrupt）容器被清理。
+    这是 lifespan 中异步清理的兜底方案。
+    """
+    import subprocess
+    from app.core.logging import info, error
+
+    info("[atexit] 同步清理预热池容器...")
+
+    # 使用 docker ps 查找所有 omniflow-prewarm-* 容器
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=omniflow-prewarm-"],
+            capture_output=True, text=True, timeout=10
+        )
+        container_ids = result.stdout.strip().split('\n')
+        container_ids = [cid for cid in container_ids if cid]
+
+        for cid in container_ids:
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", cid],
+                    capture_output=True, timeout=5
+                )
+                info(f"[atexit] 已清理容器", container_id=cid[:12])
+            except Exception as e:
+                error(f"[atexit] 清理容器失败", container_id=cid[:12], error=str(e))
+
+        info(f"[atexit] 同步清理完成，共清理 {len(container_ids)} 个容器")
+    except Exception as e:
+        error(f"[atexit] 查找容器失败", error=str(e))
+
+
+# 注册 atexit 清理函数
+atexit.register(_sync_cleanup_sandbox_pool)
+
+
+async def _prewarm_sandbox_pool():
+    """启动时预热 Sandbox 容器池"""
+    try:
+        from pathlib import Path
+        from app.core.config import settings
+        from app.service.sandbox_manager import sandbox_manager
+
+        project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+        await sandbox_manager.init_pool(project_path)
+    except Exception:
+        error("预热 Sandbox 池失败", exc_info=True)
 
 
 @asynccontextmanager
@@ -89,15 +144,28 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(_periodic_buffer_cleanup())
     info("SSE Buffer 定期清理任务已启动")
 
+    # 预热 Sandbox 池（后台异步，不阻塞启动）
+    asyncio.create_task(_prewarm_sandbox_pool())
+    info("Sandbox 预热池初始化已触发")
+
     yield
 
     # 关闭时执行
     info("OmniFlowAI Backend 关闭中...")
+
+    # 取消 SSE Buffer 清理任务
     cleanup_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
         pass
+
+    # 【修复】清理预热池容器，释放端口
+    try:
+        from app.service.sandbox_manager import sandbox_manager
+        await sandbox_manager.cleanup_pool()
+    except Exception as e:
+        error(f"清理预热池失败: {str(e)}")
 
 
 app = FastAPI(

@@ -17,7 +17,6 @@ import {
   Database,
   Server,
   AlertCircle,
-  Sparkles,
   ChevronRight,
   RefreshCw,
   Target,
@@ -176,8 +175,8 @@ export function Console() {
         <MetricCard
           title="总流水线"
           value={String(stats?.total_pipelines || 0)}
-          subtitle="较上月 +12.5%"
-          trend="up"
+          subtitle="当前总数"
+          trend="neutral"
           icon={GitBranch}
           color="blue"
         />
@@ -200,8 +199,8 @@ export function Console() {
         <MetricCard
           title="平均耗时"
           value={`${avgDuration}min`}
-          subtitle="较上月 -5.2%"
-          trend="down"
+          subtitle="平均执行时间"
+          trend="neutral"
           icon={Clock}
           color="amber"
         />
@@ -218,7 +217,7 @@ export function Console() {
             
             <div className="relative">
               <div className="flex items-center gap-2 mb-3">
-                <Sparkles className="w-5 h-5 text-blue-200" />
+                <Zap className="w-5 h-5 text-blue-200" />
                 <span className="text-blue-100 text-sm font-medium">AI 驱动研发</span>
               </div>
               <h2 className="text-2xl font-bold mb-2">开始您的 AI 流水线之旅</h2>

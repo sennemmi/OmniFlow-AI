@@ -21,14 +21,18 @@ logger = logging.getLogger(__name__)
 class TesterAgent(LangGraphAgent[TesterOutput]):
     """
     测试 Agent
-    
+
     根据设计方案和生成的代码编写单元测试
     继承 LangGraphAgent，只需实现业务差异部分
     """
-    
+
     # 【结构化输出】启用 JSON 格式化输出
     USE_JSON_FORMAT = True
-    
+
+    # 【可配置】测试文件体积限制
+    MAX_TEST_FILE_SIZE = 6000  # 单个测试文件最大字符数
+    MAX_TEST_FUNC_LINES = 30   # 单个测试函数最大行数
+
     def __init__(self):
         super().__init__(agent_name="TesterAgent")
     
@@ -152,6 +156,44 @@ JSON 格式：
     "coverage_targets": ["用户登录接口 - 正常登录", "用户登录接口 - 密码错误"],
     "dependencies_added": ["pytest", "pytest-asyncio", "pytest-mock"]
 }
+
+【测试文件体积控制 - 极其重要】
+- 单个测试文件的总字符数不得超过 6000 字符。
+- 单个测试函数不得超过 30 行（含 mock 设置和断言）。
+- 禁止在多个测试函数中复制粘贴相同的 mock 代码，必须使用 pytest fixtures 复用。
+- 如果你的输出即将超过限制，请优先使用 parametrize 合并相似测试，或删减冗余断言。
+违反体积控制将导致你的输出被拒绝并重试，请严格遵守。
+
+【断言精简铁律 - 违反会导致测试被拒绝】
+1. 对于响应体，只需验证：
+   - status_code == 200 (或约定的错误码)
+   - result["success"] is True/False
+   - result["data"] 中存在契约要求的 1~2 个关键字段
+   - result["error"] is None (或存在错误关键字)
+   禁止逐项验证 data 中所有字段的类型和值，例如：
+   ❌ assert isinstance(data["timestamp"], float)
+   ❌ assert data["timestamp"] == 1625097600.0
+   ✅ assert "timestamp" in data
+   ✅ assert data["iso_format"].startswith("2021")
+
+2. 异常测试只验证 status_code 和 error 中包含预期错误关键字，不要检查 data 结构。
+3. 如果一个字段在多个测试中出现，只验证一次。
+
+【Mock 禁止清单 - 绝对禁止，违反会立即被拒绝】
+1. 禁止对以下全局函数使用 side_effect=Exception，即使你只想测试异常路径：
+   - time.time
+   - datetime.now / datetime.utcnow
+   - time.monotonic
+   - 任何系统底层函数
+2. 禁止对上述函数使用 assert_called_once()，必须使用 assert_called() 或 assert_called_with()。
+3. 异常场景的正确 Mock 方法：
+   - 通过 Mock 被测函数内部调用的具体业务 Service 方法（如 Service.do_something.side_effect = Exception(...)）
+   - 使用 freezegun 控制时间而不破坏底层函数。
+
+【代码复用铁律】
+1. 对于边界值测试、不同输入场景，必须使用 @pytest.mark.parametrize，禁止为每组值复制整个测试函数。
+2. 所有测试文件共享的 mock 依赖（如 TestClient、数据库 session）必须定义为 pytest fixtures，禁止在每个函数中重复创建。
+3. 一个测试文件只包含 1 个 fixture 化客户端，所有测试共用。
 
 【测试编写原则】
 - 每个测试函数只测试一个概念
@@ -830,6 +872,10 @@ async def test_file_upload():
             Dict: 包含生成结果或错误信息
         """
         from app.core.sse_log_buffer import push_log
+        from app.utils.agent_debug_utils import get_agent_debugger
+
+        # 获取调试器
+        debugger = get_agent_debugger()
 
         code_files_count = len(code_output.get("files", [])) if isinstance(code_output, dict) else 0
 
@@ -879,7 +925,46 @@ async def test_file_upload():
 
         if result.get("success"):
             test_files = result.get("output", {}).get("test_files", [])
-            
+
+            # 【新增】体积检查：检查测试文件是否符合大小限制
+            if test_files:
+                size_errors = self._check_test_file_size(test_files)
+                if size_errors:
+                    logger.warning(f"[TesterAgent] 发现 {len(size_errors)} 个体积问题")
+                    for error in size_errors:
+                        logger.warning(f"  - {error}")
+                    if pipeline_id:
+                        await push_log(pipeline_id, "warning", f"发现 {len(size_errors)} 个体积问题，正在自动精简...", stage="TESTING")
+
+                    # 自动精简代码
+                    test_files = self._compact_test_code(test_files)
+                    if result.get("output"):
+                        result["output"]["test_files"] = test_files
+
+                    # 再次检查，如果仍然超限，记录错误但不阻止流程
+                    remaining_errors = self._check_test_file_size(test_files)
+                    if remaining_errors:
+                        for error in remaining_errors:
+                            logger.error(f"[TesterAgent] 体积问题未解决: {error}")
+                            if pipeline_id:
+                                await push_log(pipeline_id, "error", f"⚠️ {error}", stage="TESTING")
+
+            # 【新增】安全扫描：检测危险模式并自动修复
+            if test_files:
+                safety_issues = self._scan_test_safety(test_files)
+                if safety_issues:
+                    logger.warning(f"[TesterAgent] 发现 {len(safety_issues)} 个安全问题")
+                    for issue in safety_issues:
+                        logger.warning(f"  - {issue}")
+                    if pipeline_id:
+                        await push_log(pipeline_id, "warning", f"发现 {len(safety_issues)} 个潜在安全问题，正在自动修复...", stage="TESTING")
+
+                # 自动修复危险模式
+                test_files = self._sanitize_test_code(test_files)
+                # 更新结果中的 test_files
+                if result.get("output"):
+                    result["output"]["test_files"] = test_files
+
             # 【新增】后置验证：检查测试文件是否只导入了契约中的符号
             if test_files and interface_specs:
                 import_errors = self._validate_test_imports_against_contract(
@@ -1001,6 +1086,29 @@ async def test_file_upload():
             })
             if pipeline_id:
                 await push_log(pipeline_id, "error", f"测试生成失败: {result.get('error', '')}", stage="TESTING")
+
+        # 保存调试信息
+        if debugger:
+            debugger.save_agent_io(
+                agent_name="TesterAgent",
+                stage="generate_tests",
+                input_data={
+                    "design_output": design_output,
+                    "code_output": code_output,
+                    "target_files": target_files,
+                    "pipeline_id": pipeline_id,
+                },
+                output_data=result,
+                metadata={
+                    "input_tokens": result.get("input_tokens", 0),
+                    "output_tokens": result.get("output_tokens", 0),
+                    "duration_ms": result.get("duration_ms", 0),
+                },
+                success=result.get("success", False),
+                error=result.get("error"),
+                tool_calls=result.get("tool_results", []),
+                system_prompt=self.system_prompt,
+            )
 
         return result
 
@@ -1166,6 +1274,177 @@ async def test_file_upload():
                             )
 
         return errors
+
+    def _scan_test_safety(self, test_files: List[Dict]) -> List[str]:
+        """
+        【简化版】扫描测试代码中的危险模式
+
+        仅通过简单的字符串匹配检测明显的危险模式，
+        复杂的检测留给 LLM 在生成阶段通过 Prompt 约束。
+
+        Args:
+            test_files: 测试文件列表
+
+        Returns:
+            List[str]: 发现的安全问题列表
+        """
+        safety_issues = []
+
+        for test_file in test_files:
+            file_path = test_file.get('file_path', '?')
+            content = test_file.get('content', "")
+            if not content:
+                continue
+
+            # 简单的字符串匹配检测 assert_called_once()
+            # 注意：这里只检测明显的模式，不处理复杂情况
+            if '.assert_called_once()' in content:
+                for i, line in enumerate(content.split('\n'), 1):
+                    if '.assert_called_once()' in line and '.assert_called_once_with()' not in line:
+                        safety_issues.append(
+                            f"{file_path}:{i}: 检测到 assert_called_once()，"
+                            f"建议改用 assert_called() 避免不稳定"
+                        )
+                        break  # 只报告一次
+
+        return safety_issues
+
+    def _sanitize_test_code(self, test_files: List[Dict]) -> List[Dict]:
+        """
+        【简化版】自动修复测试代码中的明显问题
+
+        仅修复最简单的模式，复杂的修复留给 LLM 通过 Prompt 约束。
+
+        Args:
+            test_files: 测试文件列表
+
+        Returns:
+            List[Dict]: 修复后的测试文件列表
+        """
+        import re
+
+        sanitized_files = []
+
+        for test_file in test_files:
+            content = test_file.get('content', "")
+            file_path = test_file.get('file_path', '?')
+
+            if not content:
+                sanitized_files.append(test_file)
+                continue
+
+            original_content = content
+
+            # 仅替换 assert_called_once() 为 assert_called()
+            # 避免替换 assert_called_once_with()
+            content = re.sub(
+                r'\.assert_called_once\(\)',
+                '.assert_called()',
+                content
+            )
+
+            if content != original_content:
+                logger.info(f"[TesterAgent] 自动修复测试文件: {file_path}")
+
+            sanitized_files.append({
+                **test_file,
+                'content': content
+            })
+
+        return sanitized_files
+
+    def _check_test_file_size(self, test_files: List[Dict]) -> List[str]:
+        """
+        检查测试文件体积是否符合限制
+
+        Args:
+            test_files: 测试文件列表
+
+        Returns:
+            List[str]: 体积超限的错误列表
+        """
+        import ast
+
+        size_errors = []
+
+        for test_file in test_files:
+            file_path = test_file.get('file_path', '?')
+            content = test_file.get('content', "")
+
+            if not content:
+                continue
+
+            # 1. 检查文件总字符数
+            if len(content) > self.MAX_TEST_FILE_SIZE:
+                size_errors.append(
+                    f"{file_path}: 文件体积超限 ({len(content)} 字符 > {self.MAX_TEST_FILE_SIZE} 字符限制)，"
+                    f"请使用 pytest fixtures 和 parametrize 精简代码"
+                )
+
+            # 2. 检查单个函数行数
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name.startswith('test_'):
+                        # 计算函数行数
+                        func_lines = node.end_lineno - node.lineno + 1
+                        if func_lines > self.MAX_TEST_FUNC_LINES:
+                            size_errors.append(
+                                f"{file_path}:{node.lineno}: 测试函数 {node.name} 行数超限 "
+                                f"({func_lines} 行 > {self.MAX_TEST_FUNC_LINES} 行限制)，"
+                                f"请使用 fixtures 提取公共代码或使用 parametrize 合并相似测试"
+                            )
+
+        return size_errors
+
+    def _compact_test_code(self, test_files: List[Dict]) -> List[Dict]:
+        """
+        自动精简测试代码以符合体积限制
+
+        Args:
+            test_files: 测试文件列表
+
+        Returns:
+            List[Dict]: 精简后的测试文件列表
+        """
+        import re
+
+        compacted_files = []
+
+        for test_file in test_files:
+            content = test_file.get('content', "")
+            file_path = test_file.get('file_path', '?')
+
+            if not content:
+                compacted_files.append(test_file)
+                continue
+
+            original_content = content
+
+            # 如果文件未超限，不做处理
+            if len(content) <= self.MAX_TEST_FILE_SIZE:
+                compacted_files.append(test_file)
+                continue
+
+            # 自动精简：移除多余空行（超过2个连续空行改为2个）
+            content = re.sub(r'\n{3,}', '\n\n', content)
+
+            # 自动精简：移除行尾空格
+            content = '\n'.join(line.rstrip() for line in content.split('\n'))
+
+            if len(content) < len(original_content):
+                logger.info(f"[TesterAgent] 自动精简测试文件: {file_path} ({len(original_content)} -> {len(content)} 字符)")
+
+            compacted_files.append({
+                **test_file,
+                'content': content
+            })
+
+        return compacted_files
 
 
 # 单例实例

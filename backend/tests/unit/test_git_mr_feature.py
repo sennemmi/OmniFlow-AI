@@ -459,11 +459,6 @@ class TestDeliveryHandlerExecute:
 
         context = self._make_context()
 
-        mock_execution_result = MagicMock()
-        mock_execution_result.success = True
-        mock_execution_result.summary = {"success": 1, "failed": 0, "total": 1}
-        mock_execution_result.changes = []
-
         mock_git = MagicMock()
         mock_git.has_changes.return_value = True
         mock_git.get_last_commit_hash.return_value = "abc123"
@@ -478,20 +473,17 @@ class TestDeliveryHandlerExecute:
         mock_github.__aenter__ = AsyncMock(return_value=mock_github)
         mock_github.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("app.service.stage_handlers.delivery_handler.workspace_context") as mock_ws_ctx, \
+        mock_sandbox_info = MagicMock()
+        mock_sandbox_info.project_path = "/tmp/ws_42"
+
+        with patch("app.service.stage_handlers.delivery_handler.sandbox_manager") as mock_sandbox_mgr, \
              patch("app.service.stage_handlers.delivery_handler.GitProviderService", return_value=mock_git), \
-             patch("app.service.stage_handlers.delivery_handler.CodeExecutorService") as MockExec, \
              patch("app.service.stage_handlers.delivery_handler.PRGeneratorService.generate_pr_description",
                    new=AsyncMock(return_value="## PR Body")), \
              patch("app.service.stage_handlers.delivery_handler.GitHubProviderService", return_value=mock_github), \
              patch("app.service.stage_handlers.delivery_handler.push_log", new=AsyncMock()):
 
-            mock_ws = MagicMock()
-            mock_ws.get_workspace_path.return_value = Path("/tmp/ws_42")
-            mock_ws_ctx.return_value.__enter__ = MagicMock(return_value=mock_ws)
-            mock_ws_ctx.return_value.__exit__ = MagicMock(return_value=False)
-
-            MockExec.return_value.apply_changes.return_value = mock_execution_result
+            mock_sandbox_mgr.get_info.return_value = mock_sandbox_info
 
             handler = DeliveryHandler()
             result = await handler.execute(context)
@@ -501,40 +493,23 @@ class TestDeliveryHandlerExecute:
         assert result.output_data["commit_hash"] == "abc123"
 
     @pytest.mark.asyncio
-    async def test_code_application_failure_returns_failure_result(self):
+    async def test_sandbox_not_found_returns_failure_result(self):
         """
-        异常分支：apply_changes 失败
-        期望：StageResult.success=False，且 git 回滚被调用
+        异常分支：sandbox 未启动
+        期望：抛出 ValueError
         """
         from app.service.stage_handlers.delivery_handler import DeliveryHandler
 
         context = self._make_context()
 
-        mock_execution_result = MagicMock()
-        mock_execution_result.success = False
-        mock_execution_result.summary = {"success": 0, "failed": 1, "total": 1}
-        mock_execution_result.changes = [MagicMock()]
-
-        mock_git = MagicMock()
-        mock_code_executor = MagicMock()
-        mock_code_executor.apply_changes.return_value = mock_execution_result
-
-        with patch("app.service.stage_handlers.delivery_handler.workspace_context") as mock_ws_ctx, \
-             patch("app.service.stage_handlers.delivery_handler.GitProviderService", return_value=mock_git), \
-             patch("app.service.stage_handlers.delivery_handler.CodeExecutorService",
-                   return_value=mock_code_executor), \
+        with patch("app.service.stage_handlers.delivery_handler.sandbox_manager") as mock_sandbox_mgr, \
              patch("app.service.stage_handlers.delivery_handler.push_log", new=AsyncMock()):
 
-            mock_ws = MagicMock()
-            mock_ws.get_workspace_path.return_value = Path("/tmp/ws_42")
-            mock_ws_ctx.return_value.__enter__ = MagicMock(return_value=mock_ws)
-            mock_ws_ctx.return_value.__exit__ = MagicMock(return_value=False)
+            mock_sandbox_mgr.get_info.return_value = None
 
             handler = DeliveryHandler()
-            result = await handler.execute(context)
-
-        assert result.success is False
-        mock_code_executor.rollback_changes.assert_called_once()
+            with pytest.raises(ValueError, match="Sandbox 未启动"):
+                await handler.execute(context)
 
     @pytest.mark.asyncio
     async def test_pr_creation_failure_still_returns_success_for_commit(self):
@@ -544,11 +519,6 @@ class TestDeliveryHandlerExecute:
         from app.service.stage_handlers.delivery_handler import DeliveryHandler
 
         context = self._make_context()
-
-        mock_execution_result = MagicMock()
-        mock_execution_result.success = True
-        mock_execution_result.summary = {"success": 1, "failed": 0, "total": 1}
-        mock_execution_result.changes = []
 
         mock_git = MagicMock()
         mock_git.has_changes.return_value = True
@@ -564,20 +534,17 @@ class TestDeliveryHandlerExecute:
         mock_github.__aenter__ = AsyncMock(return_value=mock_github)
         mock_github.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("app.service.stage_handlers.delivery_handler.workspace_context") as mock_ws_ctx, \
+        mock_sandbox_info = MagicMock()
+        mock_sandbox_info.project_path = "/tmp/ws_42"
+
+        with patch("app.service.stage_handlers.delivery_handler.sandbox_manager") as mock_sandbox_mgr, \
              patch("app.service.stage_handlers.delivery_handler.GitProviderService", return_value=mock_git), \
-             patch("app.service.stage_handlers.delivery_handler.CodeExecutorService") as MockExec, \
              patch("app.service.stage_handlers.delivery_handler.PRGeneratorService.generate_pr_description",
                    new=AsyncMock(return_value="## body")), \
              patch("app.service.stage_handlers.delivery_handler.GitHubProviderService", return_value=mock_github), \
              patch("app.service.stage_handlers.delivery_handler.push_log", new=AsyncMock()):
 
-            mock_ws = MagicMock()
-            mock_ws.get_workspace_path.return_value = Path("/tmp/ws_42")
-            mock_ws_ctx.return_value.__enter__ = MagicMock(return_value=mock_ws)
-            mock_ws_ctx.return_value.__exit__ = MagicMock(return_value=False)
-
-            MockExec.return_value.apply_changes.return_value = mock_execution_result
+            mock_sandbox_mgr.get_info.return_value = mock_sandbox_info
 
             handler = DeliveryHandler()
             result = await handler.execute(context)
@@ -597,11 +564,6 @@ class TestDeliveryHandlerExecute:
 
         context = self._make_context()
 
-        mock_execution_result = MagicMock()
-        mock_execution_result.success = True
-        mock_execution_result.summary = {"success": 1, "failed": 0, "total": 1}
-        mock_execution_result.changes = []
-
         mock_git = MagicMock()
         mock_git.create_branch.side_effect = GitProviderError("分支已存在")
         mock_git.has_changes.return_value = False  # 无新 commit，跳过提交
@@ -613,19 +575,17 @@ class TestDeliveryHandlerExecute:
         mock_github.__aenter__ = AsyncMock(return_value=mock_github)
         mock_github.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("app.service.stage_handlers.delivery_handler.workspace_context") as mock_ws_ctx, \
+        mock_sandbox_info = MagicMock()
+        mock_sandbox_info.project_path = "/tmp/ws_42"
+
+        with patch("app.service.stage_handlers.delivery_handler.sandbox_manager") as mock_sandbox_mgr, \
              patch("app.service.stage_handlers.delivery_handler.GitProviderService", return_value=mock_git), \
-             patch("app.service.stage_handlers.delivery_handler.CodeExecutorService") as MockExec, \
              patch("app.service.stage_handlers.delivery_handler.PRGeneratorService.generate_pr_description",
                    new=AsyncMock(return_value="## body")), \
              patch("app.service.stage_handlers.delivery_handler.GitHubProviderService", return_value=mock_github), \
              patch("app.service.stage_handlers.delivery_handler.push_log", new=AsyncMock()):
 
-            mock_ws = MagicMock()
-            mock_ws.get_workspace_path.return_value = Path("/tmp/ws_42")
-            mock_ws_ctx.return_value.__enter__ = MagicMock(return_value=mock_ws)
-            mock_ws_ctx.return_value.__exit__ = MagicMock(return_value=False)
-            MockExec.return_value.apply_changes.return_value = mock_execution_result
+            mock_sandbox_mgr.get_info.return_value = mock_sandbox_info
 
             handler = DeliveryHandler()
             await handler.execute(context)
@@ -636,18 +596,22 @@ class TestDeliveryHandlerExecute:
     @pytest.mark.asyncio
     async def test_execute_raises_exception_on_unexpected_error(self):
         """
-        非预期异常（如数据库错误）应该向上抛出，触发 handle_error 流程
+        非预期异常（如 sandbox 路径为空）应该向上抛出，触发 handle_error 流程
         """
         from app.service.stage_handlers.delivery_handler import DeliveryHandler
 
         context = self._make_context()
 
-        with patch("app.service.stage_handlers.delivery_handler.workspace_context",
-                   side_effect=RuntimeError("Workspace init failed")), \
+        mock_sandbox_info = MagicMock()
+        mock_sandbox_info.project_path = None  # 空路径会触发异常
+
+        with patch("app.service.stage_handlers.delivery_handler.sandbox_manager") as mock_sandbox_mgr, \
              patch("app.service.stage_handlers.delivery_handler.push_log", new=AsyncMock()):
 
+            mock_sandbox_mgr.get_info.return_value = mock_sandbox_info
+
             handler = DeliveryHandler()
-            with pytest.raises(RuntimeError, match="Workspace init failed"):
+            with pytest.raises(ValueError, match="工作区路径为空"):
                 await handler.execute(context)
 
 

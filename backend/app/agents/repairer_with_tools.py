@@ -76,7 +76,7 @@ class RepairerState:
 class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
     """
     带测试运行工具的代码修复代理
-    
+
     支持多轮对话和快速测试验证
     继承 ToolUsingAgent 以获得工具调用能力
     """
@@ -84,6 +84,34 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
     def __init__(self):
         super().__init__(agent_name="RepairerAgentWithTools")
         self.state: Optional[RepairerState] = None
+
+    def _get_agent_tools(self, project_path: str, pipeline_id: int = 0):
+        """
+        强制使用 repairer 角色获取工具列表
+
+        【关键】直接调用父类方法但强制 agent_role="repairer"，
+        确保 run_tests / install_dependency 始终可用，不依赖名称推断。
+        """
+        from app.agents.tools import get_agent_tools
+
+        agent_role = "repairer"
+
+        if (self._agent_tools is None or
+            self._agent_tools.project_path != project_path or
+            self._agent_tools._pipeline_id != pipeline_id or
+            self._agent_tools._agent_role != agent_role):
+            self._agent_tools = get_agent_tools(
+                project_path,
+                file_service=self._file_service,
+                pipeline_id=pipeline_id,
+                agent_role=agent_role
+            )
+            logger.info(
+                f"[RepairerAgentWithTools] AgentTools 已创建/重建, "
+                f"agent_role={agent_role!r}, "
+                f"pipeline_id={pipeline_id}"
+            )
+        return self._agent_tools
 
     @property
     def system_prompt(self) -> str:
@@ -102,6 +130,34 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
 4. **调用 run_tests 工具运行测试**
 5. 如果测试通过 → 完成修复
 6. 如果测试失败 → 分析新错误，继续修复（最多3轮）
+
+【防御性测试绝对权威 - 铁律】
+⚠️ 防御性测试（defense 目录下的测试）是系统安全的核心防线，具有以下绝对权威：
+1. **严禁修改 defense 目录下的任何测试文件** - 这些测试验证系统核心安全机制，任何修改都必须经过人工审核
+2. **防御性测试失败 = 严重安全警告** - 如果 defense 测试失败，说明修复可能破坏了系统安全机制
+3. **遇到 defense 测试失败时的正确处理**：
+   - 立即停止当前修复方向
+   - 分析是否误改了被测代码的安全相关逻辑
+   - 如果是被测代码问题，修复被测代码以恢复安全机制
+   - **绝对禁止**通过修改 defense 测试来"通过"测试
+4. **违规后果**：修改 defense 测试将被系统立即拦截并终止整个 Pipeline
+
+【文件读取失败处理 - 强制规则】
+⚠️ 如果无法读取到目标文件，严格执行以下规则：
+1. **严禁进行任何修改猜测** - 不要基于假设或猜测生成修复代码
+2. **必须报告错误** - 在输出中明确说明无法读取文件的具体路径
+3. **要求人工介入** - 使用以下格式返回错误：
+   ```json
+   {
+     "files": [],
+     "summary": "无法读取目标文件 [文件路径]，修复中断，需要人工介入检查文件是否存在及权限问题",
+     "need_test": false
+   }
+   ```
+4. **允许的操作**：
+   - 使用 glob 工具搜索文件的实际位置
+   - 使用 read_file 尝试不同的相对路径
+   - 如果多次尝试后仍无法读取，必须停止并报告错误
 
 【工具使用】
 你有以下工具可用：
@@ -619,6 +675,10 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
         Returns:
             Dict: 修复结果
         """
+        # 【关键修复】为 RepairerAgent 注入 SandboxFileService，确保工具调用使用沙箱模式
+        if file_service:
+            self.set_file_service(file_service)
+
         # 初始化状态
         self.state = RepairerState(
             fix_order=fix_order,
@@ -640,6 +700,20 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
 
         for round_num in range(max_rounds):
             logger.info(f"[RepairerAgent] 开始第 {round_num + 1}/{max_rounds} 轮修复")
+
+            # 【关键】每轮循环开始前检查 Pipeline 是否已被终止
+            from app.service.pipeline import PipelineService
+            if await PipelineService._check_pipeline_terminated(pipeline_id):
+                logger.warning(f"[RepairerAgent] Pipeline {pipeline_id} 已终止，退出修复循环")
+                return {
+                    "success": False,
+                    "error": "Pipeline terminated",
+                    "output": {
+                        "files": all_files_modified,
+                        "summary": f"Pipeline 在修复第 {round_num + 1} 轮被终止",
+                        "rounds": round_num + 1
+                    }
+                }
 
             # 【修复】每轮循环开始前，重新从沙箱读取所有目标文件的最新内容
             if round_num > 0 and file_service:
@@ -678,14 +752,27 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
             max_llm_retries = 3  # LLM 空内容重试次数
             llm_retry_count = 0
             result = None
-            
+
             while llm_retry_count < max_llm_retries:
+                # 【关键】每次 LLM 调用前检查 Pipeline 是否已被终止
+                if await PipelineService._check_pipeline_terminated(pipeline_id):
+                    logger.warning(f"[RepairerAgent] Pipeline {pipeline_id} 已终止，退出 LLM 重试循环")
+                    return {
+                        "success": False,
+                        "error": "Pipeline terminated",
+                        "output": {
+                            "files": all_files_modified,
+                            "summary": f"Pipeline 在 LLM 重试第 {llm_retry_count + 1} 次时被终止",
+                            "rounds": round_num + 1
+                        }
+                    }
+
                 result = await self.execute(
                     pipeline_id=pipeline_id,
                     stage_name=stage_name,
                     initial_state=state
                 )
-                
+
                 # 检查是否是 LLM 返回空内容导致的失败
                 error_msg = result.get("error", "")
                 if "LLM 返回空内容" in error_msg or "无法从工具结果构建输出" in error_msg:
@@ -764,13 +851,43 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                             # 检查文件是否实际发生变化
                             if old_hash != new_hash:
                                 files_actually_changed = True
-                                await file_service.write_file(clean_path, new_content)
+                                write_result = await file_service.write_file(clean_path, new_content)
+                                # 【P3: 防御性测试保护】检查写入是否被拦截
+                                if not write_result.get("success") and write_result.get("blocked"):
+                                    error_msg = f"🚫 修复被拦截: {write_result.get('error')}"
+                                    logger.error(f"[RepairerAgent] {error_msg}")
+                                    print(f"[RepairerAgent] {error_msg}")
+                                    return {
+                                        "success": False,
+                                        "error": error_msg,
+                                        "output": {
+                                            "files": all_files_modified,
+                                            "summary": f"第 {round_num + 1} 轮修复被拦截：尝试修改 defense 目录文件",
+                                            "rounds": round_num + 1,
+                                            "blocked": True
+                                        }
+                                    }
                                 print(f"[RepairerAgent] 已修改: {clean_path}")
                             else:
                                 print(f"[RepairerAgent] 警告: {clean_path} 内容未变化（search_block 可能不匹配）")
                                 # 【修复】降级策略：如果提供了完整内容，直接全量写入
                                 if full_content and full_content != current_result.content:
-                                    await file_service.write_file(clean_path, full_content)
+                                    write_result = await file_service.write_file(clean_path, full_content)
+                                    # 【P3: 防御性测试保护】检查写入是否被拦截
+                                    if not write_result.get("success") and write_result.get("blocked"):
+                                        error_msg = f"🚫 修复被拦截: {write_result.get('error')}"
+                                        logger.error(f"[RepairerAgent] {error_msg}")
+                                        print(f"[RepairerAgent] {error_msg}")
+                                        return {
+                                            "success": False,
+                                            "error": error_msg,
+                                            "output": {
+                                                "files": all_files_modified,
+                                                "summary": f"第 {round_num + 1} 轮修复被拦截：尝试修改 defense 目录文件",
+                                                "rounds": round_num + 1,
+                                                "blocked": True
+                                            }
+                                        }
                                     files_actually_changed = True
                                     print(f"[RepairerAgent] 降级写入完整内容: {clean_path}")
                                 elif full_content:
@@ -784,7 +901,22 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                             if current_result.exists and current_result.content == new_content:
                                 print(f"[RepairerAgent] 警告: {clean_path} 内容未变化")
                             else:
-                                await file_service.write_file(clean_path, new_content)
+                                write_result = await file_service.write_file(clean_path, new_content)
+                                # 【P3: 防御性测试保护】检查写入是否被拦截
+                                if not write_result.get("success") and write_result.get("blocked"):
+                                    error_msg = f"🚫 修复被拦截: {write_result.get('error')}"
+                                    logger.error(f"[RepairerAgent] {error_msg}")
+                                    print(f"[RepairerAgent] {error_msg}")
+                                    return {
+                                        "success": False,
+                                        "error": error_msg,
+                                        "output": {
+                                            "files": all_files_modified,
+                                            "summary": f"第 {round_num + 1} 轮修复被拦截：尝试修改 defense 目录文件",
+                                            "rounds": round_num + 1,
+                                            "blocked": True
+                                        }
+                                    }
                                 files_actually_changed = True
                                 current_written_hashes[clean_path] = hashlib.md5(new_content.encode()).hexdigest()
                                 print(f"[RepairerAgent] 已新建/全量覆盖: {clean_path}")

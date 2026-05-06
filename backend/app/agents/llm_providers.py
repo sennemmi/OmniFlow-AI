@@ -265,24 +265,6 @@ class OpenAICompatibleProvider(LLMProvider):
             raise
 
 
-class ModelScopeProvider(OpenAICompatibleProvider):
-    """
-    ModelScope (魔搭) Provider
-
-    使用 OpenAI 兼容接口，集成智能重试机制
-    """
-
-    def __init__(self):
-        super().__init__(
-            provider_name="ModelScope",
-            model=settings.llm_model,
-            api_key=settings.llm_api_key,
-            api_base=settings.llm_api_base,
-            retry_name="modelscope_provider",
-            use_openai_prefix=True
-        )
-
-
 class OpenAIProvider(OpenAICompatibleProvider):
     """
     OpenAI Provider
@@ -320,6 +302,25 @@ class MiMoProvider(OpenAICompatibleProvider):
         )
 
 
+class DeepSeekProvider(OpenAICompatibleProvider):
+    """
+    DeepSeek Provider
+
+    使用 OpenAI 兼容接口，支持 JSON Mode 和 Tool Calls
+    文档: https://api-docs.deepseek.com/zh-cn/
+    """
+
+    def __init__(self):
+        super().__init__(
+            provider_name="DeepSeek",
+            model=settings.DEEPSEEK_DEFAULT_MODEL,
+            api_key=settings.DEEPSEEK_API_KEY,
+            api_base=settings.DEEPSEEK_API_BASE,
+            retry_name="deepseek_provider",
+            use_openai_prefix=True
+        )
+
+
 class LLMProviderFactory:
     """
     LLM Provider 工厂
@@ -328,9 +329,9 @@ class LLMProviderFactory:
     """
 
     _providers: Dict[str, type] = {
-        "modelscope": ModelScopeProvider,
         "openai": OpenAIProvider,
         "mimo": MiMoProvider,
+        "deepseek": DeepSeekProvider,
     }
 
     _instances: Dict[str, LLMProvider] = {}

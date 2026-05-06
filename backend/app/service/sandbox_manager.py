@@ -8,11 +8,13 @@ SandboxManager - Docker 沙箱管理器
 import asyncio
 import base64
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
-from app.core.logging import info, error, set_pipeline_id
+from app.core.logging import info, error, warning, set_pipeline_id
 
 
 @dataclass
@@ -35,14 +37,22 @@ class ExecResult:
 
 
 class SandboxManager:
-    """Docker 沙箱管理器"""
+    """Docker 沙箱管理器（含预热池）"""
+
+    # 预热池配置
+    POOL_SIZE = 2
+    POOL_PORT_START = 18900  # 预热池专用端口段，与动态分配端口错开
 
     def __init__(self):
         self._sandboxes: Dict[int, SandboxInfo] = {}
         self._base_port = 19000
         self._network_name = "omniflow-sandbox"
-        self._port_lock = asyncio.Lock()  # 端口分配锁，防止竞态条件
-        self._used_ports: set = set()  # 已分配端口集合
+        self._port_lock = asyncio.Lock()
+        self._used_ports: set = set()
+        # 预热池
+        self._pool: asyncio.Queue = asyncio.Queue(maxsize=self.POOL_SIZE)
+        self._pool_initialized = False
+        self._pool_lock = asyncio.Lock()
 
     async def _find_available_port(self) -> int:
         """
@@ -130,26 +140,318 @@ class SandboxManager:
 
         return False
 
-    async def _force_remove_container(self, container_name: str) -> None:
-        """强制删除容器（如果存在）"""
+    async def _force_remove_container(self, container_name: str) -> bool:
+        """强制删除容器（如果存在），返回是否成功"""
         try:
-            # 先尝试停止
-            stop_proc = await asyncio.create_subprocess_exec(
-                "docker", "stop", container_name,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+            # 先检查容器是否存在
+            check_proc = await asyncio.create_subprocess_exec(
+                "docker", "ps", "-a", "-q", "-f", f"name={container_name}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            await stop_proc.wait()
+            stdout, _ = await check_proc.communicate()
+            if not stdout.decode().strip():
+                return True  # 容器不存在，视为成功
 
-            # 再删除
-            rm_proc = await asyncio.create_subprocess_exec(
-                "docker", "rm", "-f", container_name,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+            # 【新增】检查容器是否正在删除中
+            inspect_proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "--format", "{{.State.Status}}", container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            await rm_proc.wait()
+            status_out, _ = await inspect_proc.communicate()
+            status = status_out.decode().strip()
+
+            if status == "removing":
+                info(f"容器 {container_name} 正在删除中，等待完成...")
+                # 等待容器删除完成（最多等待 10 秒）
+                for i in range(20):
+                    await asyncio.sleep(0.5)
+                    check_proc = await asyncio.create_subprocess_exec(
+                        "docker", "ps", "-a", "-q", "-f", f"name={container_name}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await check_proc.communicate()
+                    if not stdout.decode().strip():
+                        info(f"容器 {container_name} 已删除")
+                        return True
+                warning(f"等待容器 {container_name} 删除超时")
+                return False
+
+            # 【改进】直接使用 docker rm -f 强制删除容器（同时停止和删除，更可靠）
+            # 避免先 stop 再 rm 的两步操作，减少端口释放延迟
+            rm_proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", "-v", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await rm_proc.communicate()
+
+            if rm_proc.returncode != 0:
+                # 【改进】如果删除失败且错误是"already in progress"，等待后重试
+                stderr_text = stderr.decode() if stderr else ""
+                if "already in progress" in stderr_text.lower():
+                    info(f"容器 {container_name} 删除正在进行中，等待...")
+                    await asyncio.sleep(2)
+                    # 再次检查容器是否还存在
+                    check_proc = await asyncio.create_subprocess_exec(
+                        "docker", "ps", "-a", "-q", "-f", f"name={container_name}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, _ = await check_proc.communicate()
+                    if not stdout.decode().strip():
+                        return True  # 容器已删除
+                error(f"删除容器 {container_name} 失败: {stderr_text}")
+                return False
+
+            return True
+        except Exception as e:
+            error(f"强制删除容器 {container_name} 异常: {str(e)}")
+            return False
+
+    # ==================== 预热池 ====================
+
+    async def init_pool(self, project_path: str) -> None:
+        """
+        启动时预热 Sandbox 池（在 lifespan.startup 中调用）
+
+        预创建 POOL_SIZE 个容器，项目代码预加载到容器中。
+        Pipeline 创建时通过 acquire_from_pool() 直接获取，无需等待 docker run + docker cp。
+
+        【降级方案】如果预热池初始化失败，会记录警告但不会影响系统运行，
+        Pipeline 创建时会自动回退到正常启动流程。
+        """
+        async with self._pool_lock:
+            if self._pool_initialized:
+                return
+            self._pool_initialized = True
+
+        if not await self._ensure_network():
+            error("预热池启动失败：Docker 网络不可用，将使用正常启动流程")
+            self._pool_initialized = False
+            return
+
+        success_count = 0
+        for i in range(self.POOL_SIZE):
+            try:
+                container_name = f"omniflow-prewarm-{i}"
+                port = self.POOL_PORT_START + i
+                self._used_ports.add(port)
+
+                # 【改进】重试删除，确保容器被清理
+                removed = await self._force_remove_container(container_name)
+                if not removed:
+                    # 如果删除失败，尝试使用带随机后缀的名称
+                    import random
+                    container_name = f"omniflow-prewarm-{i}-{random.randint(1000, 9999)}"
+                    info(f"使用备用容器名称: {container_name}")
+
+                # 【修复】等待端口被操作系统完全释放（避免 TIME_WAIT 状态导致绑定失败）
+                # 最多等待 5 秒
+                for _ in range(10):
+                    if not await self._is_port_in_use(port):
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    warning(f"端口 {port} 仍然被占用，尝试使用备用端口")
+                    port = await self._find_available_port()
+
+                cmd = [
+                    "docker", "run", "--rm", "-d",
+                    "--name", container_name,
+                    "-p", f"{port}:8000",
+                    "--memory", "1g",
+                    "--cpus", "2",
+                    "--network", self._network_name,
+                    "omniflowai/sandbox:latest", "sleep", "infinity"
+                ]
+
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+
+                if proc.returncode != 0:
+                    error(f"预热池容器 {i} 启动失败: {stderr.decode()}")
+                    # 【降级】继续尝试创建其他容器
+                    continue
+
+                container_id = stdout.decode().strip()
+
+                if not await self._wait_for_container_ready(container_name, timeout=10):
+                    await self._stop_container(container_name)
+                    continue
+
+                # 预加载项目代码
+                if project_path:
+                    copy_ok = await self._copy_project_to_container(container_name, project_path)
+                    if not copy_ok:
+                        error(f"预热池容器 {i} 项目代码复制失败，移除此容器")
+                        await self._stop_container(container_name)
+                        continue
+
+                info(f"预热池容器就绪", index=i, container_id=container_id[:12], port=port)
+                await self._pool.put((container_name, container_id, port))
+                success_count += 1
+
+            except Exception as e:
+                error(f"预热池容器 {i} 创建失败: {str(e)}")
+
+        # 【降级提示】如果预热池没有完全初始化，给出警告
+        if success_count == 0:
+            error("预热池初始化完全失败，所有 Pipeline 将使用正常启动流程（启动时间会增加 ~10-30s）")
+            self._pool_initialized = False
+        elif success_count < self.POOL_SIZE:
+            warning(f"预热池部分初始化成功 ({success_count}/{self.POOL_SIZE})，系统仍可运行但性能可能受影响")
+        else:
+            info(f"预热池初始化完成 ({success_count}/{self.POOL_SIZE})")
+
+    async def acquire_from_pool(self, pipeline_id: int) -> SandboxInfo:
+        """
+        从预热池获取一个容器分配给 Pipeline
+
+        如果池中有可用容器，直接复用（重命名容器），耗时 <1s。
+        如果池为空，回退到正常启动流程。
+
+        Returns:
+            SandboxInfo: 沙箱信息
+        """
+        try:
+            pool_name, container_id, port = self._pool.get_nowait()
+        except asyncio.QueueEmpty:
+            info("预热池为空，回退到正常启动", pipeline_id=pipeline_id)
+            return None  # 调用方应回退到 start()
+
+        new_name = f"omniflow-sandbox-{pipeline_id}"
+
+        # 重命名容器（原子操作，近乎零开销）
+        try:
+            rename_proc = await asyncio.create_subprocess_exec(
+                "docker", "rename", pool_name, new_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await rename_proc.communicate()
+            if rename_proc.returncode != 0:
+                error(f"重命名容器失败: {stderr.decode()}")
+                await self._force_remove_container(pool_name)
+                return None
         except Exception:
-            pass  # 忽略错误，容器可能不存在
+            await self._force_remove_container(pool_name)
+            return None
+
+        # 【核心修复】创建临时目录、复制项目并设置路径
+        # 这样 DELIVERY 阶段在临时目录上执行 git 操作，不会动原始项目
+        import tempfile
+        import shutil
+        from app.core.config import settings
+
+        project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+        temp_dir = tempfile.mkdtemp(prefix=f"omniflow-sandbox-{pipeline_id}-")
+
+        try:
+            shutil.copytree(
+                project_path,
+                temp_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(
+                    '.git', '__pycache__', '*.pyc', '.pytest_cache',
+                    'node_modules', '.venv', 'venv', '.env'
+                )
+            )
+        except Exception as e:
+            error(f"预热池复制项目代码到临时目录失败：{str(e)}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            await self._force_remove_container(new_name)
+            return None
+
+        sandbox_info = SandboxInfo(
+            container_id=container_id,
+            pipeline_id=pipeline_id,
+            port=port,
+            project_path=temp_dir  # 临时目录路径
+        )
+        self._sandboxes[pipeline_id] = sandbox_info
+
+        info("从预热池分配容器成功",
+             pipeline_id=pipeline_id,
+             container_id=container_id[:12],
+             pool_name=pool_name,
+             temp_dir=temp_dir)
+
+        # 异步补充池（后台补充一个新容器）
+        asyncio.create_task(self._refill_pool())
+
+        return sandbox_info
+
+    async def _refill_pool(self) -> None:
+        """后台补充预热池"""
+        from app.core.config import settings
+        try:
+            index = int(time.time()) % 100
+            container_name = f"omniflow-prewarm-{index}"
+            port = await self._find_available_port()
+
+            # 【修复】先强制清理可能残留的同名容器
+            await self._force_remove_container(container_name)
+
+            cmd = [
+                "docker", "run", "--rm", "-d",
+                "--name", container_name,
+                "-p", f"{port}:8000",
+                "--memory", "1g", "--cpus", "2",
+                "--network", self._network_name,
+                "omniflowai/sandbox:latest", "sleep", "infinity"
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                return
+
+            container_id = stdout.decode().strip()
+            if not await self._wait_for_container_ready(container_name, timeout=10):
+                await self._stop_container(container_name)
+                return
+
+            project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
+            if project_path and Path(project_path).exists():
+                await self._copy_project_to_container(container_name, project_path)
+
+            await self._pool.put((container_name, container_id, port))
+            info(f"预热池补充完成", container_id=container_id[:12])
+        except Exception as e:
+            error(f"补充预热池失败: {str(e)}")
+
+    async def cleanup_pool(self) -> None:
+        """
+        【新增】清理预热池中的所有容器
+
+        在应用关闭时调用，确保所有预热容器被正确停止，释放端口。
+        """
+        info("开始清理预热池容器...")
+
+        # 清理预热池中的容器
+        while not self._pool.empty():
+            try:
+                pool_name, container_id, port = self._pool.get_nowait()
+                await self._force_remove_container(pool_name)
+                self._release_port(port)
+                info(f"预热池容器已清理", container_name=pool_name)
+            except Exception as e:
+                error(f"清理预热池容器失败: {str(e)}")
+
+        # 重置预热池状态
+        self._pool_initialized = False
+        info("预热池清理完成")
 
     async def start(
         self,
@@ -204,6 +506,8 @@ class SandboxManager:
                 cmd.extend(["-v", f"{project_path}:/workspace"])
 
             cmd.append("omniflowai/sandbox:latest")
+            cmd.append("sleep")
+            cmd.append("infinity")
 
             info("Starting sandbox", container_name=container_name, port=port, use_bind_mount=use_bind_mount)
 
@@ -243,6 +547,9 @@ class SandboxManager:
 
             info("Sandbox started", container_id=container_id[:12])
 
+            # 【稳定化】等待 2 秒让容器入口进程完全就绪，减少 docker cp 时容器闪退的竞态窗口
+            await asyncio.sleep(2)
+
             # 【性能优化】如果不使用绑定挂载，使用 docker cp 复制代码到容器
             if not use_bind_mount and project_path:
                 info("Copying project to container using docker cp", project_path=project_path)
@@ -267,45 +574,90 @@ class SandboxManager:
         finally:
             set_pipeline_id(None)
 
-    async def _copy_project_to_container(self, container_name: str, project_path: str) -> bool:
+    async def _copy_project_to_container(self, container_name: str, project_path: str, max_retries: int = 3) -> bool:
         """
         使用 docker cp 将项目代码复制到容器内
 
-        比绑定挂载性能更好，避免跨设备 I/O 损耗
+        包含存活检查 + 重试机制，应对容器入口进程在启动后闪退的竞态条件。
 
         Args:
             container_name: 容器名称
             project_path: 项目路径
+            max_retries: 最大重试次数
 
         Returns:
             bool: 是否成功
         """
-        try:
-            # 首先创建 /workspace 目录
-            mkdir_proc = await asyncio.create_subprocess_exec(
-                "docker", "exec", container_name, "mkdir", "-p", "/workspace",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await mkdir_proc.communicate()
+        for attempt in range(max_retries):
+            # 先确认容器还在运行，避免 No such container 错误
+            try:
+                check_proc = await asyncio.create_subprocess_exec(
+                    "docker", "ps", "-q", "-f", f"name={container_name}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                check_stdout, _ = await check_proc.communicate()
+                if not check_stdout.decode().strip():
+                    error(
+                        f"docker cp 前检查：容器 {container_name} 已不在运行中 (attempt {attempt + 1}/{max_retries})"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return False
+            except Exception as e:
+                error(f"检查容器状态时出错: {e}")
 
-            # 使用 docker cp 复制项目代码
-            copy_proc = await asyncio.create_subprocess_exec(
-                "docker", "cp", f"{project_path}/.", f"{container_name}:/workspace",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await copy_proc.communicate()
+            try:
+                # 创建 /workspace 目录
+                mkdir_proc = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container_name, "mkdir", "-p", "/workspace",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await mkdir_proc.communicate()
 
-            if copy_proc.returncode != 0:
-                error_msg = stderr.decode().strip() if stderr else "Unknown error"
-                error(f"docker cp failed: {error_msg}")
+                # 如果 mkdir 失败(容器已退出)，重试
+                if mkdir_proc.returncode != 0:
+                    error(
+                        f"docker exec mkdir 失败 (容器可能已退出), "
+                        f"attempt {attempt + 1}/{max_retries}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    return False
+
+                # 使用 docker cp 复制项目代码
+                copy_proc = await asyncio.create_subprocess_exec(
+                    "docker", "cp", f"{project_path}/.", f"{container_name}:/workspace",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await copy_proc.communicate()
+
+                if copy_proc.returncode != 0:
+                    error_msg = stderr.decode().strip() if stderr else "Unknown error"
+                    if "No such container" in error_msg and attempt < max_retries - 1:
+                        error(
+                            f"docker cp 容器已退出，重试 {attempt + 1}/{max_retries}: {error_msg}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    error(f"docker cp failed: {error_msg}")
+                    return False
+
+                info(f"docker cp 成功 (project -> {container_name}:/workspace)")
+                return True
+
+            except Exception as e:
+                error(f"Error copying project to container (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
                 return False
 
-            return True
-        except Exception as e:
-            error(f"Error copying project to container: {str(e)}")
-            return False
+        return False
 
     async def _stop_container(self, container_name: str, timeout: int = 10) -> bool:
         """停止容器（内部方法）

@@ -29,6 +29,20 @@ _file_locks: Dict[str, asyncio.Lock] = {}
 _locks_lock = asyncio.Lock()
 
 
+def cleanup_pipeline_file_locks(pipeline_id: int) -> None:
+    """
+    清理指定 Pipeline 的所有文件锁
+    在 Pipeline 终止时调用，防止内存泄漏
+    """
+    global _file_locks
+    prefix = f"pipeline_{pipeline_id}:"
+    keys_to_remove = [k for k in list(_file_locks.keys()) if k.startswith(prefix)]
+    for key in keys_to_remove:
+        del _file_locks[key]
+    if keys_to_remove:
+        logger.info(f"[SandboxFileService] 清理 {len(keys_to_remove)} 个文件锁 for pipeline {pipeline_id}")
+
+
 @dataclass
 class SandboxFileResult:
     """Sandbox 文件操作结果"""
@@ -54,11 +68,15 @@ class SandboxFileService:
         标准化路径：统一为正斜杠，确保路径指向 /workspace/backend/
 
         处理逻辑：
-        - 如果路径以 backend/ 开头（如 backend/tests/ai_generated/test.py），保留 backend/ 前缀
+        - 循环去除重复的 backend/ 前缀（如 backend/backend/app/... → backend/app/...）
         - 如果路径不以 backend/ 开头（如 app/api/v1/health.py），添加 backend/ 前缀
         - 最终路径格式：backend/xxx/xxx.py，映射到 /workspace/backend/xxx/xxx.py
         """
         clean = file_path.replace("\\", "/").lstrip("/")
+
+        # 【修复】循环去除重复的 backend/ 前缀
+        while clean.startswith("backend/backend/"):
+            clean = clean[8:]  # 去除第一个 "backend/"
 
         # 如果路径不以 backend/ 开头，添加 backend/ 前缀
         # 因为 sandbox 中 /workspace/backend/ 是代码根目录
@@ -66,6 +84,29 @@ class SandboxFileService:
             clean = f"backend/{clean}"
 
         return clean
+
+    def _is_defense_path(self, file_path: str) -> bool:
+        """
+        【P3: 防御性测试保护】检查路径是否是 defense 目录下的文件
+
+        Args:
+            file_path: 标准化后的文件路径
+
+        Returns:
+            bool: 是否是 defense 目录下的文件
+        """
+        # 检查路径中是否包含 defense 目录
+        # 匹配 patterns: backend/tests/defense/, backend/defense/, tests/defense/ 等
+        defense_patterns = [
+            "/defense/",
+            "/defense_test/",
+            "defense/",
+        ]
+        file_path_lower = file_path.lower()
+        for pattern in defense_patterns:
+            if pattern in file_path_lower:
+                return True
+        return False
 
     async def read_file(self, file_path: str) -> SandboxFileResult:
         """
@@ -116,12 +157,14 @@ class SandboxFileService:
             )
     
     async def _get_file_lock(self, file_path: str) -> asyncio.Lock:
-        """获取文件级锁，用于并发安全"""
+        """获取文件级锁，用于并发安全（带 pipeline_id 前缀）"""
         normalized = self._sanitize_path(file_path)
+        # 【修复】使用带 pipeline_id 前缀的锁键，便于后续清理
+        lock_key = f"pipeline_{self.pipeline_id}:{normalized}"
         async with _locks_lock:
-            if normalized not in _file_locks:
-                _file_locks[normalized] = asyncio.Lock()
-            return _file_locks[normalized]
+            if lock_key not in _file_locks:
+                _file_locks[lock_key] = asyncio.Lock()
+            return _file_locks[lock_key]
 
     async def write_file(self, file_path: str, content: str) -> Dict[str, Any]:
         """
@@ -145,11 +188,18 @@ class SandboxFileService:
         logger.info(f"[SandboxFileService] write_file 被调用: {file_path} ({len(content)} 字符)")
         logger.info(f"[SandboxFileService] 调用栈: {' -> '.join(caller_info)}")
 
+        # 【P3: 防御性测试保护】在写入前拦截对 defense 目录的修改
+        clean_path = self._sanitize_path(file_path)
+        if self._is_defense_path(clean_path):
+            error_msg = f"🚫 拦截违规操作：禁止修改 defense 目录下的文件 [{clean_path}]"
+            logger.error(f"[SandboxFileService] {error_msg}")
+            logger.error(f"[SandboxFileService] 调用栈: {' -> '.join(caller_info)}")
+            return {"success": False, "error": error_msg, "blocked": True}
+
         # 【改进6】获取文件级锁，防止并发写入
         lock = await self._get_file_lock(file_path)
         async with lock:
             try:
-                clean_path = self._sanitize_path(file_path)
                 full_path = f"/workspace/{clean_path}"
 
                 logger.info(f"[SandboxFileService] 清理后路径: {clean_path}, 完整路径: {full_path}")
@@ -201,8 +251,16 @@ class SandboxFileService:
             # 使用 base64 编码 + 管道写入，避免转义问题
             encoded_content = base64.b64encode(content.encode()).decode()
 
-            # 方案1：使用 printf 和管道（更可靠）
-            write_cmd = f"printf '%s' '{encoded_content}' | base64 -d > {full_path}"
+            # 【新增】防止 Windows 命令行参数过长导致写入失败
+            # Windows 命令行参数长度限制约为 8191 字符，留有余量使用 7000 作为阈值
+            MAX_CMD_ARG_LENGTH = 7000
+            if len(encoded_content) > MAX_CMD_ARG_LENGTH:
+                logger.info(f"[SandboxFileService] 文件过大 ({len(encoded_content)} 字符)，使用分块写入")
+                return await self._write_file_fallback(full_path, encoded_content)
+
+            # 方案 1：使用 printf 和管道（更可靠）
+            # 【修复】路径加单引号防止空格问题
+            write_cmd = f"printf '%s' '{encoded_content}' | base64 -d > '{full_path}'"
             exec_result = await sandbox_manager.exec(
                 self.pipeline_id,
                 write_cmd,
@@ -210,15 +268,15 @@ class SandboxFileService:
             )
 
             if exec_result.exit_code != 0:
-                logger.error(f"[SandboxFileService] 安全写入失败: {exec_result.stderr}")
+                logger.error(f"[SandboxFileService] 安全写入失败：{exec_result.stderr}")
 
-                # 方案2：回退到旧的 echo 分块方式（带重试）
+                # 方案 2：回退到旧的 echo 分块方式（带重试）
                 logger.info(f"[SandboxFileService] 尝试回退写入方式...")
                 return await self._write_file_fallback(full_path, encoded_content)
 
             return {"success": True}
         except Exception as e:
-            logger.error(f"[SandboxFileService] 安全写入异常: {e}")
+            logger.error(f"[SandboxFileService] 安全写入异常：{e}")
             return {"success": False, "error": str(e)}
 
     async def _write_file_fallback(self, full_path: str, encoded_content: str) -> Dict[str, Any]:
@@ -232,9 +290,10 @@ class SandboxFileService:
             chunks = [encoded_content[i:i+chunk_size] for i in range(0, len(encoded_content), chunk_size)]
 
             # 先清空文件
+            # 【修复】路径加单引号防止空格问题
             clear_result = await sandbox_manager.exec(
                 self.pipeline_id,
-                f"> {full_path}",
+                f"> '{full_path}'",
                 timeout=10
             )
 
@@ -243,7 +302,8 @@ class SandboxFileService:
 
             # 分块写入
             for i, chunk in enumerate(chunks):
-                write_cmd = f"echo -n '{chunk}' >> {full_path}"
+                # 【修复】路径加单引号防止空格问题
+                write_cmd = f"echo -n '{chunk}' >> '{full_path}'"
                 exec_result = await sandbox_manager.exec(
                     self.pipeline_id,
                     write_cmd,
@@ -253,9 +313,10 @@ class SandboxFileService:
                     return {"success": False, "error": f"写入块 {i+1}/{len(chunks)} 失败: {exec_result.stderr}"}
 
             # 解码
+            # 【修复】路径加单引号防止空格问题
             decode_result = await sandbox_manager.exec(
                 self.pipeline_id,
-                f"base64 -d {full_path} > {full_path}.tmp && mv {full_path}.tmp {full_path}",
+                f"base64 -d '{full_path}' > '{full_path}.tmp' && mv '{full_path}.tmp' '{full_path}'",
                 timeout=10
             )
 
