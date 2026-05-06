@@ -182,7 +182,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     logger.info(f"[{self.agent_name}] Tool call #{tool_call_count}")
 
                     # 添加助手消息（包含 tool_calls）
-                    messages.append({
+                    # 【DeepSeek Thinking Mode】需要传递 reasoning_content
+                    assistant_message = {
                         "role": "assistant",
                         "content": message.content or "",
                         "tool_calls": [
@@ -196,7 +197,12 @@ class ToolUsingAgent(LangGraphAgent[T]):
                             }
                             for tc in message.tool_calls
                         ]
-                    })
+                    }
+                    # 如果存在 reasoning_content，添加到消息中（DeepSeek 需要）
+                    reasoning_content = getattr(message, 'reasoning_content', None)
+                    if reasoning_content:
+                        assistant_message["reasoning_content"] = reasoning_content
+                    messages.append(assistant_message)
 
                     # 执行工具调用（支持异步工具）
                     for tool_call in message.tool_calls:

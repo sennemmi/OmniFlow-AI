@@ -802,9 +802,9 @@ async def get_pipeline_diff(
         stmt = select(PipelineStage).where(
             PipelineStage.pipeline_id == pipeline_id,
             PipelineStage.name == StageName.CODING
-        )
+        ).order_by(PipelineStage.created_at.desc())
         result = await session.execute(stmt)
-        coding_stage = result.scalar_one_or_none()
+        coding_stage = result.scalars().first()
 
         if not coding_stage or not coding_stage.output_data:
             return error_response(error="No coding output found", request_id=request_id)

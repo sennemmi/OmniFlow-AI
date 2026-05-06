@@ -533,6 +533,18 @@ class PipelineService:
             # 两者都接受：进入 DELIVERY 阶段
             await push_log(pipeline_id, "info", "✅ 代码和测试都已接受，进入交付阶段", stage="DELIVERY")
 
+            # 将 CODE_REVIEW 阶段标记为成功
+            stmt = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.CODE_REVIEW
+            )
+            result = await session.execute(stmt)
+            review_stage = result.scalar_one_or_none()
+            if review_stage:
+                review_stage.status = StageStatus.SUCCESS
+                session.add(review_stage)
+                await session.commit()
+
             # 调用 DELIVERY handler
             # 【修复】使用 handler.run(context) 而非直接调用 execute()，确保 prepare() 被调用
             service = cls()
@@ -1842,8 +1854,16 @@ class PipelineService:
             if test_run_result.get("test_run_success") and not test_run_result.get("requires_user_decision"):
                 asyncio.create_task(PipelineService._start_fastapi_in_sandbox(pipeline_id))
 
-            # 【新增】生成 AI 审查报告并存储到 UNIT_TESTING 阶段
-            # 【新增】生成审查报告前检查 Pipeline 是否已终止
+            # 【修复】如果测试结果标记了 requires_user_decision（修复循环失败），
+            # 暂停 Pipeline 等待人工决策，而不是静默进入 CODE_REVIEW
+            if test_run_result.get("requires_user_decision"):
+                await push_log(
+                    pipeline_id, "warning",
+                    "⚠️ 自动修复失败，Pipeline 暂停等待人工决策。请在 CODE_REVIEW 阶段查看问题并决定 Approve/Reject。",
+                    stage="UNIT_TESTING"
+                )
+
+            # 生成审查报告前检查 Pipeline 是否已终止
             if await PipelineService._check_pipeline_terminated(pipeline_id):
                 await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
                 return

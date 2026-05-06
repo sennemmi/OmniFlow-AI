@@ -143,6 +143,9 @@ class GitProviderService:
         """
         创建新分支
 
+        【关键改进】直接基于远程分支创建新分支，不切换工作区
+        避免覆盖工作区中的未跟踪文件
+
         Args:
             branch_name: 分支名称
             base_branch: 基础分支，默认 main
@@ -153,24 +156,18 @@ class GitProviderService:
         # 使用 origin/base_branch 明确指定远程分支，避免歧义
         remote_base = f"origin/{base_branch}"
 
-        # 【关键修复】先 stash 本地变更，避免 checkout 冲突
-        # 这在沙箱工作区中特别重要，因为可能有未跟踪的文件
-        self._run_git_command(["stash", "push", "-u", "-m", "auto-stash-before-branch-creation"], check=False)
+        # 【关键修复】先检查并提交工作区中的未跟踪文件
+        # 这在独立工作区中很重要，因为复制进来的文件都是未跟踪的
+        status_result = self._run_git_command(["status", "--porcelain"], check=False)
+        if status_result.stdout.strip():
+            # 有未跟踪或修改的文件，先提交到临时分支
+            self._run_git_command(["add", "."], check=False)
+            self._run_git_command(["commit", "-m", "WIP: temp commit before branch creation"], check=False)
 
-        try:
-            # 先切换到基础分支
-            self._run_git_command(["checkout", remote_base])
-            # 拉取最新代码
-            self._run_git_command(["pull", "origin", base_branch], check=False)
-            # 创建新分支
-            result = self._run_git_command(["checkout", "-b", branch_name])
-            # 恢复暂存的变更到新分支
-            self._run_git_command(["stash", "pop"], check=False)
-            return result
-        except Exception:
-            # 如果出错，尝试恢复 stash
-            self._run_git_command(["stash", "pop"], check=False)
-            raise
+        # 【关键改进】直接基于远程分支创建新分支，不切换工作区
+        # 使用 git checkout -b <branch> <remote>/<branch> 直接创建并切换
+        result = self._run_git_command(["checkout", "-b", branch_name, remote_base])
+        return result
 
     def checkout_branch(self, branch_name: str) -> GitResult:
         """
@@ -215,7 +212,9 @@ class GitProviderService:
             GitResult: 操作结果
         """
         if files:
-            return self._run_git_command(["add"] + files)
+            # 统一转为正斜杠（修复 Windows 路径问题）
+            normalized = [f.replace("\\", "/") for f in files]
+            return self._run_git_command(["add"] + normalized)
         else:
             return self._run_git_command(["add", "."])
 

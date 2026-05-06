@@ -2,7 +2,7 @@
 代码交付阶段处理器
 
 处理 DELIVERY 阶段：
-- 创建临时工作区
+- 创建独立临时工作区（隔离 Git 操作环境）
 - Git 分支管理和代码提交
 - PR 生成和创建
 - 【新增】交付失败后打回 CODING/TESTING 阶段
@@ -10,6 +10,8 @@
 
 import asyncio
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -76,6 +78,7 @@ class DeliveryHandler(StageHandler):
         pr_created = False
         copied_count = 0
         rename_mappings = []
+        delivery_workspace = None  # 独立交付工作区
 
         try:
             # 【绑定挂载架构】直接从 sandbox_manager 获取工作区路径
@@ -84,91 +87,90 @@ class DeliveryHandler(StageHandler):
             if not sandbox_info:
                 raise ValueError(f"Sandbox 未启动，无法执行 DELIVERY 阶段 (pipeline_id={pipeline_id})")
 
-            workspace_path = sandbox_info.project_path
-            if not workspace_path:
+            sandbox_path = sandbox_info.project_path
+            if not sandbox_path:
                 raise ValueError("Sandbox 工作区路径为空，无法执行 DELIVERY 阶段")
 
-            workspace_dir = Path(workspace_path)
+            sandbox_dir = Path(sandbox_path)
             await push_log(
                 pipeline_id,
                 "info",
-                f"使用 Sandbox 工作区: {workspace_dir.name}",
+                f"Sandbox 工作区: {sandbox_dir.name}",
                 stage="DELIVERY"
             )
 
-            # 【绑定挂载架构】文件已在宿主机工作区，无需复制
-            # Agent 在 Sandbox 中的修改直接反映到宿主机 temp_dir
+            # 【关键改进】创建独立的交付工作区，隔离 Git 操作环境
+            # 避免 Sandbox 工作区中的未跟踪文件、日志等影响 Git 操作
+            delivery_workspace = Path(tempfile.mkdtemp(prefix=f"omniflow-delivery-{pipeline_id}-"))
+            await push_log(
+                pipeline_id,
+                "info",
+                f"创建独立交付工作区: {delivery_workspace.name}",
+                stage="DELIVERY"
+            )
+
+            # 获取修改的文件列表
             modified_files = coding_output_data.get("modified_files", [])
             if not modified_files and generated_files:
                 # 如果没有记录修改的文件列表，从 generated_files 推断
                 modified_files = [f["file_path"] for f in generated_files]
 
             copied_count = len(modified_files)
+
+            # 【关键改进】只复制修改过的文件到交付工作区，保持工作区干净
+            for file_path in modified_files:
+                src_file = sandbox_dir / file_path
+                if src_file.exists():
+                    dst_file = delivery_workspace / file_path
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+
             await push_log(
                 pipeline_id,
                 "info",
-                f"工作区已有 {copied_count} 个修改的文件（绑定挂载）",
+                f"已复制 {copied_count} 个修改的文件到交付工作区",
                 stage="DELIVERY"
             )
 
-            # Git 操作
-            git_service = GitProviderService(str(workspace_dir))
+            # Git 操作在独立的交付工作区执行
+            git_service = GitProviderService(str(delivery_workspace))
             timestamp = now().strftime("%Y%m%d_%H%M%S")
             git_branch = f"devflow/pipeline-{pipeline_id}-{timestamp}"
 
-            # 【关键修复】沙箱临时工作区没有 .git，需要先初始化
-            git_dir = workspace_dir / ".git"
-            sandbox_git_initialized = not git_dir.exists()
-            if sandbox_git_initialized:
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    "临时工作区未初始化 Git，正在初始化并直接提交...",
-                    stage="DELIVERY"
-                )
-                remote_url = f"https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git"
-                git_service.init_repo(remote_url=remote_url)
-                # 【关键修复】沙箱模式：必须从远程 main 分支创建本地分支，保持历史一致性
-                # 这样才能创建 PR 到 main 分支
-                await push_log(
-                    pipeline_id,
-                    "info",
-                    f"从远程 main 分支创建本地分支 {git_branch}...",
-                    stage="DELIVERY"
-                )
-                try:
-                    # 【关键修复】先 stash 本地所有变更（包括未跟踪文件），避免 checkout 冲突
-                    # 沙箱工作区中可能有未跟踪的文件（如 .gitignore、后端代码等）
-                    git_service._run_git_command(
-                        ["stash", "push", "-u", "-m", f"pipeline-{pipeline_id}-auto-stash"],
-                        check=False
+            # 【关键改进】交付工作区是全新的，需要初始化 Git
+            await push_log(
+                pipeline_id,
+                "info",
+                "初始化 Git 仓库...",
+                stage="DELIVERY"
+            )
+            remote_url = f"https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git"
+            git_service.init_repo(remote_url=remote_url)
+
+            # 【关键改进】从远程 main 分支创建本地分支，保持历史一致性
+            await push_log(
+                pipeline_id,
+                "info",
+                f"从远程 main 分支创建本地分支 {git_branch}...",
+                stage="DELIVERY"
+            )
+            try:
+                # 【修复】先创建 orphan 分支，然后 reset 到 origin/main，避免工作区文件冲突
+                # 这样可以保留已复制的文件，同时设置正确的 Git 历史
+                git_service._run_git_command(["checkout", "--orphan", git_branch], check=True)
+                git_service._run_git_command(["reset", "--mixed", "origin/main"], check=False)
+            except GitProviderError as e:
+                # 如果分支已存在（极少见），则切换到该分支
+                if "already exists" in str(e).lower():
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"分支 {git_branch} 已存在，切换到该分支...",
+                        stage="DELIVERY"
                     )
-                    # 先创建并切换到本地 main 分支（基于 origin/main）
-                    git_service._run_git_command(["checkout", "-b", "main", "origin/main"], check=True)
-                    # 然后基于 main 创建新分支
-                    git_service._run_git_command(["checkout", "-b", git_branch], check=True)
-                    # 恢复暂存的变更到新分支
-                    git_service._run_git_command(["stash", "pop"], check=False)
-                except GitProviderError as e:
-                    # 如果分支已存在（极少见），则切换到该分支
-                    if "already exists" in str(e).lower():
-                        await push_log(
-                            pipeline_id,
-                            "warning",
-                            f"分支 {git_branch} 已存在，切换到该分支...",
-                            stage="DELIVERY"
-                        )
-                        git_service.checkout_branch(git_branch)
-                    else:
-                        raise
-            else:
-                try:
-                    git_service.create_branch(git_branch)
-                except GitProviderError as e:
-                    if "分支已存在" in str(e):
-                        git_service.checkout_branch(git_branch)
-                    else:
-                        raise
+                    git_service.checkout_branch(git_branch)
+                else:
+                    raise
 
             # Git 提交
             git_service.add_files()
@@ -233,6 +235,25 @@ class DeliveryHandler(StageHandler):
         except Exception as e:
             await push_log(pipeline_id, "error", f"代码交付失败: {str(e)}", stage="DELIVERY")
             raise
+
+        finally:
+            # 【关键改进】清理独立交付工作区
+            if delivery_workspace and delivery_workspace.exists():
+                try:
+                    shutil.rmtree(delivery_workspace, ignore_errors=True)
+                    await push_log(
+                        pipeline_id,
+                        "info",
+                        f"清理交付工作区: {delivery_workspace.name}",
+                        stage="DELIVERY"
+                    )
+                except Exception as cleanup_error:
+                    await push_log(
+                        pipeline_id,
+                        "warning",
+                        f"清理交付工作区失败: {cleanup_error}",
+                        stage="DELIVERY"
+                    )
 
     async def complete(self, context: StageContext, result: StageResult) -> None:
         """完成阶段：创建 DELIVERY 阶段记录，更新 Pipeline 状态"""

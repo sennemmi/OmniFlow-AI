@@ -15,6 +15,9 @@
 4. 日志记录（每个步骤都有日志）
 """
 
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -512,6 +515,19 @@ class LightweightMRRequest(BaseModel):
     summary: str = Field(default="", description="变更摘要（由AI生成）")
 
 
+class BatchMRFileInfo(BaseModel):
+    """批量MR中的文件信息"""
+    file_path: str = Field(..., description="文件路径")
+    summary: str = Field(default="", description="该文件的变更摘要")
+
+
+class BatchLightweightMRRequest(BaseModel):
+    """批量轻量 MR 创建请求"""
+    files: List[BatchMRFileInfo] = Field(..., description="修改的文件列表", min_length=1)
+    instruction: str = Field(..., description="用户的修改指令")
+    summary: str = Field(default="", description="整体变更摘要（由AI生成）")
+
+
 @router.post(
     "/code/create-mr",
     response_model=ResponseModel,
@@ -525,8 +541,11 @@ async def create_lightweight_mr(
 ):
     """
     轻量 MR 创建 - 圈选确认后自动触发
+    
+    【关键改进】使用独立临时工作区，避免本地未提交变更影响
     """
     request_id = getattr(request.state, "request_id", "")
+    mr_workspace = None  # 独立 MR 工作区
 
     try:
         from app.service.git_provider import GitProviderService
@@ -534,26 +553,86 @@ async def create_lightweight_mr(
         from app.core.config import settings
         import asyncio
 
-        # 1. 创建新分支（基于 main）
-        project_path = str(Path(settings.TARGET_PROJECT_PATH))
-        git = GitProviderService(project_path)
+        # 【关键改进】创建独立临时工作区，隔离 Git 操作环境
+        project_path = Path(settings.TARGET_PROJECT_PATH)
+        mr_workspace = Path(tempfile.mkdtemp(prefix=f"omniflow-mr-{request_id[:8]}-"))
+        info(f"创建独立 MR 工作区: {mr_workspace}", request_id=request_id)
+
+        # 1. 初始化 Git（工作区为空，无冲突）
+        git = GitProviderService(str(mr_workspace))
+        remote_url = f"https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git"
+        git.init_repo(remote_url=remote_url)
+        info(f"Git 仓库已初始化", request_id=request_id)
+
+        # 2. 复制项目文件到工作区（排除 .git 等）
+        # 使用 dirs_exist_ok=True 允许目标目录已存在（tempfile.mkdtemp 创建的）
+        shutil.copytree(
+            project_path,
+            mr_workspace,
+            ignore=shutil.ignore_patterns(
+                '.git', '__pycache__', '*.pyc', '.pytest_cache',
+                'node_modules', '.venv', 'venv', '.env'
+            ),
+            dirs_exist_ok=True
+        )
+        info(f"项目代码已复制到工作区", request_id=request_id)
+
+        # 3. 处理文件路径
+        # file_path 可能是相对路径（如 src/...），需要转换为绝对路径或相对于工作区的路径
+        file_path_in_workspace = data.file_path
+
+        # 检查文件是否存在于工作区（尝试多种路径组合）
+        possible_paths = [
+            mr_workspace / file_path_in_workspace,  # 直接路径
+            mr_workspace / "frontend" / file_path_in_workspace,  # frontend/ 前缀
+            mr_workspace / "backend" / file_path_in_workspace,   # backend/ 前缀
+        ]
+
+        file_found = False
+        for test_path in possible_paths:
+            if test_path.exists():
+                # 计算相对于工作区的路径
+                file_path_in_workspace = str(test_path.relative_to(mr_workspace)).replace("\\", "/")
+                info(f"文件路径调整: {data.file_path} -> {file_path_in_workspace}", request_id=request_id)
+                file_found = True
+                break
+
+        if not file_found:
+            # 尝试在工作区中搜索文件（修复变量名遮蔽：files -> dir_files）
+            file_name = Path(data.file_path).name
+            for root, dirs, dir_files in os.walk(mr_workspace):
+                for filename in dir_files:
+                    if filename == file_name:
+                        found_path = Path(root) / filename
+                        file_path_in_workspace = str(found_path.relative_to(mr_workspace)).replace("\\", "/")
+                        info(f"通过搜索找到文件: {data.file_path} -> {file_path_in_workspace}", request_id=request_id)
+                        file_found = True
+                        break
+                if file_found:
+                    break
+
+        if not file_found:
+            error(f"文件不存在于工作区: {data.file_path}", request_id=request_id)
+            raise FileNotFoundError(f"文件不存在: {data.file_path}")
+
+        # 4. 创建 orphan 分支并设置历史（不覆盖工作区文件）
         branch_name = f"feat/injector-{request_id[:8]}"
+        # 创建 orphan 分支（无父提交），然后 reset 到 origin/main 设置历史
+        git._run_git_command(["checkout", "--orphan", branch_name])
+        git._run_git_command(["reset", "--mixed", "origin/main"])
+        info(f"创建分支: {branch_name}", request_id=request_id)
 
-        # 创建并切换到新分支
-        await asyncio.to_thread(git.create_branch, branch_name)
-        info(f"创建分支: {branch_name}")
-
-        # 2. 添加变更并提交
-        await asyncio.to_thread(git.add_files, [data.file_path])
+        # 6. 添加变更并提交
+        await asyncio.to_thread(git.add_files, [file_path_in_workspace])
 
         # 提交信息包含用户指令
         commit_msg = f"injector: {data.instruction[:80]}"
         await asyncio.to_thread(git.commit_changes, commit_msg)
-        info(f"提交变更: {commit_msg}")
+        info(f"提交变更: {commit_msg}", request_id=request_id)
 
         # 3. 推送分支
         await asyncio.to_thread(git.push_branch, branch_name)
-        info(f"推送分支: {branch_name}")
+        info(f"推送分支: {branch_name}", request_id=request_id)
 
         # 4. 生成 PR 描述
         pr_description = f"""## 来自圈选修改
@@ -572,7 +651,7 @@ async def create_lightweight_mr(
             )
 
         if pr_result.success:
-            info(f"PR 创建成功: {pr_result.pr_url}")
+            info(f"PR 创建成功: {pr_result.pr_url}", request_id=request_id)
             return success_response(
                 data={
                     "pr_url": pr_result.pr_url,
@@ -582,15 +661,192 @@ async def create_lightweight_mr(
                 request_id=request_id
             )
         else:
-            error(f"PR 创建失败: {pr_result.error}")
+            error(f"PR 创建失败: {pr_result.error}", request_id=request_id)
             return error_response(
                 error=f"PR创建失败: {pr_result.error}",
                 request_id=request_id
             )
 
     except Exception as e:
-        error(f"创建 MR 失败: {e}", exc_info=True)
+        error(f"创建 MR 失败: {e}", exc_info=True, request_id=request_id)
         return error_response(
             error=f"创建 MR 失败: {str(e)}",
             request_id=request_id
         )
+
+    finally:
+        # 【关键改进】清理独立 MR 工作区
+        if mr_workspace and mr_workspace.exists():
+            try:
+                shutil.rmtree(mr_workspace, ignore_errors=True)
+                info(f"清理 MR 工作区: {mr_workspace}", request_id=request_id)
+            except Exception as cleanup_error:
+                error(f"清理 MR 工作区失败: {cleanup_error}", request_id=request_id)
+
+
+@router.post(
+    "/code/create-mr-batch",
+    response_model=ResponseModel,
+    summary="创建批量轻量 MR",
+    description="圈选确认后自动创建 MR（支持多文件），包含分支创建、提交、推送和 PR 创建"
+)
+async def create_batch_lightweight_mr(
+    request: Request,
+    data: BatchLightweightMRRequest,
+    session: AsyncSession = Depends(get_session)
+):
+    """
+    批量轻量 MR 创建 - 圈选确认后自动触发（支持多文件）
+
+    【关键改进】使用独立临时工作区，避免本地未提交变更影响
+    """
+    request_id = getattr(request.state, "request_id", "")
+    mr_workspace = None  # 独立 MR 工作区
+
+    try:
+        from app.service.git_provider import GitProviderService
+        from app.service.platform_provider import GitHubProviderService
+        from app.core.config import settings
+        import asyncio
+
+        # 【关键改进】创建独立临时工作区，隔离 Git 操作环境
+        project_path = Path(settings.TARGET_PROJECT_PATH)
+        mr_workspace = Path(tempfile.mkdtemp(prefix=f"omniflow-mr-batch-{request_id[:8]}-"))
+        info(f"创建独立 MR 工作区(批量): {mr_workspace}", request_id=request_id)
+
+        # 1. 初始化 Git（工作区为空，无冲突）
+        git = GitProviderService(str(mr_workspace))
+        remote_url = f"https://github.com/{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}.git"
+        git.init_repo(remote_url=remote_url)
+        info(f"Git 仓库已初始化", request_id=request_id)
+
+        # 2. 复制项目文件到工作区（排除 .git 等）
+        shutil.copytree(
+            project_path,
+            mr_workspace,
+            ignore=shutil.ignore_patterns(
+                '.git', '__pycache__', '*.pyc', '.pytest_cache',
+                'node_modules', '.venv', 'venv', '.env'
+            ),
+            dirs_exist_ok=True
+        )
+        info(f"项目代码已复制到工作区", request_id=request_id)
+
+        # 3. 处理多个文件路径
+        file_paths_in_workspace: List[str] = []
+        file_path_mapping: Dict[str, str] = {}  # 原始路径 -> 工作区路径
+
+        for file_info in data.files:
+            original_path = file_info.file_path
+            file_path_in_workspace = original_path
+            file_found = False
+
+            # 检查文件是否存在于工作区（尝试多种路径组合）
+            possible_paths = [
+                mr_workspace / file_path_in_workspace,  # 直接路径
+                mr_workspace / "frontend" / file_path_in_workspace,  # frontend/ 前缀
+                mr_workspace / "backend" / file_path_in_workspace,   # backend/ 前缀
+            ]
+
+            for test_path in possible_paths:
+                if test_path.exists():
+                    # 计算相对于工作区的路径
+                    file_path_in_workspace = str(test_path.relative_to(mr_workspace)).replace("\\", "/")
+                    info(f"文件路径调整: {original_path} -> {file_path_in_workspace}", request_id=request_id)
+                    file_found = True
+                    break
+
+            if not file_found:
+                # 尝试在工作区中搜索文件（修复变量名遮蔽：files -> dir_files）
+                file_name = Path(original_path).name
+                for root, dirs, dir_files in os.walk(mr_workspace):
+                    for filename in dir_files:
+                        if filename == file_name:
+                            found_path = Path(root) / filename
+                            file_path_in_workspace = str(found_path.relative_to(mr_workspace)).replace("\\", "/")
+                            info(f"通过搜索找到文件: {original_path} -> {file_path_in_workspace}", request_id=request_id)
+                            file_found = True
+                            break
+                    if file_found:
+                        break
+
+            if not file_found:
+                error(f"文件不存在于工作区: {original_path}", request_id=request_id)
+                raise FileNotFoundError(f"文件不存在: {original_path}")
+
+            file_paths_in_workspace.append(file_path_in_workspace)
+            file_path_mapping[original_path] = file_path_in_workspace
+
+        info(f"共找到 {len(file_paths_in_workspace)} 个文件", request_id=request_id)
+
+        # 4. 创建 orphan 分支并设置历史（不覆盖工作区文件）
+        branch_name = f"feat/injector-batch-{request_id[:8]}"
+        # 创建 orphan 分支（无父提交），然后 reset 到 origin/main 设置历史
+        git._run_git_command(["checkout", "--orphan", branch_name])
+        git._run_git_command(["reset", "--mixed", "origin/main"])
+        info(f"创建分支: {branch_name}", request_id=request_id)
+
+        # 6. 添加所有变更文件并提交
+        await asyncio.to_thread(git.add_files, file_paths_in_workspace)
+
+        # 提交信息包含用户指令
+        commit_msg = f"injector(batch): {data.instruction[:80]}"
+        await asyncio.to_thread(git.commit_changes, commit_msg)
+        info(f"提交变更: {commit_msg}", request_id=request_id)
+
+        # 7. 推送分支
+        await asyncio.to_thread(git.push_branch, branch_name)
+        info(f"推送分支: {branch_name}", request_id=request_id)
+
+        # 8. 生成 PR 描述（包含所有文件）
+        files_list_str = "\n".join([f"- `{f}`" for f in file_path_mapping.keys()])
+        pr_description = f"""## 来自圈选修改（批量）
+{data.summary or data.instruction}
+
+### 修改文件
+{files_list_str}
+"""
+
+        # 9. 创建 PR
+        async with GitHubProviderService() as gh:
+            pr_result = await gh.create_pull_request(
+                head_branch=branch_name,
+                title=f"OmniFlowAI(batch): {data.instruction[:50]}",
+                body=pr_description,
+                base_branch="main"
+            )
+
+        if pr_result.success:
+            info(f"PR 创建成功: {pr_result.pr_url}", request_id=request_id)
+            return success_response(
+                data={
+                    "pr_url": pr_result.pr_url,
+                    "pr_number": pr_result.pr_number,
+                    "branch": branch_name,
+                    "files_count": len(file_paths_in_workspace),
+                    "files": list(file_path_mapping.keys())
+                },
+                request_id=request_id
+            )
+        else:
+            error(f"PR 创建失败: {pr_result.error}", request_id=request_id)
+            return error_response(
+                error=f"PR创建失败: {pr_result.error}",
+                request_id=request_id
+            )
+
+    except Exception as e:
+        error(f"创建批量 MR 失败: {e}", exc_info=True, request_id=request_id)
+        return error_response(
+            error=f"创建批量 MR 失败: {str(e)}",
+            request_id=request_id
+        )
+
+    finally:
+        # 【关键改进】清理独立 MR 工作区
+        if mr_workspace and mr_workspace.exists():
+            try:
+                shutil.rmtree(mr_workspace, ignore_errors=True)
+                info(f"清理 MR 工作区: {mr_workspace}", request_id=request_id)
+            except Exception as cleanup_error:
+                error(f"清理 MR 工作区失败: {cleanup_error}", request_id=request_id)

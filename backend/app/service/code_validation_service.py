@@ -66,7 +66,19 @@ class CodeValidationService:
             None 表示语法正确，否则返回 SyntaxErrorInfo
         """
         try:
-            clean_path = file_path.replace("backend/", "").replace("backend\\", "").lstrip("/")
+            # 【修复】正确处理各种路径格式
+            # 移除 /workspace/backend/ 或 /workspace/ 前缀，以及开头的 backend/
+            clean_path = file_path.replace("\\", "/").lstrip("/")
+            for prefix in ("/workspace/backend/", "/workspace/", "workspace/backend/", "workspace/"):
+                if clean_path.startswith(prefix.lstrip("/")):
+                    clean_path = clean_path[len(prefix.lstrip("/")):]
+                    break
+            # 移除开头的 backend/
+            while clean_path.startswith("backend/"):
+                clean_path = clean_path[8:]
+            # 移除开头的 /
+            clean_path = clean_path.lstrip("/")
+
             full_path = f"/workspace/backend/{clean_path}"
 
             # 如果提供了内容，先写入沙箱

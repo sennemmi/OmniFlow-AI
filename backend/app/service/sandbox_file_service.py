@@ -68,11 +68,18 @@ class SandboxFileService:
         标准化路径：统一为正斜杠，确保路径指向 /workspace/backend/
 
         处理逻辑：
+        - 移除可能的 /workspace/ 或 /workspace/backend/ 前缀（绝对路径转相对路径）
         - 循环去除重复的 backend/ 前缀（如 backend/backend/app/... → backend/app/...）
         - 如果路径不以 backend/ 开头（如 app/api/v1/health.py），添加 backend/ 前缀
         - 最终路径格式：backend/xxx/xxx.py，映射到 /workspace/backend/xxx/xxx.py
         """
         clean = file_path.replace("\\", "/").lstrip("/")
+
+        # 【修复】处理沙箱内的绝对路径，移除 /workspace/backend/ 或 /workspace/ 前缀
+        if clean.startswith("workspace/backend/"):
+            clean = clean[len("workspace/backend/"):]
+        elif clean.startswith("workspace/"):
+            clean = clean[len("workspace/"):]
 
         # 【修复】循环去除重复的 backend/ 前缀
         while clean.startswith("backend/backend/"):

@@ -81,9 +81,9 @@ class TestArchitectExploration:
         
         # 验证每个符号都有必要的字段
         for symbol in output.required_symbols:
-            assert "name" in symbol
-            assert "type" in symbol
-            assert "module" in symbol
+            assert symbol.name is not None
+            assert symbol.type is not None
+            assert symbol.module is not None
 
     def test_architect_identifies_acceptance_criteria(self, mock_architect_output):
         """测试 Architect 识别验收标准"""
@@ -131,25 +131,29 @@ class TestContractAlignment:
                 symbol_name="create_user",
                 module="app/service/user.py",
                 signature="def create_user(data: dict) -> User",
-                expected_behavior="创建新用户"
+                expected_behavior="创建新用户",
+                return_type="User"
             ),
             InterfaceSpec(
                 symbol_name="get_user",
                 module="app/service/user.py",
                 signature="def get_user(user_id: int) -> User",
-                expected_behavior="获取用户信息"
+                expected_behavior="获取用户信息",
+                return_type="User"
             ),
             InterfaceSpec(
                 symbol_name="update_user",
                 module="app/service/user.py",
                 signature="def update_user(user_id: int, data: dict) -> User",
-                expected_behavior="更新用户信息"
+                expected_behavior="更新用户信息",
+                return_type="User"
             ),
             InterfaceSpec(
                 symbol_name="delete_user",
                 module="app/service/user.py",
                 signature="def delete_user(user_id: int) -> bool",
-                expected_behavior="删除用户"
+                expected_behavior="删除用户",
+                return_type="bool"
             )
         ]
 
@@ -161,13 +165,15 @@ class TestContractAlignment:
                 symbol_name="create_user",
                 module="app/service/user.py",
                 signature="def create_user(data: dict) -> User",
-                expected_behavior="创建新用户"
+                expected_behavior="创建新用户",
+                return_type="User"
             ),
             InterfaceSpec(
                 symbol_name="get_user",
                 module="app/service/user.py",
                 signature="def get_user(user_id: int) -> User",
-                expected_behavior="获取用户信息"
+                expected_behavior="获取用户信息",
+                return_type="User"
             )
             # 缺少 update_user 和 delete_user
         ]

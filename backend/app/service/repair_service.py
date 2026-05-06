@@ -114,9 +114,15 @@ class RepairService:
             max_retries=self.MAX_REPAIR_ROUNDS
         )
 
-        # 提取失败的测试
+        # 提取失败的测试（同时捕获运行期 FAILED 和收集期 ERROR）
         failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
-        await log("info", f"📋 发现 {len(failed_tests)} 个失败测试")
+        # 也捕获 pytest 收集阶段的错误（如 SyntaxError 导致 import 失败）
+        collection_errors = re.findall(r'ERROR\s+collecting\s+(\S+)', test_logs)
+        if collection_errors:
+            failed_tests.extend(collection_errors)
+            failed_tests = list(set(failed_tests))  # 去重
+        await log("info", f"📋 发现 {len(failed_tests)} 个失败/错误测试" +
+                   (f"（含 {len(collection_errors)} 个收集错误）" if collection_errors else ""))
 
         while state.attempt < state.max_retries:
             state.attempt += 1
@@ -260,11 +266,13 @@ class RepairService:
 
         # 达到最大重试次数
         await log("error", f"🚨 已达到最大重试次数 ({state.max_retries})")
+        await log("warning", "⚠️ 自动修复未能在限定轮次内完成，建议人工介入检查")
 
         return {
             "success": False,
             "repair_rounds": state.attempt,
             "test_run_success": False,
+            "requires_user_decision": True,
             "error": f"Auto-fix failed after {state.attempt} rounds",
             "fix_history": state.fix_history,
         }

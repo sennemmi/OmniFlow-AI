@@ -45,7 +45,7 @@ export function ApproveDrawer() {
   // 【修复】用实时查询数据替代 store 快照，添加 signal 用于清理
   const pipelineId = storedPipeline?.id;
   const { data: livePipeline } = useQuery<Pipeline>({
-    queryKey: ['pipeline', String(pipelineId)],
+    queryKey: ['pipeline', pipelineId],
     queryFn: ({ signal }) => apiGet<Pipeline>(`/pipeline/${pipelineId}/status`, { signal }),
     enabled: !!pipelineId && isApproveDrawerOpen,
     refetchInterval: 2000,
@@ -227,7 +227,7 @@ export function ApproveDrawer() {
       }));
 
       // 刷新数据
-      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
       queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
       // 延迟关闭抽屉
@@ -298,7 +298,7 @@ export function ApproveDrawer() {
         detail: { stageId: selectedStage?.id, type: 'coder-only' }
       }));
 
-      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
       queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
       // 如果拒绝了代码，关闭抽屉；如果批准了，保持打开可以继续审批测试
@@ -370,7 +370,7 @@ export function ApproveDrawer() {
         detail: { stageId: selectedStage?.id, type: 'tester-only' }
       }));
 
-      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
       queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
       // 如果拒绝了测试，关闭抽屉；如果批准了，切换到 coder tab 继续审批（如果还没审批）
@@ -464,7 +464,7 @@ export function ApproveDrawer() {
         detail: { stageId: selectedStage.id }
       }));
 
-      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
       queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
       setTimeout(() => {
@@ -491,7 +491,8 @@ export function ApproveDrawer() {
     }
 
     const isMatch = selectedStage?.name === selectedPipeline?.current_stage ||
-                      (selectedStage?.name === 'CODING' && selectedPipeline?.current_stage === 'CODE_REVIEW');
+                      (selectedStage?.name === 'CODING' && selectedPipeline?.current_stage === 'CODE_REVIEW') ||
+                      (selectedStage?.name === 'UNIT_TESTING' && selectedPipeline?.current_stage === 'CODE_REVIEW');
 
     if (!isMatch) {
       addToast({ type: 'warning', message: '当前阶段不是待审批阶段' });
@@ -514,7 +515,7 @@ export function ApproveDrawer() {
         suggested_changes: undefined
       });
 
-      queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+      queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
       queryClient.invalidateQueries({ queryKey: ['pipelines'] });
 
       document.dispatchEvent(new CustomEvent('pipeline:reject', {
@@ -858,7 +859,7 @@ export function ApproveDrawer() {
                         <div className="flex gap-1 overflow-x-auto pb-1">
                           {allCodeChanges.map((change, i) => (
                             <button
-                              key={change.fileName}
+                              key={`${change.fileName}-${i}`}
                               onClick={() => setSelectedFileIndex(i)}
                               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono whitespace-nowrap transition-colors
                                 ${i === selectedFileIndex
@@ -993,7 +994,7 @@ export function ApproveDrawer() {
                     <div className="flex gap-1 overflow-x-auto pb-1">
                       {testCodeChanges.map((change, i) => (
                         <button
-                          key={change.fileName}
+                          key={`${change.fileName}-${i}`}
                           onClick={() => setSelectedTestFileIndex(i)}
                           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono whitespace-nowrap transition-colors
                             ${i === selectedTestFileIndex
@@ -1024,7 +1025,7 @@ export function ApproveDrawer() {
                             newCode: newContent
                           };
                           // 触发刷新
-                          queryClient.invalidateQueries({ queryKey: ['pipeline', String(selectedPipeline.id)] });
+                          queryClient.invalidateQueries({ queryKey: ['pipeline', selectedPipeline.id] });
                         }}
                         onTestRun={(success) => {
                           // 更新测试结果状态

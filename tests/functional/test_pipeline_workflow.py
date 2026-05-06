@@ -36,7 +36,7 @@ class TestPipelineStateTransitions:
             StageName.REQUIREMENT,
             StageName.DESIGN,
             StageName.CODING,
-            StageName.TESTING,
+            StageName.UNIT_TESTING,
             StageName.CODE_REVIEW,
             StageName.DELIVERY
         ]
@@ -54,7 +54,7 @@ class TestPipelineStateTransitions:
         stages = []
         for i, stage_name in enumerate([
             StageName.REQUIREMENT, StageName.DESIGN, StageName.CODING,
-            StageName.TESTING, StageName.CODE_REVIEW, StageName.DELIVERY
+            StageName.UNIT_TESTING, StageName.CODE_REVIEW, StageName.DELIVERY
         ]):
             stage = MagicMock(spec=PipelineStage)
             stage.id = i + 1
@@ -168,7 +168,7 @@ class TestPipelineStateTransitions:
             StageName.REQUIREMENT,
             StageName.DESIGN,
             StageName.CODING,
-            StageName.TESTING,
+            StageName.UNIT_TESTING,
             StageName.CODE_REVIEW,
             StageName.DELIVERY
         ]

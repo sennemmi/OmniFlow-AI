@@ -17,6 +17,9 @@ class ErrorInfo:
         self.type = error_type
         self.message = message
         self.extra = kwargs
+        # 将 kwargs 中的属性直接设置到实例上，方便通过 getattr 访问
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,13 +45,34 @@ class ErrorAnalysisService:
     def extract_syntax_errors(self, logs: str) -> List[ErrorInfo]:
         """从日志中提取 SyntaxError"""
         errors = []
-        pattern = r'SyntaxError:\s*(.+?)(?:\n|$)'
-        for match in re.finditer(pattern, logs, re.MULTILINE):
+
+        # 提取所有文件路径（SyntaxError 前最近的 File "..." 行）
+        file_pattern = r'File "([^"]+)"'
+        files = re.findall(file_pattern, logs)
+
+        # 提取 SyntaxError 及其行号
+        syntax_pattern = r'File "([^"]+)".*?line (\d+).*?SyntaxError:\s*(.+?)(?:\n|$)'
+        for match in re.finditer(syntax_pattern, logs, re.MULTILINE | re.DOTALL):
             errors.append(ErrorInfo(
                 error_type="SyntaxError",
-                message=match.group(1).strip(),
-                line=0
+                message=match.group(3).strip(),
+                file=match.group(1),
+                line=int(match.group(2))
             ))
+
+        # 如果没有匹配到带文件路径的格式，尝试简单匹配
+        if not errors:
+            simple_pattern = r'SyntaxError:\s*(.+?)(?:\n|$)'
+            for match in re.finditer(simple_pattern, logs, re.MULTILINE):
+                # 尝试找到最近的文件路径
+                file_path = files[-1] if files else ""
+                errors.append(ErrorInfo(
+                    error_type="SyntaxError",
+                    message=match.group(1).strip(),
+                    file=file_path,
+                    line=0
+                ))
+
         return errors
 
     def extract_import_errors(self, logs: str) -> List[ErrorInfo]:

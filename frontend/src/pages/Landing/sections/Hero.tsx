@@ -35,7 +35,7 @@ export function Hero() {
             <h1 className="text-5xl lg:text-7xl font-bold leading-[1.1] text-white">
               <span className="text-blue-400">让 AI 重新定义</span>
               <br />
-              <span className="text-white">软件开发流程</span>
+              <span className="text-black">软件开发流程</span>
             </h1>
 
             <p className="text-xl text-white/60 max-w-xl leading-relaxed">
@@ -46,12 +46,12 @@ export function Hero() {
             <div className="flex flex-wrap items-center gap-4">
               <Link
                 to="/console"
-                className="group inline-flex items-center gap-2 px-8 py-4 bg-blue-500 text-white rounded-xl font-semibold text-lg hover:bg-blue-600 hover:shadow-lg hover:shadow-blue-500/25 hover:-translate-y-0.5 transition-all duration-300"
+                className="group inline-flex items-center gap-2 px-8 py-4 bg-blue-500 text-black rounded-xl font-semibold text-lg hover:bg-blue-600 hover:shadow-lg hover:shadow-blue-500/25 hover:-translate-y-0.5 transition-all duration-300"
               >
                 开始使用
                 <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
               </Link>
-              <button className="group inline-flex items-center gap-2 px-6 py-4 text-white/80 hover:text-white border border-white/20 hover:border-white/40 rounded-xl backdrop-blur-sm transition-all duration-300">
+              <button className="group inline-flex items-center gap-2 px-6 py-4 text-white hover:text-white border border-white/20 hover:border-white/40 rounded-xl backdrop-blur-sm transition-all duration-300">
                 <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-white/20 transition-colors">
                   <Play className="w-4 h-4 ml-0.5" />
                 </div>

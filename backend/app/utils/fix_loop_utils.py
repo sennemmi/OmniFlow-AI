@@ -64,9 +64,23 @@ class ErrorContextBuilder:
             if not file_path:
                 continue
 
-            # 读取文件内容
-            read_result = await self.file_service.read_file(file_path)
+            # 路径归一化：处理沙箱日志中的 /workspace/backend/xxx 格式
+            normalized_path = file_path
+            for prefix in ('/workspace/backend/', '/workspace/'):
+                if normalized_path.startswith(prefix):
+                    normalized_path = normalized_path[len(prefix):]
+                    break
+            # 去除可能的嵌套 backend/ 前缀
+            while normalized_path.startswith('backend/') or normalized_path.startswith('backend\\'):
+                normalized_path = normalized_path.replace('backend/', '', 1).replace('backend\\', '', 1)
+
+            # 先尝试归一化路径，失败则尝试原始路径
+            read_result = await self.file_service.read_file(normalized_path)
+            if (not read_result.exists or not read_result.content) and normalized_path != file_path:
+                read_result = await self.file_service.read_file(file_path)
+
             if not read_result.exists or not read_result.content:
+                logger.warning(f"[ContextBuilder] 无法读取语法错误文件: original={file_path}, normalized={normalized_path}")
                 continue
 
             content = read_result.content
@@ -77,10 +91,11 @@ class ErrorContextBuilder:
             end_line = min(len(lines), line_no + self.syntax_context_lines)
 
             focused_content = '\n'.join(lines[start_line:end_line])
-            focused_content = f"# ... (文件 {file_path} 的第 {start_line+1}-{end_line} 行，共 {len(lines)} 行)\n{focused_content}\n# ..."
+            focused_content = f"# ... (文件 {normalized_path} 的第 {start_line+1}-{end_line} 行，共 {len(lines)} 行)\n{focused_content}\n# ..."
 
-            focused_files.append((file_path, focused_content))
-            logger.info(f"[ContextBuilder] SyntaxError 上下文: {file_path} 第 {line_no} 行附近")
+            # 使用归一化后的路径，确保后续 run_syntax_fix_loop 能够匹配
+            focused_files.append((normalized_path, focused_content))
+            logger.info(f"[ContextBuilder] SyntaxError 上下文: {file_path} → {normalized_path} 第 {line_no} 行附近")
 
         return focused_files
 

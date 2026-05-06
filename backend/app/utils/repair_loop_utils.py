@@ -46,21 +46,63 @@ async def run_syntax_fix_loop(
 
     fixed_files = {}
 
+    # 路径归一化辅助函数：处理 sandbox日志路径 与 file_service 期望路径之间的差异
+    def _normalize_error_path(fp: str) -> str:
+        """将各种形式的路径归一化为 file_service 可接受的相对路径"""
+        if not fp:
+            return fp
+        # 去除 /workspace/backend/ 或 /workspace/ 前缀（沙箱日志中的绝对路径）
+        fp = fp.replace('/workspace/backend/', '').replace('/workspace/', '')
+        # 去除开头的 backend/（偶发的嵌套前缀）
+        while fp.startswith('backend/') or fp.startswith('backend\\'):
+            fp = fp.replace('backend/', '', 1).replace('backend\\', '', 1)
+        return fp.lstrip('/')
+
     for attempt in range(max_retries):
         logger.info(f"语法错误自动修复 第 {attempt + 1}/{max_retries} 次")
 
-        # 收集错误文件
+        # 收集错误文件：先在 files_to_check 中匹配，匹配不到则直接从 file_service 读取
         error_files = {}
         for err in syntax_errors:
-            fp = err.get("file", "")
-            if fp:
-                for check_fp, content in files_to_check:
-                    if check_fp == fp:
-                        error_files[fp] = content
-                        break
+            # 【修复】ErrorInfo 对象使用 getattr 访问属性
+            fp = getattr(err, 'file', '') if hasattr(err, 'file') else err.get("file", "")
+            if not fp:
+                continue
+
+            # 归一化路径
+            normalized_fp = _normalize_error_path(fp)
+
+            # 1) 先尝试在 files_to_check 中匹配（支持原始路径和归一化路径）
+            matched = False
+            for check_fp, content in files_to_check:
+                check_normalized = _normalize_error_path(check_fp)
+                if check_fp == fp or check_fp == normalized_fp or check_normalized == normalized_fp:
+                    error_files[fp] = content
+                    error_files[normalized_fp] = content  # 同时注册归一化后的 key
+                    matched = True
+                    logger.info(f"语法修复：从 files_to_check 匹配到错误文件: {check_fp}")
+                    break
+
+            # 2) 匹配不到则直接从 file_service 读取（修复非 AI 生成文件的场景）
+            if not matched and file_service:
+                try:
+                    read_result = await file_service.read_file(normalized_fp)
+                    if read_result.exists and read_result.content:
+                        error_files[normalized_fp] = read_result.content
+                        logger.info(f"语法修复：从 file_service 直接读取错误文件: {normalized_fp}")
+                    else:
+                        # 尝试原始路径
+                        read_result = await file_service.read_file(fp)
+                        if read_result.exists and read_result.content:
+                            error_files[fp] = read_result.content
+                            logger.info(f"语法修复：从 file_service 读取(原始路径): {fp}")
+                        else:
+                            logger.warning(f"语法修复：无法读取错误文件（原始/归一化均失败）: fp={fp}, normalized={normalized_fp}")
+                except Exception as e:
+                    logger.warning(f"语法修复：读取错误文件异常: {fp} / {normalized_fp} — {e}")
 
         if not error_files:
-            logger.info("没有需要修复的语法错误文件")
+            logger.warning("没有可修复的语法错误文件（files_to_check 和 file_service 均无法获取）")
             return fixed_files
 
         # 构建修复指令
@@ -70,16 +112,23 @@ async def run_syntax_fix_loop(
         )
 
         # 构建定向设计输出
-        # 【修复】保留 interface_specs 和 required_symbols，让 CoderAgent 在修复语法错误时仍有契约约束
-        # 【新增】添加 syntax_fix_mode 标识，让 CoderAgent 知道这是语法修复模式
+        # 【关键修复】语法修复模式下，只保留必要的字段，避免原始设计内容干扰修复任务
+        # CoderAgent 应该专注于修复语法错误，而不是执行原始设计
         targeted_design = {
-            **design_output,
             "affected_files": list(error_files.keys()),
             "fix_mode": True,
             "syntax_fix_mode": True,  # 明确告知 CoderAgent 这是语法修复模式
             "force_full_file": force_full_file,
             "fix_instruction": fix_instruction,
-            "syntax_errors": syntax_errors
+            "syntax_errors": syntax_errors,
+            # 保留可能需要的契约约束，但清空会干扰修复的设计字段
+            "interface_specs": design_output.get("interface_specs", []),
+            "required_symbols": design_output.get("required_symbols", []),
+            "pipeline_id": design_output.get("pipeline_id", 0),
+            # 【关键】覆盖技术设计描述，明确告知这是语法修复任务
+            "technical_design": f"【语法修复任务】修复以下文件的语法错误，使其可以通过 Python 语法检查。\n\n{fix_instruction}",
+            "api_endpoints": [],  # 清空 API 端点定义，避免干扰
+            "function_changes": [],  # 清空函数变更列表，避免干扰
         }
 
         # 调用 CoderAgent
@@ -457,7 +506,8 @@ async def _check_remaining_syntax_errors(
     checked_files = set()
     
     for err in syntax_errors:
-        fp = err.get("file", "")
+        # 【修复】ErrorInfo 对象使用 getattr 访问属性
+        fp = getattr(err, 'file', '') if hasattr(err, 'file') else err.get("file", "")
         if fp in checked_files:
             continue
         checked_files.add(fp)

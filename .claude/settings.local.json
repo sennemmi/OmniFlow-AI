@@ -19,7 +19,8 @@
       "Read(//c/Users/98778/.conda/envs//**)",
       "Bash(ls /d/feishuProj/backend/requirements*.txt)",
       "Bash(/c/Users/98778/miniconda3/envs/gino_swe/bin/python -c \"import sqlalchemy; print\\('sqlalchemy OK'\\)\" 2>&1 || echo \"---\" && pip list 2>/dev/null | grep -i sql 2>/dev/null | head -3)",
-      "Bash(which python:*)"
+      "Bash(which python:*)",
+      "Bash(PYTHONPATH=\"C:/Users/xyx/Desktop/feishuProj050601/backend\" python -m pytest tests/unit tests/defense tests/functional -v --tb=short -p no:warnings)"
     ]
   }
 }

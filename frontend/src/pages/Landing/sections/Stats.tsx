@@ -75,7 +75,7 @@ function StatItem({ icon, value, label, suffix = '', delay = 0 }: StatItemProps)
       {/* Value */}
       <div className="relative">
         <div className="flex items-baseline gap-1">
-          <span className="text-4xl font-bold text-gray-900 tracking-tight">
+          <span className="text-4xl font-bold text-blue-600 tracking-tight">
             {displayValue}
           </span>
           {suffix && (

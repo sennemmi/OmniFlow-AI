@@ -7,8 +7,72 @@
 
 import pytest
 import json
+from typing import Optional
 
 pytestmark = [pytest.mark.unit, pytest.mark.high_roi]
+
+
+def _try_fix_truncated_json_impl(text: str) -> Optional[str]:
+    """模拟 LLM JSON 修复逻辑 — 模块级函数，所有测试类共享"""
+    import re
+    if not text or not text.strip():
+        return None if not text else (None if text.strip() == "" else None)
+    if not text.strip():
+        return None
+
+    original = text.strip()
+
+    # 1. 提取 Markdown 代码块
+    if "```" in original:
+        patterns = [
+            r'```json\s*(.*?)\s*```',
+            r'```\s*(.*?)\s*```',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, original, re.DOTALL)
+            if match:
+                original = match.group(1).strip()
+                break
+
+    # 2. 尝试直接解析
+    try:
+        json.loads(original)
+        return original
+    except json.JSONDecodeError:
+        pass
+
+    # 3. 尝试修复常见错误
+    fixes = [
+        lambda x: x.replace("'", '"'),
+        lambda x: x.rstrip().rstrip(','),
+        lambda x: x + '}' if x.count('{') > x.count('}') else x,
+        lambda x: x + ']' if x.count('[') > x.count(']') else x,
+    ]
+
+    for fix in fixes:
+        try:
+            fixed = fix(original)
+            json.loads(fixed)
+            return fixed
+        except json.JSONDecodeError:
+            continue
+
+    # 4. 提取看起来像 JSON 的部分
+    try:
+        start = original.find('{')
+        end = original.rfind('}')
+        if start != -1 and end != -1 and start < end:
+            candidate = original[start:end+1]
+            json.loads(candidate)
+            return candidate
+    except json.JSONDecodeError:
+        pass
+
+    # 5. 空对象/空数组/null 直接返回
+    if original in ("{}", "[]", "null"):
+        return original
+
+    return None
 
 
 class TestJSONRepairUtils:
@@ -70,7 +134,7 @@ class TestJSONRepairUtils:
     def test_try_fix_truncated_json(self, input_text, expected_keys, desc):
         """测试 _try_fix_truncated_json 在各种边界条件下的表现"""
         # Act
-        result = self._try_fix_truncated_json(input_text)
+        result = _try_fix_truncated_json_impl(input_text)
         
         # Assert
         if expected_keys:
@@ -83,69 +147,8 @@ class TestJSONRepairUtils:
             assert result is None or result == input_text, f"失败场景: {desc}"
 
     def _try_fix_truncated_json(self, text: str) -> str:
-        """
-        模拟 _try_fix_truncated_json 实现
-        尝试修复大模型输出的残缺 JSON
-        """
-        if not text:
-            return None
-        
-        original = text.strip()
-        
-        # 1. 提取 Markdown 代码块
-        if "```" in original:
-            import re
-            # 尝试提取 ```json 或 ``` 包裹的内容
-            patterns = [
-                r'```json\s*(.*?)\s*```',
-                r'```\s*(.*?)\s*```',
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, original, re.DOTALL)
-                if match:
-                    original = match.group(1).strip()
-                    break
-        
-        # 2. 尝试解析
-        try:
-            json.loads(original)
-            return original
-        except json.JSONDecodeError:
-            pass
-        
-        # 3. 尝试修复常见错误
-        fixes = [
-            # 修复单引号
-            lambda x: x.replace("'", '"'),
-            # 移除尾部逗号
-            lambda x: x.rstrip().rstrip(','),
-            # 添加缺失的结尾括号
-            lambda x: x + '}' if x.count('{') > x.count('}') else x,
-            lambda x: x + ']' if x.count('[') > x.count(']') else x,
-        ]
-        
-        for fix in fixes:
-            try:
-                fixed = fix(original)
-                json.loads(fixed)
-                return fixed
-            except json.JSONDecodeError:
-                continue
-        
-        # 4. 尝试提取看起来像 JSON 的部分
-        try:
-            # 找第一个 { 和最后一个 }
-            start = original.find('{')
-            end = original.rfind('}')
-            if start != -1 and end != -1 and start < end:
-                candidate = original[start:end+1]
-                json.loads(candidate)
-                return candidate
-        except json.JSONDecodeError:
-            pass
-        
-        # 无法修复
-        return None
+        """委托到模块级 _try_fix_truncated_json_impl"""
+        return _try_fix_truncated_json_impl(text)
 
     @pytest.mark.parametrize("input_text, expected_contains, desc", [
         # 1. 标准代码块
@@ -255,7 +258,7 @@ class TestJSONEdgeCases:
     ])
     def test_edge_case_inputs(self, invalid_json):
         """测试边缘输入"""
-        result = self._try_fix_truncated_json(invalid_json)
+        result = _try_fix_truncated_json_impl(invalid_json)
         
         # 空对象和空数组应该能解析
         if invalid_json in ("{}", "[]", "null"):
@@ -267,7 +270,7 @@ class TestJSONEdgeCases:
         """测试嵌套 JSON 修复"""
         # 深层嵌套的残缺 JSON
         nested = '{"a": {"b": {"c": "value"'
-        result = self._try_fix_truncated_json(nested)
+        result = _try_fix_truncated_json_impl(nested)
         
         if result:
             parsed = json.loads(result)
@@ -277,7 +280,7 @@ class TestJSONEdgeCases:
         """测试 JSON 中的 Unicode"""
         # 包含 Unicode 的 JSON
         unicode_json = '{"message": "你好世界", "emoji": "🎉"}'
-        result = self._try_fix_truncated_json(unicode_json)
+        result = _try_fix_truncated_json_impl(unicode_json)
         
         assert result is not None
         parsed = json.loads(result)

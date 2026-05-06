@@ -15,10 +15,11 @@ def normalize_relative_path(file_path: str, remove_backend_prefix: bool = True) 
     标准化相对路径
 
     统一处理：
-    1. 移除 backend/ 或 backend\\ 前缀
-    2. 统一使用正斜杠 /
+    1. 移除 backend/ 或 backend\\
+   2. 统一使用正斜杠 /
     3. 去除首尾的斜杠
     4. 处理 Windows 反斜杠
+    5. 去除冗余的连续斜杠
 
     Args:
         file_path: 原始文件路径
@@ -43,10 +44,15 @@ def normalize_relative_path(file_path: str, remove_backend_prefix: bool = True) 
     # 统一使用正斜杠
     path = file_path.replace("\\", "/")
 
-    # 移除 backend/ 前缀（如果启用）
+    # 移除 backend/ 前缀（大小写不敏感，处理多种变体）
     if remove_backend_prefix:
-        # 匹配开头或 / 后的 backend/
-        path = re.sub(r'^(/?)backend/', '', path)
+        path = re.sub(r'^/*(?i:backend)/', '', path)
+
+    # 去除 ./ 当前目录前缀
+    path = re.sub(r'^\./', '', path)
+
+    # 去除冗余的连续斜杠（保留协议部分如 http://）
+    path = re.sub(r'(?<!:)/+', '/', path)
 
     # 去除首尾的斜杠
     path = path.strip("/")
