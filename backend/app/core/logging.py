@@ -55,8 +55,14 @@ def set_agent(agent: Optional[str]) -> None:
 
 
 def get_request_id() -> str:
-    """获取当前 request_id"""
+    """获取当前 request_id（从 ContextVar）"""
     return _request_id_var.get()
+
+
+def get_request_id_from_request(request) -> str:
+    """从 FastAPI Request 获取 request_id，优先使用 request.state 中的值"""
+    rid = getattr(request.state, "request_id", None)
+    return rid or get_request_id()
 
 
 def get_pipeline_id() -> Optional[int]:

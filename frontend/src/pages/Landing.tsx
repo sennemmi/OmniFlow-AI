@@ -5,8 +5,6 @@ import {
   Stats,
   Features,
   Modules,
-  Testimonials,
-  Pricing,
   CTA,
   Footer,
 } from './Landing/sections';
@@ -39,8 +37,6 @@ export function Landing() {
       <Stats />
       <Features />
       <Modules />
-      <Testimonials />
-      <Pricing />
       <CTA />
       <Footer />
     </div>

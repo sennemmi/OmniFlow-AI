@@ -341,31 +341,30 @@ class CodingHandler(StageHandler):
         reason: str,
         suggested_changes: Optional[str] = None
     ) -> StageResult:
-        """CODING 阶段被驳回后：重新执行 CODING 阶段"""
+        """CODING 阶段被驳回后：打回 DESIGN 阶段重新设计"""
+        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
+
         await push_log(
             context.pipeline_id,
             "info",
-            f"代码被驳回，原因: {reason}，重新生成...",
-            stage="CODING"
+            f"代码被驳回，打回 DESIGN 阶段重新设计。原因: {reason}",
+            stage="DESIGN"
         )
 
-        # 重新执行当前阶段
-        rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
-
-        result = await self.run(StageContext(
+        await WorkflowService.mark_stage_for_rerun(
             pipeline_id=context.pipeline_id,
-            session=context.session,
-            input_data={},
-            rejection_feedback=rejection_feedback
-        ))
+            stage_name=StageName.DESIGN,
+            rejection_feedback=rejection_feedback,
+            session=context.session
+        )
 
         return StageResult(
-            success=result.success,
-            status=result.status,
-            message=result.message,
+            success=True,
+            status=PipelineStatus.RUNNING,
+            message="打回 DESIGN 阶段重新设计",
             output_data={
                 "previous_stage": StageName.CODING.value,
-                "current_stage": StageName.CODING.value,
+                "current_stage": StageName.DESIGN.value,
                 "feedback": rejection_feedback
             }
         )

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.service.error_analysis_service import ErrorAnalysisService
 from app.service.sandbox_file_service import SandboxFileService
 from app.utils.agent_output_utils import merge_files_content
+from app.utils.file_operation_utils import clean_backend_prefix
 from app.utils.repair_loop_utils import (
     run_syntax_fix_loop,
     run_test_import_fix_loop,
@@ -64,15 +65,13 @@ class ErrorContextBuilder:
             if not file_path:
                 continue
 
-            # 路径归一化：处理沙箱日志中的 /workspace/backend/xxx 格式
+            # 路径归一化：处理沙箱日志中的 /workspace/xxx 格式
             normalized_path = file_path
             for prefix in ('/workspace/backend/', '/workspace/'):
                 if normalized_path.startswith(prefix):
                     normalized_path = normalized_path[len(prefix):]
                     break
-            # 去除可能的嵌套 backend/ 前缀
-            while normalized_path.startswith('backend/') or normalized_path.startswith('backend\\'):
-                normalized_path = normalized_path.replace('backend/', '', 1).replace('backend\\', '', 1)
+            normalized_path = clean_backend_prefix(normalized_path)
 
             # 先尝试归一化路径，失败则尝试原始路径
             read_result = await self.file_service.read_file(normalized_path)

@@ -88,7 +88,7 @@ class GitProviderService:
                     cwd=self.repo_path,
                     capture_output=True
                 )
-            except:
+            except Exception:
                 pass
 
     def _run_git_command(
@@ -370,7 +370,7 @@ class GitProviderService:
                 "diff_text": diff_text,
                 "diff_stat": stat_res.stdout.strip() if stat_res.stdout else ""
             }
-        except:
+        except Exception:
             return {"diff_text": "", "diff_stat": ""}
 
     def reset_hard(self, commit: str = "HEAD") -> GitResult:
@@ -440,30 +440,6 @@ class GitProviderService:
             check=False
         )
         return result.stdout
-
-    def stash_changes(self, message: Optional[str] = None) -> GitResult:
-        """
-        暂存当前变更
-
-        Args:
-            message: 暂存信息
-
-        Returns:
-            GitResult: 操作结果
-        """
-        if message:
-            return self._run_git_command(["stash", "push", "-m", message])
-        else:
-            return self._run_git_command(["stash", "push"])
-
-    def pop_stash(self) -> GitResult:
-        """
-        恢复暂存的变更
-
-        Returns:
-            GitResult: 操作结果
-        """
-        return self._run_git_command(["stash", "pop"])
 
     def get_branch_list(self, remote: bool = False) -> List[str]:
         """

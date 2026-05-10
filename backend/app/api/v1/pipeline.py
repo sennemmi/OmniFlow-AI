@@ -247,7 +247,7 @@ async def create_pipeline(
     使用 BackgroundTasks 异步执行 ArchitectAgent 分析
     立即返回 Pipeline ID，后台运行分析任务
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         # 1. 创建 Pipeline 记录
@@ -357,7 +357,7 @@ async def get_pipeline_status(
     """
     获取 Pipeline 状态
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
     
     try:
         pipeline = await PipelineService.get_pipeline_status(
@@ -401,7 +401,8 @@ async def get_pipeline_status(
                 stages_data.append(stage_data.model_dump())
         
         # 计算当前阶段索引（用于前端进度显示）
-        stage_order = ["REQUIREMENT", "DESIGN", "CODING", "UNIT_TESTING", "CODE_REVIEW", "DELIVERY"]
+        from app.repositories.stage_transition_service import StageTransitionService
+        stage_order = [s.value for s in StageTransitionService.STAGE_FLOW]
         current_stage_index = 0
         if pipeline.current_stage:
             try:
@@ -445,6 +446,8 @@ async def get_pipeline_status(
 
             if delivery_stage and delivery_stage.output_data:
                 output_data = delivery_stage.output_data
+                if not isinstance(output_data, dict):
+                    output_data = {}
 
                 delivery_info = PipelineDeliveryInfo(
                     git_branch=output_data.get("git_branch"),
@@ -501,7 +504,7 @@ async def list_pipelines(
     """
     列出所有 Pipeline
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
     
     try:
         pipelines = await PipelineService.list_pipelines(
@@ -566,7 +569,7 @@ async def approve_pipeline(
 
     DESIGN 阶段审批会立即返回，后台异步执行代码生成
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         result = await PipelineService.approve_pipeline(
@@ -620,7 +623,7 @@ async def reject_pipeline(
     """
     驳回 Pipeline，退回当前阶段重新执行
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         result = await PipelineService.reject_pipeline(
@@ -680,7 +683,7 @@ async def approve_code_review(
     """
     审批 CODE_REVIEW 阶段，支持分别审批 CODER 和 TESTER
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         approve_coding = data.get("approve_coding", True) if data else True
@@ -747,7 +750,7 @@ async def terminate_pipeline(
     Sandbox 停止操作使用 docker kill 快速终止（约 100ms），
     相比默认 docker stop（等待 10s）大幅提升响应速度。
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         result = await PipelineService.terminate_pipeline(
@@ -794,7 +797,7 @@ async def get_pipeline_diff(
     session: AsyncSession = Depends(get_session)
 ):
     """获取 CODING 阶段完整代码（含 original_content），供审批页面展示 diff"""
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
     try:
         from sqlmodel import select
         from app.models.pipeline import PipelineStage, StageName
@@ -929,7 +932,7 @@ async def handle_test_decision(
     """
     当新代码导致旧测试失败时，用户选择更新测试或回滚代码
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     choice = body.choice
 
     if choice not in ("update_tests", "rollback"):
@@ -1015,7 +1018,7 @@ async def retry_pipeline(
     """
     重试失败的 Pipeline
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         result = await PipelineService.retry_pipeline(
@@ -1097,7 +1100,7 @@ async def override_test_code(
     """
     人工覆盖测试代码并重跑测试
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         if not data or not data.file_path or not data.content:
@@ -1174,7 +1177,7 @@ async def delete_pipeline(
     """
     删除 Pipeline
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
 
     try:
         result = await PipelineService.delete_pipeline(

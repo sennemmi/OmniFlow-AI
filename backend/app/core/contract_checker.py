@@ -10,6 +10,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 
+from app.utils.ast_utils import extract_return_keys_from_function
+
 logger = logging.getLogger(__name__)
 
 
@@ -308,190 +310,6 @@ def verify_test_imports(
     return violations
 
 
-def verify_test_imports_detailed(
-    test_content: str,
-    code_files: Dict[str, str],
-    interface_specs: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    【改进】详细验证测试文件的导入，包括静态方法/类方法的检查
-    
-    返回详细的错误信息，包括正确的导入方式建议。
-
-    Args:
-        test_content: 测试文件内容
-        code_files: 源代码文件映射
-        interface_specs: 接口规范列表
-
-    Returns:
-        违规导入的详细信息列表，每项包含：
-        - symbol: 导入的符号名
-        - module: 导入的模块
-        - error_type: 错误类型 ("not_defined", "static_method", "class_method", "instance_method")
-        - message: 错误信息
-        - suggestion: 正确的导入/使用方式建议
-    """
-    violations = []
-    
-    # 构建允许的符号及其类型映射
-    allowed_symbols: Dict[str, str] = {}  # symbol_name -> type
-    for spec in interface_specs:
-        symbol_name = spec.get("symbol_name", "")
-        signature = spec.get("signature", "")
-        if symbol_name:
-            # 尝试从签名推断类型
-            if signature:
-                sig_lower = signature.lower()
-                if "@staticmethod" in sig_lower:
-                    allowed_symbols[symbol_name] = "static_method"
-                elif "@classmethod" in sig_lower:
-                    allowed_symbols[symbol_name] = "class_method"
-                elif "(self" in signature or "( cls" in signature:
-                    allowed_symbols[symbol_name] = "instance_method"
-                elif signature.startswith("class "):
-                    allowed_symbols[symbol_name] = "class"
-                else:
-                    allowed_symbols[symbol_name] = "module_level_function"
-            else:
-                allowed_symbols[symbol_name] = "unknown"
-    
-    # 提取测试文件的导入
-    try:
-        tree = ast.parse(test_content)
-    except SyntaxError:
-        return violations
-    
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom):
-            continue
-            
-        module = node.module or ""
-        if not module.startswith("app."):
-            continue
-        
-        for alias in node.names:
-            symbol_name = alias.name
-            
-            # 检查符号是否在契约中
-            if symbol_name not in allowed_symbols:
-                # 符号不在契约中，检查是否在源代码中定义为方法
-                source_module = module.replace(".", "/") + ".py"
-                source_content = code_files.get(source_module) or code_files.get(f"backend/{source_module}")
-                
-                if source_content:
-                    source_symbols = extract_defined_symbols_with_types(source_content)
-                    
-                    # 检查是否是类的方法
-                    for src_symbol, src_type in source_symbols.items():
-                        if src_symbol.endswith(f".{symbol_name}"):
-                            class_name = src_symbol.split(".")[0]
-                            if src_type == "static_method":
-                                violations.append({
-                                    "symbol": symbol_name,
-                                    "module": module,
-                                    "error_type": "static_method",
-                                    "message": f"'{symbol_name}' 是 {class_name} 的静态方法，不能直接导入",
-                                    "suggestion": f"使用 'from {module} import {class_name}'，然后通过 '{class_name}.{symbol_name}(...)' 调用"
-                                })
-                            elif src_type == "class_method":
-                                violations.append({
-                                    "symbol": symbol_name,
-                                    "module": module,
-                                    "error_type": "class_method",
-                                    "message": f"'{symbol_name}' 是 {class_name} 的类方法，不能直接导入",
-                                    "suggestion": f"使用 'from {module} import {class_name}'，然后通过 '{class_name}.{symbol_name}(...)' 调用"
-                                })
-                            elif src_type == "instance_method":
-                                violations.append({
-                                    "symbol": symbol_name,
-                                    "module": module,
-                                    "error_type": "instance_method",
-                                    "message": f"'{symbol_name}' 是 {class_name} 的实例方法，不能直接导入",
-                                    "suggestion": f"使用 'from {module} import {class_name}'，实例化后通过 'instance.{symbol_name}(...)' 调用"
-                                })
-                            break
-                    else:
-                        # 符号确实不存在
-                        violations.append({
-                            "symbol": symbol_name,
-                            "module": module,
-                            "error_type": "not_defined",
-                            "message": f"'{symbol_name}' 未在契约中声明，也不在 {module} 中定义",
-                            "suggestion": f"检查契约中的 interface_specs，或确认符号名称拼写正确"
-                        })
-                else:
-                    violations.append({
-                        "symbol": symbol_name,
-                        "module": module,
-                        "error_type": "not_defined",
-                        "message": f"'{symbol_name}' 未在契约中声明",
-                        "suggestion": f"检查契约中的 interface_specs"
-                    })
-            else:
-                # 符号在契约中，检查类型
-                symbol_type = allowed_symbols[symbol_name]
-                if symbol_type in ["static_method", "class_method", "instance_method"]:
-                    # 从 interface_specs 中找到类名
-                    class_name = None
-                    for spec in interface_specs:
-                        if spec.get("symbol_name") == symbol_name:
-                            # 尝试从 module 推断类名
-                            module_path = spec.get("module", "")
-                            if module_path:
-                                # 从代码文件中查找包含此方法的类
-                                source_module = module_path.replace(".py", "").replace("/", ".")
-                                source_file = module_path.replace(".", "/") + ".py"
-                                source_content = code_files.get(source_file) or code_files.get(f"backend/{source_file}")
-                                if source_content:
-                                    source_symbols = extract_defined_symbols_with_types(source_content)
-                                    for src_symbol, src_type in source_symbols.items():
-                                        if src_type == "class" and f"{src_symbol}.{symbol_name}" in source_symbols:
-                                            class_name = src_symbol
-                                            break
-                            break
-                    
-                    if class_name:
-                        violations.append({
-                            "symbol": symbol_name,
-                            "module": module,
-                            "error_type": symbol_type,
-                            "message": f"'{symbol_name}' 是 {class_name} 的{symbol_type.replace('_', '')}，不能直接导入",
-                            "suggestion": f"使用 'from {module} import {class_name}'，然后通过 '{class_name}.{symbol_name}(...)' 调用"
-                        })
-    
-    return violations
-
-
-def _extract_return_keys_from_function(node) -> Set[str]:
-    """
-    从函数 AST 节点中提取返回字典的键名
-    
-    Args:
-        node: AST FunctionDef 或 AsyncFunctionDef 节点
-        
-    Returns:
-        返回字典的键名集合
-    """
-    keys = set()
-    
-    for child in ast.walk(node):
-        if isinstance(child, ast.Return) and child.value:
-            # 处理 return {"key": value, ...}
-            if isinstance(child.value, ast.Dict):
-                for key in child.value.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        keys.add(key.value)
-                    elif isinstance(key, ast.Str):  # Python < 3.8
-                        keys.add(key.s)
-            # 处理 return dict(key=value, ...)
-            elif isinstance(child.value, ast.Call):
-                if isinstance(child.value.func, ast.Name) and child.value.func.id == 'dict':
-                    for keyword in child.value.keywords:
-                        keys.add(keyword.arg)
-    
-    return keys
-
-
 def verify_return_fields_consistency(
     code_files: Dict[str, str],
     interface_specs: List[Dict[str, Any]]
@@ -537,7 +355,7 @@ def verify_return_fields_consistency(
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         if node.name == symbol_name:
                             found = True
-                            actual_keys = _extract_return_keys_from_function(node)
+                            actual_keys = extract_return_keys_from_function(node)
                             
                             if actual_keys:
                                 missing_keys = required_keys - actual_keys
@@ -647,31 +465,3 @@ def check_contract_before_test(
     logger.info("契约检查通过")
     return {"success": True, "violations": []}
 
-
-# 便捷函数：从文件路径读取内容
-def load_code_files(file_paths: List[str], base_path: Optional[Path] = None) -> Dict[str, str]:
-    """
-    从文件路径列表加载代码内容
-
-    Args:
-        file_paths: 文件路径列表
-        base_path: 基础路径（可选）
-
-    Returns:
-        文件路径到内容的映射
-    """
-    code_files = {}
-
-    for path in file_paths:
-        full_path = Path(path)
-        if base_path:
-            full_path = base_path / path
-
-        try:
-            if full_path.exists():
-                content = full_path.read_text(encoding="utf-8")
-                code_files[path] = content
-        except Exception as e:
-            logger.warning(f"无法读取文件 {path}: {e}")
-
-    return code_files

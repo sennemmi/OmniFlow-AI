@@ -1,9 +1,7 @@
 import { memo } from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import {
-  Cpu,
   Code,
-  Rocket,
   AlertCircle,
   CheckCircle2,
   Loader2,
@@ -20,16 +18,12 @@ import type { PipelineNodeData } from '@types';
 // ============================================
 
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
-  architect: Cpu,
-  designer: Palette,
-  coder: Code,
-  deploy: Rocket,
   FileText: FileText,
   Palette: Palette,
   Code: Code,
   CheckCircle2: CheckCircle2,
   GitBranch: GitBranch,
-  default: Cpu,
+  default: Code,
 };
 
 // 【修复】统一前后端状态枚举
@@ -62,18 +56,6 @@ const statusConfig: Record<
     icon: AlertCircle, 
     className: 'text-status-error bg-status-error/10', 
     label: '失败',
-    indicatorClass: 'failed'
-  },
-  approved: { 
-    icon: CheckCircle2, 
-    className: 'text-status-success bg-status-success/10', 
-    label: '已批准',
-    indicatorClass: 'completed'
-  },
-  rejected: { 
-    icon: AlertCircle, 
-    className: 'text-status-error bg-status-error/10', 
-    label: '已拒绝',
     indicatorClass: 'failed'
   },
   paused: {

@@ -11,12 +11,15 @@ Enhanced version with:
 
 import asyncio
 import json
+import logging
 import time
 import traceback
 import psutil
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Any, List
 from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
 
 # Global buffer dictionary, key = pipeline_id
 _log_buffers: Dict[int, asyncio.Queue] = {}
@@ -78,7 +81,7 @@ def _cleanup_expired_buffers():
     for pid in expired_ids:
         _log_buffers.pop(pid, None)
         _buffer_creation_time.pop(pid, None)
-        print(f"[SSE Log Buffer] Cleaned expired buffer: pipeline_id={pid}")
+        logger.info("SSE buffer cleaned (expired)", pipeline_id=pid)
 
 
 async def push_log(pipeline_id: int, level: str, msg: str, stage: str = "", **extra) -> None:
@@ -111,7 +114,7 @@ async def push_log(pipeline_id: int, level: str, msg: str, stage: str = "", **ex
     except asyncio.QueueFull:
         pass  # Drop if full, don't block Agent
     except Exception as e:
-        print(f"[SSE Log Buffer] push_log error: {e}")
+        logger.warning("push_log error", error=str(e))
 
 
 async def push_thought(pipeline_id: int, agent_name: str, content: str) -> None:

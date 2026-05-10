@@ -146,6 +146,7 @@ class SandboxOrchestrator:
             verify_result = await self._verify_sandbox_filesystem()
             if not verify_result["success"]:
                 logger.error(f"[Pipeline {self.pipeline_id}] Sandbox 文件系统验证失败")
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
                 return verify_result
 
             # 4. 初始化 Git 环境（为 SnapshotService 做准备）
@@ -158,6 +159,7 @@ class SandboxOrchestrator:
             syntax_check_result = await self._verify_file_syntax_integrity()
             if not syntax_check_result["success"]:
                 logger.error(f"[Pipeline {self.pipeline_id}] 文件语法完整性验证失败")
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
                 return syntax_check_result
 
             # 6. 【新增】预构建代码索引（为 RAG 语义检索做准备）

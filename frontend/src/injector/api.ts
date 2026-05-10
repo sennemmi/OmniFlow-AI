@@ -184,18 +184,4 @@ class APIClient {
 // 导出单例
 export const api = new APIClient();
 export const API = api;
-
-// 导出便捷方法
-export const createPipeline = (data: Parameters<APIClient['createPipeline']>[0]) =>
-  api.createPipeline(data);
-export const getPipelineStatus = (pipelineId: string) =>
-  api.getPipelineStatus(pipelineId);
-export const getFileContent = (filePath: string) => api.getFileContent(filePath);
-export const writeFile = (filePath: string, content: string) =>
-  api.writeFile(filePath, content);
-export const modifyCode = (payload: Parameters<APIClient['modifyCode']>[0]) =>
-  api.modifyCode(payload);
-export const modifyBatch = (payload: Parameters<APIClient['modifyBatch']>[0]) =>
-  api.modifyBatch(payload);
-
 export default api;

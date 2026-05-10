@@ -21,7 +21,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.config import get_workspace_path, process_file_path
 from app.core.database import get_session
 from app.core.response import ResponseModel, success_response, error_response
-from app.core.logging import error, info
+from app.core.logging import error, info, get_request_id_from_request
 from app.utils.code_modify_helper import (
     generate_diff,
     read_file_context,
@@ -121,7 +121,7 @@ async def modify_code_batch(
     """
     批量代码修改 - 一次对话修改多个文件
     """
-    request_id = getattr(request.state, "request_id", "unknown")
+    request_id = get_request_id_from_request(request)
     
     info("=" * 60)
     info("批量代码修改开始", request_id=request_id)

@@ -142,23 +142,6 @@ async def get_user(user_id: int, request: Request):
         return JSONResponse(status_code=500, content=error_data.dict())
 ```
 
-正确示例2 - 用户 API：
-```python
-from fastapi import Request
-from app.core.response import success_response, error_response
-
-@router.get("/users/{user_id}")
-async def get_user(user_id: int, request: Request):  # 【必须引入 request 以获取 request_id】
-    request_id = getattr(request.state, "request_id", "")
-    try:
-        user = await user_service.get_by_id(user_id)
-        if not user:
-            return error_response(error="用户不存在", request_id=request_id)
-        return success_response(data=user, request_id=request_id)
-    except Exception as e:
-        return error_response(error=f"获取用户失败: {str(e)}", request_id=request_id)
-```
-
 正确示例3 - 时间戳 API：
 ```python
 from fastapi import Request

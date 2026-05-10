@@ -38,6 +38,7 @@ from app.service.stage_handlers import (
     TestingHandler, CodeReviewHandler, DeliveryHandler
 )
 from app.service.sandbox_manager import sandbox_manager
+from app.service.test_orchestrator import TestOrchestrator
 
 class PipelineService:
     """
@@ -56,8 +57,9 @@ class PipelineService:
 
     @classmethod
     def _register_task(cls, pipeline_id: int, task: asyncio.Task) -> None:
-        """注册正在运行的任务"""
+        """注册正在运行的任务，任务完成时自动清理"""
         cls._running_tasks[pipeline_id] = task
+        task.add_done_callback(lambda _: cls._running_tasks.pop(pipeline_id, None))
 
     @classmethod
     def _cancel_task(cls, pipeline_id: int) -> bool:
@@ -248,74 +250,20 @@ class PipelineService:
         return response
     
     @classmethod
-    async def _trigger_coding_phase(
+    async def _trigger_phase(
         cls,
+        stage_name: StageName,
         pipeline_id: int,
         session: Optional[AsyncSession] = None,
-        error_context: Optional[str] = None
+        **kwargs
     ) -> Dict[str, Any]:
-        """
-        触发 CODING 阶段（供后台任务调用）
-
-        【重要】如果传入 session，会使用该 session；否则创建独立 session。
-        并发执行时应该传入 None，让每个阶段使用独立的 session 避免冲突。
-        """
+        """触发指定阶段（供后台任务/并发调用）"""
         service = cls()
-
         if session is not None:
-            # 使用传入的 session（单线程模式）
-            return await service._trigger_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.CODING,
-                session=session,
-                error_context=error_context
-            )
-        else:
-            # 【并发模式】创建独立 session
-            async with async_session_factory() as new_session:
-                return await service._trigger_stage(
-                    pipeline_id=pipeline_id,
-                    stage_name=StageName.CODING,
-                    session=new_session,
-                    error_context=error_context
-                )
+            return await service._trigger_stage(pipeline_id, stage_name, session, **kwargs)
+        async with async_session_factory() as new_session:
+            return await service._trigger_stage(pipeline_id, stage_name, new_session, **kwargs)
 
-    @classmethod
-    async def _trigger_testing_phase(cls, pipeline_id: int, session: Optional[AsyncSession] = None) -> Dict[str, Any]:
-        """
-        触发 UNIT_TESTING 阶段
-
-        【重要】如果传入 session，会使用该 session；否则创建独立 session。
-        并发执行时应该传入 None，让每个阶段使用独立的 session 避免冲突。
-        """
-        service = cls()
-
-        if session is not None:
-            # 使用传入的 session（单线程模式）
-            return await service._trigger_stage(
-                pipeline_id=pipeline_id,
-                stage_name=StageName.UNIT_TESTING,
-                session=session
-            )
-        else:
-            # 【并发模式】创建独立 session
-            async with async_session_factory() as new_session:
-                return await service._trigger_stage(
-                    pipeline_id=pipeline_id,
-                    stage_name=StageName.UNIT_TESTING,
-                    session=new_session
-                )
-
-    @classmethod
-    async def _trigger_delivery_phase(cls, pipeline_id: int, session: AsyncSession) -> Dict[str, Any]:
-        """触发 DELIVERY 阶段"""
-        service = cls()
-        return await service._trigger_stage(
-            pipeline_id=pipeline_id,
-            stage_name=StageName.DELIVERY,
-            session=session
-        )
-    
     # ==================== 审批方法 ====================
 
     @classmethod
@@ -368,24 +316,22 @@ class PipelineService:
         # 调用 Handler 的 on_approved 方法
         result = await handler.on_approved(context, notes, feedback)
 
-        # 处理 DESIGN 阶段的特殊情况（需要后台任务执行 CODING）
-        if current_stage == StageName.DESIGN and background_tasks:
-            if result.output_data.get("requires_background_task"):
-                # 【Task Registry】注册后台任务以便后续取消
-                task = asyncio.create_task(cls._run_coding_task_background(pipeline_id))
-                cls._register_task(pipeline_id, task)
+        # 通用后台任务机制：任何 handler 均可通过 requires_background_task 请求异步执行
+        if result.output_data.get("requires_background_task"):
+            task = asyncio.create_task(cls._run_coding_task_background(pipeline_id))
+            cls._register_task(pipeline_id, task)
 
-                return {
-                    "success": True,
-                    "data": {
-                        "pipeline_id": pipeline_id,
-                        "previous_stage": StageName.DESIGN.value,
-                        "next_stage": StageName.CODING.value,
-                        "status": PipelineStatus.RUNNING.value,
-                        "message": result.message,
-                        "async": True
-                    }
+            return {
+                "success": True,
+                "data": {
+                    "pipeline_id": pipeline_id,
+                    "previous_stage": current_stage.value,
+                    "next_stage": result.output_data.get("next_stage", next_stage.value if next_stage else None),
+                    "status": PipelineStatus.RUNNING.value,
+                    "message": result.message,
+                    "async": True
                 }
+            }
 
         # 统一组装响应
         return {
@@ -429,26 +375,10 @@ class PipelineService:
 
         rejection_feedback = {"reason": reason, "suggested_changes": suggested_changes}
 
-        # 【新流程】CODING 阶段被驳回时，打回 DESIGN 阶段重试
-        target_stage = current_stage
-        if current_stage == StageName.CODING:
-            target_stage = StageName.DESIGN
-            await push_log(
-                pipeline_id,
-                "info",
-                f"代码被驳回，打回 DESIGN 阶段重新设计",
-                stage="DESIGN"
-            )
-
-        # 标记目标阶段需要重新执行
         await WorkflowService.mark_stage_for_rerun(
-            pipeline_id=pipeline_id, stage_name=target_stage,
+            pipeline_id=pipeline_id, stage_name=current_stage,
             rejection_feedback=rejection_feedback, session=session
         )
-
-        # 【关键】如果是 CODING 被驳回，需要将 Pipeline 当前阶段设为 DESIGN
-        if current_stage == StageName.CODING:
-            pipeline.current_stage = StageName.DESIGN
 
         await WorkflowService.set_pipeline_running(pipeline, session)
         await session.commit()
@@ -460,13 +390,8 @@ class PipelineService:
             input_data={}
         )
 
-        # 调用 Handler 的 on_rejected 方法（使用目标阶段的 handler）
-        target_handler = service._registry.get(target_stage)
-        if target_handler:
-            result = await target_handler.on_rejected(context, reason, suggested_changes)
-        else:
-            # 如果没有找到 handler，使用当前 handler
-            result = await handler.on_rejected(context, reason, suggested_changes)
+        # 调用 Handler 的 on_rejected 方法
+        result = await handler.on_rejected(context, reason, suggested_changes)
 
         # 统一组装响应
         response_data = {
@@ -573,10 +498,8 @@ class PipelineService:
             # 只接受 CODING：重试 TESTING
             await push_log(pipeline_id, "info", "🔄 代码已接受，重新生成测试...", stage="UNIT_TESTING")
 
-            if background_tasks:
-                # 【Task Registry】注册后台任务以便后续取消
-                task = asyncio.create_task(cls._retry_testing_only(pipeline_id, feedback))
-                cls._register_task(pipeline_id, task)
+            task = asyncio.create_task(cls._retry_testing_only(pipeline_id, feedback))
+            cls._register_task(pipeline_id, task)
 
             return {
                 "success": True,
@@ -593,10 +516,8 @@ class PipelineService:
             # 只接受 TESTING：重试 CODING
             await push_log(pipeline_id, "info", "🔄 测试已接受，重新生成代码...", stage="CODING")
 
-            if background_tasks:
-                # 【Task Registry】注册后台任务以便后续取消
-                task = asyncio.create_task(cls._retry_coding_only(pipeline_id, feedback))
-                cls._register_task(pipeline_id, task)
+            task = asyncio.create_task(cls._retry_coding_only(pipeline_id, feedback))
+            cls._register_task(pipeline_id, task)
 
             return {
                 "success": True,
@@ -613,11 +534,9 @@ class PipelineService:
             # 两者都拒绝：同时重试
             await push_log(pipeline_id, "info", "🔄 代码和测试都需要重新生成...", stage="CODING")
 
-            if background_tasks:
-                # 【Task Registry】注册后台任务以便后续取消
-                # 先重试 CODING，完成后会自动重试 TESTING
-                task = asyncio.create_task(cls._retry_coding_only(pipeline_id, feedback))
-                cls._register_task(pipeline_id, task)
+            # 先重试 CODING，完成后会自动重试 TESTING
+            task = asyncio.create_task(cls._retry_coding_only(pipeline_id, feedback))
+            cls._register_task(pipeline_id, task)
 
             return {
                 "success": True,
@@ -640,7 +559,7 @@ class PipelineService:
         error_context: Optional[str] = None
     ) -> Dict[str, Any]:
         """公开方法：触发 CODING 阶段（供后台任务调用）"""
-        return await cls._trigger_coding_phase(pipeline_id, session, error_context)
+        return await cls._trigger_phase(StageName.CODING, pipeline_id, session, error_context=error_context)
 
     @classmethod
     async def mark_pipeline_failed(cls, pipeline_id: int, error: str, session: AsyncSession) -> None:
@@ -952,16 +871,9 @@ class PipelineService:
 
     @classmethod
     def _get_handler_for_stage(cls, stage_name: StageName) -> Optional[Any]:
-        """获取阶段对应的 Handler"""
-        handler_map = {
-            StageName.REQUIREMENT: RequirementHandler(),
-            StageName.DESIGN: DesignHandler(),
-            StageName.CODING: CodingHandler(),
-            StageName.UNIT_TESTING: TestingHandler(),
-            StageName.CODE_REVIEW: CodeReviewHandler(),
-            StageName.DELIVERY: DeliveryHandler(),
-        }
-        return handler_map.get(stage_name)
+        """获取阶段对应的 Handler（从注册表单例获取，保证全局唯一实例）"""
+        from app.service.stage_handlers.registry import get_registry
+        return get_registry().get(stage_name)
 
     @classmethod
     async def _run_stage_background(cls, pipeline_id: int, stage_name: str):
@@ -989,595 +901,6 @@ class PipelineService:
                 error(f"后台运行阶段 {stage_name} 失败", pipeline_id=pipeline_id, exc_info=True)
 
     @staticmethod
-    async def _run_tests_after_gather(pipeline_id: int) -> Dict[str, Any]:
-        """
-        在 CODING 和 TESTING 都完成后，统一执行测试流程（支持逐层修复）
-
-        流程：
-        1. 从数据库读取 CODING 和 UNIT_TESTING 阶段的输出
-        2. 【前置检查】契约检查 + 语法检查，失败则重新调用 Tester 生成测试
-        3. 执行预测试，失败则调用 RepairService 修复，直到通过
-        4. 执行分层测试（defense -> regression -> new_tests），每层失败后修复再重试
-        5. 返回测试结果
-        """
-
-        # 【新增】初始化测试详情记录
-        test_details = {
-            "preliminary": {"attempts": [], "final_status": "pending"},
-            "layers": {"defense": [], "regression": [], "new_tests": []},
-            "repairs": [],
-            "defense_violations": [],  # 记录对 defense 文件夹的修改尝试
-        }
-        from app.service.layered_test_runner import LayeredTestRunner, LayerResult
-        from app.service.sandbox_file_service import get_sandbox_file_service
-        from app.service.repair_service import repair_service
-        from app.core.contract_checker import verify_contract
-        from app.utils.test_execution import run_preliminary_test, analyze_test_failure
-        from app.agents import test_agent
-        from app.utils.agent_debug_utils import get_agent_debugger
-
-        await push_log(pipeline_id, "info", "CODER 和 TESTER 都已完成，开始测试流程...", stage="UNIT_TESTING")
-
-        # 【新增】测试流程开始前检查 Pipeline 是否已终止
-        if await PipelineService._check_pipeline_terminated(pipeline_id):
-            await push_log(pipeline_id, "warning", "Pipeline 已终止，测试流程退出", stage="UNIT_TESTING")
-            return {"success": False, "error": "Pipeline terminated", "test_run_success": False}
-
-        file_service = get_sandbox_file_service(pipeline_id)
-        debugger = get_agent_debugger()
-
-        # 从数据库获取 CODING 和 UNIT_TESTING 阶段的输出
-        async with async_session_factory() as session:
-            statement = select(PipelineStage).where(
-                PipelineStage.pipeline_id == pipeline_id,
-                PipelineStage.name.in_([StageName.CODING, StageName.UNIT_TESTING])
-            )
-            result = await session.execute(statement)
-            stages = result.scalars().all()
-
-            coding_stage = None
-            testing_stage = None
-            for stage in stages:
-                if stage.name == StageName.CODING:
-                    coding_stage = stage
-                elif stage.name == StageName.UNIT_TESTING:
-                    testing_stage = stage
-
-            # 提取代码文件（从 CODING 阶段）
-            code_files = []
-            if coding_stage and coding_stage.output_data:
-                coder_output = coding_stage.output_data.get("coder_output", {})
-                code_files = coder_output.get("files", [])
-
-            # 提取测试文件（从 UNIT_TESTING 阶段）
-            test_files = []
-            design_output = {}
-            if testing_stage and testing_stage.output_data:
-                testing_result = testing_stage.output_data.get("testing_result", {})
-                test_files = testing_result.get("test_files", [])
-                design_output = testing_stage.input_data.get("design_output", {})
-
-        if not test_files:
-            return {"success": False, "error": "No test files found", "contract_check": None}
-
-        # 构建 code_files_dict 用于契约检查
-        code_files_dict = {}
-        for f in code_files:
-            file_path = f.get("file_path", "")
-            content = f.get("content", "")
-            if file_path and content:
-                file_path = file_path.lstrip("/")
-                if not file_path.startswith("backend/"):
-                    file_path = f"backend/{file_path}"
-                code_files_dict[file_path] = content
-
-        # ========== 【前置检查】契约检查 + 语法检查 ==========
-        await push_log(pipeline_id, "info", "[前置检查] 执行契约检查和语法检查...", stage="UNIT_TESTING")
-
-        interface_specs = design_output.get("interface_specs", [])
-        max_tester_regeneration = 2  # 最多重新生成2次
-
-        for regeneration in range(max_tester_regeneration + 1):
-            # 契约检查
-            contract_passed = True
-            if interface_specs and code_files_dict:
-                missing_symbols = verify_contract(code_files_dict, interface_specs)
-                contract_passed = len(missing_symbols) == 0
-
-                if not contract_passed:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"❌ 契约检查失败: {len(missing_symbols)} 个符号未实现",
-                        stage="UNIT_TESTING"
-                    )
-                    for sym in missing_symbols:
-                        await push_log(pipeline_id, "warning", f"   - {sym}", stage="UNIT_TESTING")
-
-            # 语法检查（对测试文件）
-            syntax_passed = True
-            syntax_errors = []
-            import ast
-            for tf in test_files:
-                path = tf.get("file_path", "")
-                content = tf.get("content", "")
-                if path.endswith(".py") and content:
-                    try:
-                        ast.parse(content)
-                    except SyntaxError as e:
-                        syntax_passed = False
-                        syntax_errors.append(f"{path}: SyntaxError at line {e.lineno}: {e.msg}")
-
-            if not syntax_passed:
-                await push_log(
-                    pipeline_id, "warning",
-                    f"❌ 语法检查失败: {len(syntax_errors)} 个文件存在语法错误",
-                    stage="UNIT_TESTING"
-                )
-                for err in syntax_errors:
-                    await push_log(pipeline_id, "warning", f"   - {err}", stage="UNIT_TESTING")
-
-            # 检查是否通过
-            if contract_passed and syntax_passed:
-                await push_log(
-                    pipeline_id, "info",
-                    "✅ 契约检查和语法检查通过",
-                    stage="UNIT_TESTING"
-                )
-                break
-            else:
-                if regeneration < max_tester_regeneration:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"前置检查失败（尝试 {regeneration + 1}/{max_tester_regeneration}），重新调用 Tester 生成测试...",
-                        stage="UNIT_TESTING"
-                    )
-
-                    # 重新调用 Tester 生成测试
-                    test_result = await test_agent.generate_tests(
-                        design_output=design_output,
-                        code_output=None,
-                        pipeline_id=pipeline_id,
-                    )
-
-                    if test_result.get("success"):
-                        test_files = test_result["output"].get("test_files", [])
-                        # 写入沙箱
-                        for tf in test_files:
-                            file_path = tf.get("file_path", "")
-                            content = tf.get("content", "")
-                            if file_path and content:
-                                # 【修复】正确处理 Tester 生成的路径（已规范输出 backend/tests/ai_generated/...）
-                                # 信任 Tester 生成的路径，不再添加前缀
-                                await file_service.write_file(file_path, content)
-
-                        await push_log(
-                            pipeline_id, "info",
-                            f"✅ 测试重新生成成功 ({len(test_files)} 个文件)",
-                            stage="UNIT_TESTING"
-                        )
-                    else:
-                        await push_log(
-                            pipeline_id, "error",
-                            f"❌ 测试重新生成失败: {test_result.get('error', '')}",
-                            stage="UNIT_TESTING"
-                        )
-                        return {
-                            "success": False,
-                            "error": "前置检查失败且测试重新生成失败",
-                            "test_run_success": False,
-                            "layers": [{"layer": "pre_check", "passed": False, "summary": "前置检查失败"}]
-                        }
-                else:
-                    await push_log(
-                        pipeline_id, "error",
-                        "❌ 前置检查在最大重试次数后仍未通过",
-                        stage="UNIT_TESTING"
-                    )
-                    return {
-                        "success": False,
-                        "error": "契约检查或语法检查失败",
-                        "test_run_success": False,
-                        "layers": [{"layer": "pre_check", "passed": False, "summary": "前置检查失败"}]
-                    }
-
-        # 构建 all_files 列表
-        all_files = []
-        for f in code_files:
-            file_path = f.get("file_path", "")
-            content = f.get("content", "")
-            if file_path and content:
-                file_path = file_path.lstrip("/")
-                if not file_path.startswith("backend/"):
-                    file_path = f"backend/{file_path}"
-                all_files.append({"file_path": file_path, "content": content})
-
-        for tf in test_files:
-            file_path = tf.get("file_path", "")
-            content = tf.get("content", "")
-            if file_path and content:
-                # 【修复】信任 Tester 生成的路径（已规范输出 backend/tests/ai_generated/...）
-                # 不再添加前缀，直接使用原始路径
-                all_files.append({"file_path": file_path, "content": content})
-
-        # ========== 1. 预测试（失败则修复直到通过）==========
-        await push_log(pipeline_id, "info", "[Step 1/3] 执行预测试...", stage="UNIT_TESTING")
-
-        max_preliminary_retries = 3
-        preliminary_passed = False
-        preliminary_logs = ""
-
-        # 包装 push_log 为同步回调（push_log 内部无 await，直接调用即可）
-        def _sync_push_log(level: str, msg: str):
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(push_log(pipeline_id, level, msg, stage="UNIT_TESTING"))
-                else:
-                    # 无事件循环时直接同步执行（push_log 内部无 await）
-                    asyncio.run(push_log(pipeline_id, level, msg, stage="UNIT_TESTING"))
-            except RuntimeError:
-                # get_event_loop 可能失败，fallback
-                pass
-
-        for retry in range(max_preliminary_retries):
-            preliminary_result = await run_preliminary_test(
-                pipeline_id=pipeline_id,
-                test_files=test_files,
-                file_service=file_service,
-                timeout=60,
-                log_callback=_sync_push_log
-            )
-
-            preliminary_logs = preliminary_result.get("logs", "")
-
-            # 【新增】记录预测试尝试
-            test_details["preliminary"]["attempts"].append({
-                "attempt": retry + 1,
-                "success": preliminary_result.get("success", False),
-                "passed_count": preliminary_result.get("passed_count", 0),
-                "failed_count": preliminary_result.get("failed_count", 0),
-                "logs": preliminary_logs[:2000] if preliminary_logs else "",  # 限制日志长度
-            })
-
-            if preliminary_result.get("success"):
-                preliminary_passed = True
-                test_details["preliminary"]["final_status"] = "passed"
-                await push_log(
-                    pipeline_id, "info",
-                    f"✅ 预测试通过 ({preliminary_result.get('passed_count', 0)} passed)",
-                    stage="UNIT_TESTING"
-                )
-                break
-            else:
-                await push_log(
-                    pipeline_id, "warning",
-                    f"预测试失败（尝试 {retry + 1}/{max_preliminary_retries}），启动 RepairService...",
-                    stage="UNIT_TESTING"
-                )
-
-                # 【修复】显式推送预测试错误详情到终端/SSE
-                failed_count = preliminary_result.get("failed_count", 0)
-                errors_count = preliminary_result.get("errors_count", 0)
-                passed_count = preliminary_result.get("passed_count", 0)
-                collected_count = preliminary_result.get("collected_count", 0)
-                failed_tests = preliminary_result.get("failed_tests", [])
-                error_tests = preliminary_result.get("error_tests", [])
-
-                await push_log(
-                    pipeline_id, "warning",
-                    f"预测试统计: collected={collected_count} | passed={passed_count} | failed={failed_count} | errors={errors_count}",
-                    stage="UNIT_TESTING"
-                )
-                if failed_tests:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"失败测试: {', '.join(failed_tests[:10])}",
-                        stage="UNIT_TESTING"
-                    )
-                if error_tests:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"错误测试: {', '.join(error_tests[:10])}",
-                        stage="UNIT_TESTING"
-                    )
-
-                # 提取并推送错误日志关键部分
-                from app.utils.repair_utils import extract_pytest_failures
-                error_summary = extract_pytest_failures(preliminary_logs, max_chars=3000)
-                if error_summary:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"【预测试错误详情】\n{error_summary}",
-                        stage="UNIT_TESTING"
-                    )
-
-                # 【新增】检查 RepairAgent 是否尝试修改 defense 文件夹
-                defense_violations = await PipelineService._check_defense_modifications(pipeline_id, file_service)
-                if defense_violations:
-                    violation_msg = f"🚫 检测到 RepairAgent 尝试修改 defense 文件夹: {defense_violations}"
-                    await push_log(pipeline_id, "error", violation_msg, stage="UNIT_TESTING")
-                    test_details["defense_violations"].extend(defense_violations)
-
-                    # 终止 Pipeline
-                    async with async_session_factory() as session:
-                        pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
-                        if pipeline:
-                            pipeline.status = PipelineStatus.FAILED
-                            from app.core.timezone import now
-                            pipeline.updated_at = now()
-                            await session.commit()
-
-                    return {
-                        "success": False,
-                        "error": f"RepairAgent 违规修改 defense 文件夹: {defense_violations}",
-                        "test_run_success": False,
-                        "defense_violations": defense_violations,
-                        "test_details": test_details,
-                        "layers": [{"layer": "preliminary", "passed": False, "summary": "违规修改 defense 文件夹"}]
-                    }
-
-                # 调用 RepairService 修复
-                repair_result = await repair_service.start_repair(
-                    pipeline_id=pipeline_id,
-                    code_files=code_files,
-                    test_files=test_files,
-                    test_logs=preliminary_logs,
-                    design_output=design_output,
-                    file_service=file_service,
-                    log_callback=lambda level, msg: push_log(pipeline_id, level, msg, stage="UNIT_TESTING"),
-                    debugger=debugger,
-                )
-
-                # 【新增】记录修复详情
-                test_details["repairs"].append({
-                    "stage": "preliminary",
-                    "attempt": retry + 1,
-                    "success": repair_result.get("test_run_success", False),
-                    "repair_rounds": repair_result.get("repair_rounds", 0),
-                    "fixed_files": repair_result.get("fixed_files", []),
-                    "fix_history": repair_result.get("fix_history", []),
-                })
-
-                if repair_result.get("test_run_success"):
-                    await push_log(
-                        pipeline_id, "success",
-                        f"✅ 修复成功，重新进行预测试...",
-                        stage="UNIT_TESTING"
-                    )
-                    # 更新代码文件（修复后的）
-                    code_files = repair_result.get("fixed_files", code_files)
-                else:
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"⚠️ 修复失败，预测试未通过，建议重试或完善需求说明",
-                        stage="UNIT_TESTING"
-                    )
-                    test_details["preliminary"]["final_status"] = "failed"
-                    # 【修改】返回警告而非失败，允许用户选择继续
-                    return {
-                        "success": True,  # 改为 True，表示流程可以继续
-                        "warning": True,
-                        "error": "预测试失败且修复未通过",
-                        "test_run_success": False,
-                        "requires_user_decision": True,
-                        "suggestion": "建议重试或完善需求说明",
-                        "test_details": test_details,
-                        "layers": [{"layer": "preliminary", "passed": False, "summary": "预测试失败（需人工确认）"}]
-                    }
-
-        if not preliminary_passed:
-            await push_log(
-                pipeline_id, "warning",
-                f"⚠️ 预测试在最大重试次数后仍未通过，建议重试或完善需求说明",
-                stage="UNIT_TESTING"
-            )
-            # 【修改】返回警告而非失败
-            return {
-                "success": True,  # 改为 True
-                "warning": True,
-                "error": "预测试在最大重试次数后仍未通过",
-                "test_run_success": False,
-                "requires_user_decision": True,
-                "suggestion": "建议重试或完善需求说明",
-                "layers": [{"layer": "preliminary", "passed": False, "summary": "预测试失败（需人工确认）"}]
-            }
-
-        # ========== 2. 分层测试（逐层执行，每层失败后修复）==========
-        await push_log(pipeline_id, "info", "[Step 2/3] 执行分层测试...", stage="UNIT_TESTING")
-
-        layers: List[LayerResult] = []
-        layer_order = ["defense", "regression", "new_tests"]
-        max_layer_retries = 3
-
-        for layer_name in layer_order:
-            await push_log(pipeline_id, "info", f"  开始 {layer_name} 层测试...", stage="UNIT_TESTING")
-
-            layer_passed = False
-            layer_result = None
-
-            for retry in range(max_layer_retries):
-                # 运行当前层测试
-                if layer_name == "defense":
-                    layer_result = await LayeredTestRunner._run_defense_layer(
-                        Path("/workspace"), file_service, 120
-                    )
-                elif layer_name == "regression":
-                    layer_result = await LayeredTestRunner._run_regression_layer(
-                        Path("/workspace"), file_service, 120
-                    )
-                else:  # new_tests
-                    layer_result = await LayeredTestRunner._run_new_tests_layer(
-                        Path("/workspace"), file_service, 120
-                    )
-
-                layers.append(layer_result)
-
-                # 【新增】记录分层测试详情
-                test_details["layers"][layer_name].append({
-                    "attempt": retry + 1,
-                    "passed": layer_result.passed,
-                    "summary": layer_result.summary,
-                    "logs": layer_result.logs[:2000] if layer_result.logs else "",
-                    "failed_tests": layer_result.failed_tests if hasattr(layer_result, 'failed_tests') else [],
-                })
-
-                status = "✅ PASS" if layer_result.passed else "❌ FAIL"
-                await push_log(
-                    pipeline_id,
-                    "info" if layer_result.passed else "warning",
-                    f"  {status} {layer_name}: {layer_result.summary}",
-                    stage="UNIT_TESTING"
-                )
-
-                if layer_result.passed:
-                    layer_passed = True
-                    break
-                else:
-                    # 当前层失败，调用 RepairService
-                    await push_log(
-                        pipeline_id, "warning",
-                        f"  {layer_name} 层失败（尝试 {retry + 1}/{max_layer_retries}），启动修复...",
-                        stage="UNIT_TESTING"
-                    )
-
-                    # 【新增】检查 RepairAgent 是否尝试修改 defense 文件夹
-                    defense_violations = await PipelineService._check_defense_modifications(pipeline_id, file_service)
-                    if defense_violations:
-                        violation_msg = f"🚫 检测到 RepairAgent 尝试修改 defense 文件夹: {defense_violations}"
-                        await push_log(pipeline_id, "error", violation_msg, stage="UNIT_TESTING")
-                        test_details["defense_violations"].extend(defense_violations)
-
-                        # 终止 Pipeline
-                        async with async_session_factory() as session:
-                            pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
-                            if pipeline:
-                                pipeline.status = PipelineStatus.FAILED
-                                from app.core.timezone import now
-                                pipeline.updated_at = now()
-                                await session.commit()
-
-                        return {
-                            "success": False,
-                            "error": f"RepairAgent 违规修改 defense 文件夹: {defense_violations}",
-                            "test_run_success": False,
-                            "defense_violations": defense_violations,
-                            "test_details": test_details,
-                            "layers": [
-                                {"layer": l.layer, "passed": l.passed, "summary": "违规修改 defense 文件夹"}
-                                for l in layers
-                            ]
-                        }
-
-                    repair_result = await repair_service.start_repair(
-                        pipeline_id=pipeline_id,
-                        code_files=code_files,
-                        test_files=test_files,
-                        test_logs=layer_result.logs,
-                        design_output=design_output,
-                        file_service=file_service,
-                        log_callback=lambda level, msg: push_log(pipeline_id, level, msg, stage="UNIT_TESTING"),
-                        debugger=debugger,
-                    )
-
-                    # 【新增】记录修复详情
-                    test_details["repairs"].append({
-                        "stage": layer_name,
-                        "attempt": retry + 1,
-                        "success": repair_result.get("test_run_success", False),
-                        "repair_rounds": repair_result.get("repair_rounds", 0),
-                        "fixed_files": repair_result.get("fixed_files", []),
-                        "fix_history": repair_result.get("fix_history", []),
-                    })
-
-                    if repair_result.get("test_run_success"):
-                        await push_log(
-                            pipeline_id, "success",
-                            f"  ✅ {layer_name} 层修复成功，重新测试...",
-                            stage="UNIT_TESTING"
-                        )
-                        code_files = repair_result.get("fixed_files", code_files)
-                    else:
-                        await push_log(
-                            pipeline_id, "warning",
-                            f"  ⚠️ {layer_name} 层修复失败，建议重试或完善需求说明",
-                            stage="UNIT_TESTING"
-                        )
-                        # 【修改】返回警告而非失败，允许用户选择继续
-                        return {
-                            "success": True,  # 改为 True
-                            "warning": True,
-                            "error": f"{layer_name} 层测试失败且修复未通过",
-                            "test_run_success": False,
-                            "requires_user_decision": True,
-                            "suggestion": "建议重试或完善需求说明",
-                            "test_details": test_details,
-                            "layers": [
-                                {"layer": l.layer, "passed": l.passed, "summary": l.summary + "（需人工确认）"}
-                                for l in layers
-                            ]
-                        }
-
-            if not layer_passed:
-                await push_log(
-                    pipeline_id, "warning",
-                    f"  ⚠️ {layer_name} 层在最大重试次数后仍未通过，建议重试或完善需求说明",
-                    stage="UNIT_TESTING"
-                )
-                # 【修改】返回警告而非失败
-                return {
-                    "success": True,  # 改为 True
-                    "warning": True,
-                    "error": f"{layer_name} 层在最大重试次数后仍未通过",
-                    "test_run_success": False,
-                    "requires_user_decision": True,
-                    "suggestion": "建议重试或完善需求说明",
-                    "test_details": test_details,
-                    "layers": [
-                        {"layer": l.layer, "passed": l.passed, "summary": l.summary + "（需人工确认）"}
-                        for l in layers
-                    ]
-                }
-
-        all_passed = all(l.passed for l in layers)
-
-        # 【修改】即使测试未完全通过，也返回成功（带警告），让用户决定
-        if not all_passed:
-            await push_log(
-                pipeline_id, "warning",
-                "⚠️ 部分测试未通过，建议重试或完善需求说明",
-                stage="UNIT_TESTING"
-            )
-            return {
-                "success": True,  # 改为 True，流程继续
-                "warning": True,
-                "test_run_success": False,
-                "requires_user_decision": True,
-                "suggestion": "建议重试或完善需求说明",
-                "contract_check": {"passed": True, "message": "契约检查已在前置步骤完成"},
-                "logs": "\n\n".join([l.logs for l in layers]),
-                "failed_tests": [],
-                "test_details": test_details,
-                "layers": [
-                    {"layer": l.layer, "passed": l.passed, "summary": l.summary + ("（需人工确认）" if not l.passed else "")}
-                    for l in layers
-                ]
-            }
-
-        return {
-            "success": True,
-            "test_run_success": True,
-            "contract_check": {"passed": True, "message": "契约检查已在前置步骤完成"},
-            "logs": "\n\n".join([l.logs for l in layers]),
-            "failed_tests": [],
-            "test_details": test_details,
-            "layers": [
-                {"layer": l.layer, "passed": l.passed, "summary": l.summary}
-                for l in layers
-            ]
-        }
-
-    @staticmethod
     async def _check_pipeline_terminated(pipeline_id: int) -> bool:
         """检查 Pipeline 是否已被终止（支持 failed 和 cancelled 状态）"""
         async with async_session_factory() as session:
@@ -1586,438 +909,246 @@ class PipelineService:
                 return True
             return False
 
+
+
     @staticmethod
-    async def _start_fastapi_in_sandbox(pipeline_id: int) -> Dict[str, Any]:
-        """
-        分层测试通过后在 Sandbox 容器中启动 FastAPI 服务
-
-        1. 杀掉 sandbox 中占用 8000 端口的进程
-        2. 后台启动 uvicorn main:app
-        3. 推送启动日志供用户查看
-
-        Returns:
-            Dict: {success, port, message}
-        """
-        try:
-            # 1. 杀掉占用 8000 端口的进程
-            kill_cmd = (
-                "fuser -k 8000/tcp 2>/dev/null && echo 'killed' || echo 'port_free'"
+    async def _create_testing_stage_record(pipeline_id: int) -> None:
+        """提前创建 UNIT_TESTING 阶段记录，让前端轮询时看到 TESTER 节点为"执行中" """
+        async with async_session_factory() as pre_session:
+            from app.repositories.pipeline_stage_repository import PipelineStageRepository
+            existing = await PipelineStageRepository.get_by_pipeline_and_name(
+                pipeline_id, StageName.UNIT_TESTING, pre_session
             )
-            kill_result = await sandbox_manager.exec(pipeline_id, kill_cmd, timeout=10)
-            await push_log(
-                pipeline_id, "info",
-                f"端口 8000 清理结果: {kill_result.stdout.strip()}",
-                stage="UNIT_TESTING"
-            )
+            if not existing:
+                pre_session.add(PipelineStage(
+                    pipeline_id=pipeline_id,
+                    name=StageName.UNIT_TESTING,
+                    status=StageStatus.RUNNING,
+                    input_data={}
+                ))
+                await pre_session.commit()
+                await push_log(pipeline_id, "info", "UNIT_TESTING 阶段已就绪", stage="UNIT_TESTING")
 
-            # 2. 后台启动 FastAPI
-            start_cmd = (
-                "cd /workspace/backend && "
-                "PYTHONPATH=/workspace/backend nohup python -m uvicorn main:app "
-                "--host 0.0.0.0 --port 8000 "
-                "> /tmp/fastapi.log 2>&1 & "
-                "sleep 3 && "
-                "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/v1/health 2>/dev/null || echo 'starting'"
-            )
-            start_result = await sandbox_manager.exec(pipeline_id, start_cmd, timeout=15)
-            status_output = start_result.stdout.strip()
+    @staticmethod
+    async def _execute_coding_and_testing_concurrent(pipeline_id: int) -> tuple:
+        """并发执行 CODING 和 TESTING，返回 (coding_result, testing_result)"""
+        coding_task = PipelineService._trigger_phase(StageName.CODING, pipeline_id=pipeline_id, session=None)
+        testing_task = PipelineService._trigger_phase(StageName.UNIT_TESTING, pipeline_id=pipeline_id, session=None)
+        return await asyncio.gather(coding_task, testing_task, return_exceptions=True)
 
-            # 3. 获取 sandbox 对外端口
-            sandbox_info = sandbox_manager.get_info(pipeline_id)
-            host_port = sandbox_info.port if sandbox_info else "unknown"
+    @staticmethod
+    async def _handle_coding_testing_results(
+        pipeline_id: int, coding_result, testing_result
+    ) -> bool:
+        """检查并发结果，失败时标记 Pipeline 失败。返回 True 表示应该继续。"""
+        if isinstance(coding_result, Exception) or isinstance(testing_result, Exception):
+            error_msg = ""
+            if isinstance(coding_result, Exception):
+                error_msg += f"CODING 异常: {coding_result} "
+            if isinstance(testing_result, Exception):
+                error_msg += f"TESTING 异常: {testing_result}"
+            raise Exception(error_msg)
 
-            if "200" in status_output:
-                await push_log(
-                    pipeline_id, "success",
-                    f"FastAPI 服务已在 Sandbox 中启动，对外端口: {host_port}",
-                    stage="UNIT_TESTING"
+        if not coding_result.get("success"):
+            async with async_session_factory() as err_session:
+                await PipelineService.mark_pipeline_failed(
+                    pipeline_id, coding_result.get("message", "Coding phase failed"), session=err_session
                 )
-                await push_log(
-                    pipeline_id, "info",
-                    f"接口测试地址: http://localhost:{host_port}/api/v1/health",
-                    stage="UNIT_TESTING"
-                )
-                return {"success": True, "port": host_port, "message": f"FastAPI started on sandbox port {host_port}"}
-            else:
-                await push_log(
-                    pipeline_id, "info",
-                    f"FastAPI 已启动，对外端口：{host_port}",
-                    stage="UNIT_TESTING"
-                )
-                return {"success": True, "port": host_port, "message": f"FastAPI started on sandbox port {host_port}"}
-
-        except Exception as e:
-            await push_log(
-                pipeline_id, "error",
-                f"在 Sandbox 中启动 FastAPI 失败: {str(e)}",
-                stage="UNIT_TESTING"
-            )
-            return {"success": False, "error": str(e)}
+                await err_session.commit()
             return False
 
+        if not testing_result.get("success"):
+            async with async_session_factory() as err_session:
+                await PipelineService.mark_pipeline_failed(
+                    pipeline_id, testing_result.get("message", "Testing phase failed"), session=err_session
+                )
+                await err_session.commit()
+            return False
+
+        return True
+
     @staticmethod
-    async def _check_defense_modifications(pipeline_id: int, file_service: Any) -> List[str]:
-        """
-        检查 RepairAgent 是否尝试修改 defense 文件夹中的内容
+    async def _run_tests_and_update_stage(pipeline_id: int) -> dict:
+        """gather 完成后运行分层测试并更新 UNIT_TESTING 阶段"""
+        test_run_result = await TestOrchestrator._run_tests_after_gather(pipeline_id)
 
-        Returns:
-            List[str]: 违规修改的文件路径列表，如果没有则返回空列表
-        """
-        violations = []
-        try:
-            # 获取最近修改的文件列表（可以通过文件服务的日志或检查文件修改时间）
-            # 这里我们检查 sandbox 中 defense 目录下的文件是否被修改
-            import os
-            from pathlib import Path
+        async with async_session_factory() as session:
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.UNIT_TESTING
+            )
+            result = await session.execute(statement)
+            testing_stage = result.scalar_one_or_none()
 
-            workspace_path = Path(f"/tmp/pipeline_{pipeline_id}")
-            defense_path = workspace_path / "backend" / "tests" / "unit" / "defense"
+            if testing_stage and testing_stage.output_data:
+                tr = testing_stage.output_data.setdefault("testing_result", {})
+                tr["test_run_success"] = test_run_result.get("test_run_success", False)
+                tr["overall_success"] = test_run_result.get("success", False)
+                tr["test_run_logs"] = test_run_result.get("logs", "")
+                tr["test_run_layers"] = test_run_result.get("layers", [])
+                tr["contract_check"] = test_run_result.get("contract_check")
+                tr["failed_tests"] = test_run_result.get("failed_tests", [])
+                tr["failure_cause"] = test_run_result.get("failure_cause")
+                tr["test_details"] = test_run_result.get("test_details", {})
+                tr["defense_violations"] = test_run_result.get("defense_violations", [])
+                flag_modified(testing_stage, "output_data")
+                await session.commit()
 
-            if defense_path.exists():
-                # 检查 defense 目录下的所有文件
-                for file_path in defense_path.rglob("*.py"):
-                    # 检查文件是否被修改（可以通过比较哈希或修改时间）
-                    # 简化处理：检查文件是否存在且可读
-                    try:
-                        relative_path = str(file_path.relative_to(workspace_path))
-                        # 如果文件存在，记录它（实际应该检查是否被修改）
-                        violations.append(relative_path)
-                    except Exception:
-                        pass
+        if test_run_result.get("test_run_success") and not test_run_result.get("requires_user_decision"):
+            asyncio.create_task(TestOrchestrator._start_fastapi_in_sandbox(pipeline_id))
 
-            # 【更严格的检查】通过 file_service 检查最近的写入操作
-            # 这需要 file_service 支持记录写入历史
-            # 暂时返回空列表，实际实现需要根据 file_service 的能力
-            return []
-        except Exception as e:
-            logger.warning(f"检查 defense 修改时出错: {e}", extra={"pipeline_id": pipeline_id})
-            return []
+        if test_run_result.get("requires_user_decision"):
+            await push_log(
+                pipeline_id, "warning",
+                "⚠️ 自动修复失败，Pipeline 暂停等待人工决策",
+                stage="UNIT_TESTING"
+            )
+        return test_run_result
+
+    @staticmethod
+    async def _store_review_report(pipeline_id: int, pipeline_stages: dict) -> dict:
+        """生成并存储 AI 审查报告到 CODE_REVIEW 阶段"""
+        await push_log(pipeline_id, "info", "🤖 生成 AI 代码审查报告...", stage="UNIT_TESTING")
+        review_report = await PipelineService._generate_ai_review_report(pipeline_id)
+
+        async with async_session_factory() as session:
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.CODE_REVIEW
+            )
+            result = await session.execute(statement)
+            review_stage = result.scalar_one_or_none()
+
+            if not review_stage:
+                coding_stage = pipeline_stages.get(StageName.CODING)
+                testing_stage_inner = pipeline_stages.get(StageName.UNIT_TESTING)
+                review_stage = await WorkflowService.create_stage(
+                    pipeline_id=pipeline_id,
+                    stage_name=StageName.CODE_REVIEW,
+                    input_data={
+                        "coding_output": coding_stage.output_data if coding_stage else {},
+                        "testing_result": testing_stage_inner.output_data.get("testing_result", {}) if testing_stage_inner else {},
+                    },
+                    session=session
+                )
+
+            if review_stage:
+                if not review_stage.output_data:
+                    review_stage.output_data = {}
+                review_stage.output_data["review_report"] = review_report
+                flag_modified(review_stage, "output_data")
+                await session.commit()
+
+        await push_log(pipeline_id, "info", f"✅ AI 审查报告已生成，发现 {len(review_report.get('issues', []))} 个问题", stage="CODE_REVIEW")
+        return review_report
+
+    @staticmethod
+    async def _set_pipeline_paused_at_review(pipeline_id: int) -> None:
+        """设置 Pipeline 为 PAUSED 状态，当前阶段为 CODE_REVIEW"""
+        async with async_session_factory() as session:
+            pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
+            if not pipeline:
+                return
+            pipeline.status = PipelineStatus.PAUSED
+            pipeline.current_stage = StageName.CODE_REVIEW
+
+            statement = select(PipelineStage).where(
+                PipelineStage.pipeline_id == pipeline_id,
+                PipelineStage.name == StageName.CODE_REVIEW
+            )
+            result = await session.execute(statement)
+            if not result.scalar_one_or_none():
+                coding_stage = testing_stage = None
+                for s in pipeline.stages:
+                    if s.name == StageName.CODING:
+                        coding_stage = s
+                    elif s.name == StageName.UNIT_TESTING:
+                        testing_stage = s
+                await WorkflowService.create_stage(
+                    pipeline_id=pipeline_id,
+                    stage_name=StageName.CODE_REVIEW,
+                    input_data={
+                        "coding_output": coding_stage.output_data.get("coder_output", {}) if coding_stage else {},
+                        "testing_result": testing_stage.output_data.get("testing_result", {}) if testing_stage else {},
+                        "target_files": coding_stage.output_data.get("target_files", {}) if coding_stage else {},
+                    },
+                    session=session
+                )
+                await push_log(pipeline_id, "info", "创建 CODE_REVIEW 阶段，等待统一审批", stage="CODE_REVIEW")
+            await session.commit()
 
     @staticmethod
     async def _run_coding_task_background(pipeline_id: int) -> None:
         """
         后台任务：并发执行 CODING 和 TESTING 阶段，gather 完成后统一运行测试
-
-        【新流程】CODING + TESTING 并发 → 统一运行测试 → 进入 CODE_REVIEW 审批
-        - CODING 和 TESTING 同时执行（Tester 基于契约生成测试，不依赖 Coder 输出）
-        - 两者都完成后，统一运行分层测试
-        - 然后进入 CODE_REVIEW 阶段等待审批
-
-        这是从 API 层迁移过来的后台任务函数，避免循环导入问题。
-        【关键修复】并发执行时，CODING 和 TESTING 各自使用独立的 session，避免 SQLAlchemy 并发冲突
+        【流程】CODING + TESTING 并发 → 统一运行测试 → 进入 CODE_REVIEW 审批
         """
-        try:
-            # 【新增】启动时检查 Pipeline 是否已终止
+        async def _check_terminated() -> bool:
             if await PipelineService._check_pipeline_terminated(pipeline_id):
                 await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
+                return True
+            return False
+
+        try:
+            if await _check_terminated():
                 return
 
             await push_log(pipeline_id, "info", "后台任务启动：并发执行代码生成和分层测试...", stage="CODING")
-            await push_log(pipeline_id, "info", "🚀 CODING 和 TESTING 并发执行中...", stage="UNIT_TESTING")
+            await PipelineService._create_testing_stage_record(pipeline_id)
 
-            # 【关键修复】提前创建 UNIT_TESTING 阶段记录，让前端轮询时立即看到 TESTER 节点为"执行中"
-            async with async_session_factory() as pre_session:
-                from app.repositories.pipeline_stage_repository import PipelineStageRepository
-                existing_testing = await PipelineStageRepository.get_by_pipeline_and_name(
-                    pipeline_id, StageName.UNIT_TESTING, pre_session
-                )
-                if not existing_testing:
-                    testing_stage = PipelineStage(
-                        pipeline_id=pipeline_id,
-                        name=StageName.UNIT_TESTING,
-                        status=StageStatus.RUNNING,
-                        input_data={}
-                    )
-                    pre_session.add(testing_stage)
-                    await pre_session.commit()
-                    await push_log(
-                        pipeline_id, "info",
-                        "UNIT_TESTING 阶段已就绪",
-                        stage="UNIT_TESTING"
-                    )
+            coding_result, testing_result = await PipelineService._execute_coding_and_testing_concurrent(pipeline_id)
 
-            # 【并发执行】同时启动 CODING 和 TESTING 阶段
-            coding_task = PipelineService._trigger_coding_phase(
-                pipeline_id=pipeline_id,
-                session=None  # 独立 session
-            )
-            testing_task = PipelineService._trigger_testing_phase(
-                pipeline_id=pipeline_id,
-                session=None  # 独立 session
-            )
-
-            # 等待两个任务完成
-            coding_result, testing_result = await asyncio.gather(
-                coding_task,
-                testing_task,
-                return_exceptions=True
-            )
-
-            # 【新增】检查 Pipeline 是否已终止
-            if await PipelineService._check_pipeline_terminated(pipeline_id):
-                await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
+            if await _check_terminated():
                 return
 
-            # 处理异常结果
-            if isinstance(coding_result, Exception) or isinstance(testing_result, Exception):
-                error_msg = ""
-                if isinstance(coding_result, Exception):
-                    error_msg += f"CODING 异常: {coding_result} "
-                if isinstance(testing_result, Exception):
-                    error_msg += f"TESTING 异常: {testing_result}"
-                raise Exception(error_msg)
-
-            # 检查 CODING 结果
-            if not coding_result.get("success"):
-                op_logger.log_pipeline_status_change(
-                    pipeline_id=pipeline_id,
-                    old_status='running',
-                    new_status='failed',
-                    stage='CODING',
-                    error=coding_result.get("message", "Unknown error")
-                )
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=coding_result.get("message", "Coding phase failed"),
-                        session=err_session
-                    )
-                    await err_session.commit()
+            if not await PipelineService._handle_coding_testing_results(pipeline_id, coding_result, testing_result):
                 return
 
-            # 检查 TESTING 结果
-            if not testing_result.get("success"):
-                op_logger.log_pipeline_status_change(
-                    pipeline_id=pipeline_id,
-                    old_status='running',
-                    new_status='failed',
-                    stage='UNIT_TESTING',
-                    error=testing_result.get("message", "Testing phase failed")
-                )
-                async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=testing_result.get("message", "Testing phase failed"),
-                        session=err_session
-                    )
-                    await err_session.commit()
+            if await _check_terminated():
                 return
 
-            # 【新增】运行测试前检查 Pipeline 是否已终止
-            if await PipelineService._check_pipeline_terminated(pipeline_id):
-                await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
-                return
-
-            # 【新增】检查 Pipeline 是否存在，并预加载 stages
+            # 预加载 pipeline stages
             from sqlalchemy.orm import selectinload
             async with async_session_factory() as session:
-                statement = (
-                    select(Pipeline)
-                    .where(Pipeline.id == pipeline_id)
-                    .options(selectinload(Pipeline.stages))
-                )
+                statement = select(Pipeline).where(Pipeline.id == pipeline_id).options(selectinload(Pipeline.stages))
                 result = await session.execute(statement)
                 pipeline = result.scalar_one_or_none()
                 if not pipeline:
                     await push_log(pipeline_id, "error", f"Pipeline {pipeline_id} 不存在", stage="CODING")
                     return
-                # 【修复】预加载 stages 数据到字典，避免 DetachedInstanceError
                 pipeline_stages = {s.name: s for s in pipeline.stages}
 
-            # ========== 并行完成后：运行测试 ==========
-            test_run_result = await PipelineService._run_tests_after_gather(pipeline_id)
+            test_run_result = await PipelineService._run_tests_and_update_stage(pipeline_id)
 
-            # 更新 UNIT_TESTING 阶段的 test_run_success 结果（包含契约检查结果）
-            async with async_session_factory() as session:
-                statement = select(PipelineStage).where(
-                    PipelineStage.pipeline_id == pipeline_id,
-                    PipelineStage.name == StageName.UNIT_TESTING
-                )
-                result = await session.execute(statement)
-                testing_stage = result.scalar_one_or_none()
-
-                if testing_stage and testing_stage.output_data:
-                    testing_stage.output_data["testing_result"]["test_run_success"] = test_run_result.get("test_run_success", False)
-                    testing_stage.output_data["testing_result"]["overall_success"] = test_run_result.get("success", False)
-                    testing_stage.output_data["testing_result"]["test_run_logs"] = test_run_result.get("logs", "")
-                    testing_stage.output_data["testing_result"]["test_run_layers"] = test_run_result.get("layers", [])
-                    testing_stage.output_data["testing_result"]["contract_check"] = test_run_result.get("contract_check")
-                    testing_stage.output_data["testing_result"]["failed_tests"] = test_run_result.get("failed_tests", [])
-                    testing_stage.output_data["testing_result"]["failure_cause"] = test_run_result.get("failure_cause")
-                    # 【新增】保存详细的测试和修复记录
-                    testing_stage.output_data["testing_result"]["test_details"] = test_run_result.get("test_details", {})
-                    testing_stage.output_data["testing_result"]["defense_violations"] = test_run_result.get("defense_violations", [])
-                    flag_modified(testing_stage, "output_data")
-                    await session.commit()
-
-            # 【新增】分层测试通过后，在 Sandbox 中启动 FastAPI 服务
-            if test_run_result.get("test_run_success") and not test_run_result.get("requires_user_decision"):
-                asyncio.create_task(PipelineService._start_fastapi_in_sandbox(pipeline_id))
-
-            # 【修复】如果测试结果标记了 requires_user_decision（修复循环失败），
-            # 暂停 Pipeline 等待人工决策，而不是静默进入 CODE_REVIEW
-            if test_run_result.get("requires_user_decision"):
-                await push_log(
-                    pipeline_id, "warning",
-                    "⚠️ 自动修复失败，Pipeline 暂停等待人工决策。请在 CODE_REVIEW 阶段查看问题并决定 Approve/Reject。",
-                    stage="UNIT_TESTING"
-                )
-
-            # 生成审查报告前检查 Pipeline 是否已终止
-            if await PipelineService._check_pipeline_terminated(pipeline_id):
-                await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
+            if await _check_terminated():
                 return
 
-            await push_log(
-                pipeline_id,
-                "info",
-                "🤖 生成 AI 代码审查报告...",
-                stage="UNIT_TESTING"
-            )
+            await PipelineService._store_review_report(pipeline_id, pipeline_stages)
 
-            review_report = await PipelineService._generate_ai_review_report(pipeline_id)
-
-            # 将审查报告存储到 CODE_REVIEW 阶段
-            async with async_session_factory() as session:
-                # 先创建 CODE_REVIEW 阶段（如果不存在）
-                statement = select(PipelineStage).where(
-                    PipelineStage.pipeline_id == pipeline_id,
-                    PipelineStage.name == StageName.CODE_REVIEW
-                )
-                result = await session.execute(statement)
-                review_stage = result.scalar_one_or_none()
-
-                if not review_stage:
-                    # 获取 CODING 和 TESTING 的输出数据（使用预加载的 stages）
-                    coding_stage = pipeline_stages.get(StageName.CODING)
-                    testing_stage = pipeline_stages.get(StageName.UNIT_TESTING)
-
-                    coding_output = coding_stage.output_data if coding_stage else {}
-                    testing_output = testing_stage.output_data if testing_stage else {}
-
-                    review_stage = await WorkflowService.create_stage(
-                        pipeline_id=pipeline_id,
-                        stage_name=StageName.CODE_REVIEW,
-                        input_data={
-                            "coding_output": coding_output,
-                            "testing_result": testing_output.get("testing_result", {}),
-                        },
-                        session=session
-                    )
-
-                # 将审查报告存储到 CODE_REVIEW 阶段的 output_data
-                if review_stage:
-                    if not review_stage.output_data:
-                        review_stage.output_data = {}
-                    review_stage.output_data["review_report"] = review_report
-                    flag_modified(review_stage, "output_data")
-                    await session.commit()
-
-            await push_log(
-                pipeline_id,
-                "info",
-                f"✅ AI 审查报告已生成，发现 {len(review_report.get('issues', []))} 个问题",
-                stage="CODE_REVIEW"
-            )
-
-            # 【新增】设置 PAUSED 前检查 Pipeline 是否已终止
-            if await PipelineService._check_pipeline_terminated(pipeline_id):
-                await push_log(pipeline_id, "warning", "Pipeline 已终止，后台任务退出", stage="CODING")
+            if await _check_terminated():
                 return
 
-            # 设置 PAUSED -> CODE_REVIEW
-            async with async_session_factory() as session:
-                pipeline = await PipelineRepository.get_by_id(pipeline_id, session)
-                if pipeline:
-                    pipeline.status = PipelineStatus.PAUSED
-                    pipeline.current_stage = StageName.CODE_REVIEW
+            await PipelineService._set_pipeline_paused_at_review(pipeline_id)
 
-                    # 创建 CODE_REVIEW 阶段（如果不存在）
-                    statement = select(PipelineStage).where(
-                        PipelineStage.pipeline_id == pipeline_id,
-                        PipelineStage.name == StageName.CODE_REVIEW
-                    )
-                    result = await session.execute(statement)
-                    existing_review_stage = result.scalar_one_or_none()
-
-                    if not existing_review_stage:
-                        # 获取 CODING 和 TESTING 的输出数据
-                        coding_stage = None
-                        testing_stage = None
-                        for stage in pipeline.stages:
-                            if stage.name == StageName.CODING:
-                                coding_stage = stage
-                            elif stage.name == StageName.UNIT_TESTING:
-                                testing_stage = stage
-
-                        coding_output = coding_stage.output_data if coding_stage else {}
-                        testing_output = testing_stage.output_data if testing_stage else {}
-
-                        await WorkflowService.create_stage(
-                            pipeline_id=pipeline_id,
-                            stage_name=StageName.CODE_REVIEW,
-                            input_data={
-                                "coding_output": coding_output.get("coder_output", {}),
-                                "testing_result": testing_output.get("testing_result", {}),
-                                "target_files": coding_output.get("target_files", {})
-                            },
-                            session=session
-                        )
-                        await push_log(
-                            pipeline_id,
-                            "info",
-                            "创建 CODE_REVIEW 阶段，等待统一审批",
-                            stage="CODE_REVIEW"
-                        )
-
-                    await session.commit()
-
-                    # 推送状态日志
-                    test_generated = testing_result.get("output_data", {}).get("testing_result", {}).get("test_generated", False)
-                    test_run_success = test_run_result.get("success", False)
-
-                    if test_generated and test_run_success:
-                        await push_log(
-                            pipeline_id,
-                            "success",
-                            "✅ 代码生成和测试运行完成，等待代码审查",
-                            stage="CODE_REVIEW"
-                        )
-                    elif test_generated:
-                        await push_log(
-                            pipeline_id,
-                            "warning",
-                            "⚠️ 代码生成完成，测试部分未通过，等待代码审查",
-                            stage="CODE_REVIEW"
-                        )
-                    else:
-                        await push_log(
-                            pipeline_id,
-                            "info",
-                            "代码生成和分层测试完成，等待代码审查",
-                            stage="CODE_REVIEW"
-                        )
+            # 推送状态日志
+            test_generated = testing_result.get("output_data", {}).get("testing_result", {}).get("test_generated", False)
+            test_run_success = test_run_result.get("success", False)
+            if test_generated and test_run_success:
+                await push_log(pipeline_id, "success", "✅ 代码生成和测试运行完成，等待代码审查", stage="CODE_REVIEW")
+            elif test_generated:
+                await push_log(pipeline_id, "warning", "⚠️ 代码生成完成，测试部分未通过，等待代码审查", stage="CODE_REVIEW")
+            else:
+                await push_log(pipeline_id, "info", "代码生成和分层测试完成，等待代码审查", stage="CODE_REVIEW")
 
         except Exception as e:
-            error(
-                "Pipeline CODING/UNIT_TESTING 阶段失败",
-                pipeline_id=pipeline_id,
-                exc_info=True
-            )
+            error("Pipeline CODING/UNIT_TESTING 阶段失败", pipeline_id=pipeline_id, exc_info=True)
             op_logger.log_pipeline_status_change(
-                pipeline_id=pipeline_id,
-                old_status='running',
-                new_status='failed',
-                stage='CODING',
-                error=str(e)
+                pipeline_id=pipeline_id, old_status='running', new_status='failed',
+                stage='CODING', error=str(e)
             )
             try:
                 async with async_session_factory() as err_session:
-                    await PipelineService.mark_pipeline_failed(
-                        pipeline_id=pipeline_id,
-                        error=str(e),
-                        session=err_session
-                    )
+                    await PipelineService.mark_pipeline_failed(pipeline_id, error=str(e), session=err_session)
                     await err_session.commit()
             except Exception:
                 pass
@@ -2051,6 +1182,8 @@ class PipelineService:
                     coding_stage.status = StageStatus.PENDING
                     coding_stage.output_data = {"retry_feedback": feedback}
                     await session.commit()
+                    # 使对象过期，后续查询强制从 DB 获取最新状态
+                    session.expire(coding_stage)
 
                 # 重新执行 CODING
                 coding_result = await PipelineService.trigger_coding_phase(
@@ -2108,7 +1241,8 @@ class PipelineService:
                     await session.commit()
 
                 # 重新执行 TESTING
-                testing_result = await PipelineService._trigger_testing_phase(
+                testing_result = await PipelineService._trigger_phase(
+                    StageName.UNIT_TESTING,
                     pipeline_id=pipeline_id,
                     session=session
                 )
@@ -2339,7 +1473,7 @@ class PipelineService:
             )
 
             # 只运行用户修改的测试文件
-            single_test_result = await cls._run_single_test_file(
+            single_test_result = await TestOrchestrator._run_single_test_file(
                 pipeline_id=pipeline_id,
                 file_path=file_path,
                 content=content,
@@ -2430,81 +1564,6 @@ class PipelineService:
                 "error": f"Failed to override test: {str(e)}"
             }
 
-    @classmethod
-    async def _run_single_test_file(
-        cls,
-        pipeline_id: int,
-        file_path: str,
-        content: str,
-        file_service: Any
-    ) -> Dict[str, Any]:
-        """
-        运行单个测试文件
-
-        Args:
-            pipeline_id: Pipeline ID
-            file_path: 测试文件路径
-            content: 测试文件内容
-            file_service: 沙箱文件服务
-
-        Returns:
-            Dict: 测试结果
-        """
-        from app.service.sandbox_manager import sandbox_manager
-        import re
-
-        try:
-            # 在 Docker 容器中运行单个测试文件
-            cmd = (
-                f"cd /workspace && "
-                f"PYTHONPATH=/workspace/backend python -m pytest {file_path} "
-                f"-v --tb=short --color=no "
-                f"2>&1"
-            )
-
-            exec_result = await sandbox_manager.exec(
-                pipeline_id,
-                cmd,
-                timeout=120
-            )
-
-            stdout = exec_result.stdout or ""
-            stderr = exec_result.stderr or ""
-            logs = stdout + "\n" + stderr
-
-            success = exec_result.exit_code == 0
-
-            # 提取失败测试
-            failed_tests = []
-            if not success:
-                pattern = r"FAILED\s+(\S+)"
-                failed_tests = re.findall(pattern, logs)
-
-            # 提取摘要
-            summary_match = re.search(r"(\d+\s+passed|\d+\s+failed|\d+\s+error)", logs)
-            if summary_match:
-                summary = summary_match.group(0)
-            else:
-                summary = "测试执行完成" if success else "测试执行失败"
-
-            return {
-                "success": success,
-                "exit_code": exec_result.exit_code,
-                "logs": logs,
-                "summary": summary,
-                "failed_tests": failed_tests,
-                "error": stderr if stderr else None
-            }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "exit_code": -1,
-                "logs": str(e),
-                "summary": "测试执行异常",
-                "failed_tests": [],
-                "error": str(e)
-            }
 
     @classmethod
     async def delete_pipeline(

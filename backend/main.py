@@ -56,24 +56,34 @@ async def _periodic_buffer_cleanup():
 
 def _sync_cleanup_sandbox_pool():
     """
-    【新增】同步清理 Sandbox 预热池容器
+    同步清理 Sandbox 预热池容器（atexit 兜底方案）
 
-    使用 atexit 注册，确保程序退出时（包括 KeyboardInterrupt）容器被清理。
-    这是 lifespan 中异步清理的兜底方案。
+    优先级：
+    1. lifespan 关闭时已通过 await sandbox_manager.cleanup_pool() 做了异步清理
+    2. 本函数是兜底：处理 KeyboardInterrupt / SIGTERM / 进程崩溃等情况
+    3. atexit 阶段 Python 解释器可能已部分卸载模块，所有 import 必须在函数内完成
+
+    注意：本函数用 subprocess 同步调用 docker，与 lifespan 的异步清理不会并发 —
+    atexit 在事件循环停止后才执行。
     """
     import subprocess
-    from app.core.logging import info, error
 
-    info("[atexit] 同步清理预热池容器...")
-
-    # 使用 docker ps 查找所有 omniflow-prewarm-* 容器
+    # atexit 阶段 logging 模块可能已关闭，降级到 print
     try:
+        from app.core.logging import info, error
+    except Exception:
+        def info(msg, **kw):
+            print(f"[atexit:INFO] {msg}")
+        def error(msg, **kw):
+            print(f"[atexit:ERROR] {msg} {kw}")
+
+    try:
+        info("[atexit] 同步清理预热池容器（兜底）...")
         result = subprocess.run(
             ["docker", "ps", "-q", "--filter", "name=omniflow-prewarm-"],
             capture_output=True, text=True, timeout=10
         )
-        container_ids = result.stdout.strip().split('\n')
-        container_ids = [cid for cid in container_ids if cid]
+        container_ids = [c for c in result.stdout.strip().split('\n') if c]
 
         for cid in container_ids:
             try:
@@ -81,16 +91,18 @@ def _sync_cleanup_sandbox_pool():
                     ["docker", "rm", "-f", cid],
                     capture_output=True, timeout=5
                 )
-                info(f"[atexit] 已清理容器", container_id=cid[:12])
+                info("[atexit] 已清理容器", container_id=cid[:12])
             except Exception as e:
-                error(f"[atexit] 清理容器失败", container_id=cid[:12], error=str(e))
+                error("[atexit] 清理容器失败", container_id=cid[:12], error=str(e))
 
-        info(f"[atexit] 同步清理完成，共清理 {len(container_ids)} 个容器")
+        info(f"[atexit] 兜底清理完成，共清理 {len(container_ids)} 个容器")
+    except FileNotFoundError:
+        print("[atexit:WARN] docker 命令不可用，跳过容器清理")
     except Exception as e:
-        error(f"[atexit] 查找容器失败", error=str(e))
+        error("[atexit] 查找容器失败", error=str(e))
 
 
-# 注册 atexit 清理函数
+# 注册 atexit 清理函数（兜底：事件循环已停止后才执行）
 atexit.register(_sync_cleanup_sandbox_pool)
 
 
@@ -131,6 +143,10 @@ async def lifespan(app: FastAPI):
 
     # 启动时执行
     info("OmniFlowAI Backend 启动中...", env=settings.ENV, debug=settings.DEBUG)
+
+    # 初始化 EventBus 默认处理器
+    from app.core.event_bus import init_event_bus
+    await init_event_bus()
 
     # 初始化数据库
     try:
@@ -258,12 +274,13 @@ async def global_exception_handler(request: Request, exc: Exception):
         request_id=request_id
     )
 
+    error_msg = str(exc) if settings.DEBUG else "Internal server error"
     return JSONResponse(
         status_code=500,
         content=ResponseModel(
             success=False,
             data=None,
-            error=str(exc),
+            error=error_msg,
             request_id=request_id
         ).model_dump()
     )

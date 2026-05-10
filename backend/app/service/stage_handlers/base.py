@@ -92,16 +92,12 @@ class StageHandler(ABC):
     """
     
     def __init__(self):
-        """Initialize handler with global AgentDebugger instance and logger"""
+        """Initialize handler with global AgentDebugger instance"""
         self.debugger = get_agent_debugger()
-        self._logger: Optional[PipelineLogger] = None
-        self._start_time: Optional[float] = None
-    
+
     def _get_logger(self, pipeline_id: int) -> PipelineLogger:
-        """Get or create PipelineLogger instance"""
-        if self._logger is None or self._logger.pipeline_id != pipeline_id:
-            self._logger = PipelineLogger(pipeline_id, self.stage_name.value)
-        return self._logger
+        """Create a new PipelineLogger — stateless, no shared mutable state"""
+        return PipelineLogger(pipeline_id, self.stage_name.value)
 
     def _save_agent_log(
         self,
@@ -288,46 +284,120 @@ class StageHandler(ABC):
             status=PipelineStatus.RUNNING
         )
     
+    async def _save_stage_result(
+        self,
+        context: StageContext,
+        result: StageResult
+    ) -> None:
+        """将阶段执行结果持久化到 stage 记录（供 complete 使用）"""
+        from sqlmodel import select
+        from app.models.pipeline import PipelineStage, StageStatus
+        from app.core.timezone import now
+
+        if not context.stage_id:
+            return
+
+        statement = select(PipelineStage).where(PipelineStage.id == context.stage_id)
+        query_result = await context.session.execute(statement)
+        stage = query_result.scalar_one_or_none()
+        if not stage:
+            return
+
+        stage.output_data = result.output_data
+        if result.success:
+            if result.status == PipelineStatus.PAUSED:
+                stage.status = StageStatus.SUCCESS
+            elif result.status == PipelineStatus.SUCCESS:
+                stage.status = StageStatus.SUCCESS
+            elif result.status == PipelineStatus.RUNNING:
+                stage.status = StageStatus.RUNNING
+            else:
+                stage.status = StageStatus.SUCCESS
+        else:
+            stage.status = StageStatus.FAILED
+        stage.completed_at = now()
+        stage.input_tokens = result.metrics.get("input_tokens", 0)
+        stage.output_tokens = result.metrics.get("output_tokens", 0)
+        stage.duration_ms = result.metrics.get("duration_ms", 0)
+        stage.retry_count = result.metrics.get("retry_count", 0)
+        stage.reasoning = result.metrics.get("reasoning")
+        await context.session.commit()
+
+    async def _update_pipeline_after_stage(
+        self,
+        context: StageContext,
+        result: StageResult,
+        *,
+        remove_buffer_on_failure: bool = True
+    ) -> None:
+        """更新 Pipeline 状态（成功则暂停/成功，失败则标记失败）"""
+        from app.service.workflow import WorkflowService
+
+        pipeline = await WorkflowService.get_pipeline_with_stages(
+            context.pipeline_id, context.session
+        )
+        if not pipeline:
+            return
+
+        if result.success:
+            if result.status == PipelineStatus.PAUSED:
+                await WorkflowService.set_pipeline_paused(pipeline, context.session)
+            elif result.status == PipelineStatus.RUNNING:
+                await WorkflowService.set_pipeline_running(pipeline, context.session)
+            else:
+                await WorkflowService.set_pipeline_success(pipeline, context.session)
+        else:
+            await WorkflowService.set_pipeline_failed(pipeline, context.session)
+            if remove_buffer_on_failure:
+                from app.core.sse_log_buffer import remove_buffer
+                remove_buffer(context.pipeline_id)
+
     async def run(self, context: StageContext) -> StageResult:
         """
         Run complete stage workflow
-        
+
+        All state is local — handler instances are shared across pipelines,
+        so instance variables must not hold per-execution state.
+
         Args:
             context: Stage context
-            
+
         Returns:
             StageResult: Execution result
         """
         logger = self._get_logger(context.pipeline_id)
-        self._start_time = time.perf_counter()
-        
+        _start_time = time.perf_counter()
+
         try:
             # 1. Preparation phase - with logging
             await push_stage_start(context.pipeline_id, self.stage_name.value, context.input_data)
             context = await self.prepare(context)
-            
+
             # 2. Execution phase
             result = await self.execute(context)
-            
+
             # 3. Completion phase
             await self.complete(context, result)
-            
+
             # Log stage completion
-            duration_ms = int((time.perf_counter() - self._start_time) * 1000)
+            duration_ms = int((time.perf_counter() - _start_time) * 1000)
             await push_stage_complete(
-                context.pipeline_id, 
-                self.stage_name.value, 
+                context.pipeline_id,
+                self.stage_name.value,
                 result.success,
                 result.output_data if result.success else None,
                 duration_ms
             )
-            
+
             return result
-            
+
         except Exception as e:
             # Error handling with detailed logging
-            duration_ms = int((time.perf_counter() - self._start_time) * 1000) if self._start_time else 0
-            
+            duration_ms = int((time.perf_counter() - _start_time) * 1000)
+
+            # Rollback 阶段中可能的部分写入，避免脏数据
+            await context.session.rollback()
+
             # Log detailed error
             await push_error_details(context.pipeline_id, e, context=f"Stage {self.stage_name.value}")
             await push_stage_complete(
@@ -337,7 +407,7 @@ class StageHandler(ABC):
                 None,
                 duration_ms
             )
-            
+
             result = await self.handle_error(context, e)
             await self.complete(context, result)
             return result

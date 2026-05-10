@@ -305,15 +305,5 @@ class CodeValidationService:
                         return True
         return False
 
-    def is_inside_function(self, target_node: ast.AST, tree: ast.AST) -> bool:
-        """判断节点是否在函数体内"""
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for child in ast.walk(node):
-                    if child is target_node:
-                        return True
-        return False
-
-
 # 单例实例
 code_validation_service = CodeValidationService()

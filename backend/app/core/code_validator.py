@@ -5,10 +5,10 @@
 """
 
 import ast
-import logging
+import structlog
 from typing import Optional, List
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class CodeValidator:
@@ -116,7 +116,7 @@ class CodeValidator:
 
         lines = content.splitlines()
         total_lines = len(lines)
-        logger.info(f"[PostWriteHook] 开始检查文件: {file_path} ({total_lines} 行)")
+        logger.debug(f"[PostWriteHook] 开始检查文件: {file_path} ({total_lines} 行)")
 
         # 1. FastAPI 路由完整性检查
         has_router_import = any('APIRouter' in line for line in lines)
@@ -124,7 +124,7 @@ class CodeValidator:
         has_decorator = any('@router.' in line for line in lines)
 
         if has_decorator:
-            logger.info(f"[PostWriteHook] 检测到 FastAPI 路由装饰器 (@router.)")
+            logger.debug(f"[PostWriteHook] 检测到 FastAPI 路由装饰器 (@router.)")
             if not (has_router_import and has_router_init):
                 missing = []
                 if not has_router_import:
@@ -134,29 +134,29 @@ class CodeValidator:
                     missing.append("router = APIRouter(...)")
                     logger.error(f"[PostWriteHook] 缺少 router = APIRouter() 初始化")
                 return f"FastAPI 路由文件缺少: {', '.join(missing)}"
-            logger.info(f"[PostWriteHook] FastAPI 路由完整性检查通过")
+            logger.debug(f"[PostWriteHook] FastAPI 路由完整性检查通过")
 
         # 2. 检查使用了 @app. 但没有 FastAPI 实例
         has_app_decorator = any('@app.' in line for line in lines)
         has_app_init = any('app = FastAPI' in line for line in lines) or 'FastAPI(' in ''.join(lines)
 
         if has_app_decorator:
-            logger.info(f"[PostWriteHook] 检测到 FastAPI 应用装饰器 (@app.)")
+            logger.debug(f"[PostWriteHook] 检测到 FastAPI 应用装饰器 (@app.)")
             if not has_app_init:
                 logger.error(f"[PostWriteHook] 缺少 app = FastAPI() 初始化")
                 return "使用了 @app. 装饰器但缺少 app = FastAPI() 初始化"
-            logger.info(f"[PostWriteHook] FastAPI 应用完整性检查通过")
+            logger.debug(f"[PostWriteHook] FastAPI 应用完整性检查通过")
 
         # 3. 检查 SQLModel 模型缺少导入
         has_model_def = any('class ' in line and '(SQLModel' in line for line in lines)
         has_sqlmodel_import = any('SQLModel' in line and 'import' in line for line in lines)
 
         if has_model_def:
-            logger.info(f"[PostWriteHook] 检测到 SQLModel 模型定义")
+            logger.debug(f"[PostWriteHook] 检测到 SQLModel 模型定义")
             if not has_sqlmodel_import:
                 logger.error(f"[PostWriteHook] 缺少 SQLModel 导入")
                 return "SQLModel 模型定义缺少 from sqlmodel import SQLModel"
-            logger.info(f"[PostWriteHook] SQLModel 导入检查通过")
+            logger.debug(f"[PostWriteHook] SQLModel 导入检查通过")
 
         # 4. 检查使用了 async def 但可能缺少 await（简单启发式）
         has_async_def = any('async def ' in line for line in lines)
@@ -167,15 +167,15 @@ class CodeValidator:
 
         # 5. 模块导出契约检查 - 防止破坏公共 API
         if 'app/core/database.py' in file_path:
-            logger.info(f"[PostWriteHook] 检查核心模块导出契约: app/core/database.py")
+            logger.debug(f"[PostWriteHook] 检查核心模块导出契约: app/core/database.py")
             has_get_session = 'def get_session' in content
             if not has_get_session:
                 logger.error(f"[PostWriteHook] [严重错误] app/core/database.py 缺少 get_session 函数！")
                 return "[严重错误] 禁止删除 app/core/database.py 中的 get_session 函数！"
-            logger.info(f"[PostWriteHook] app/core/database.py 导出契约检查通过")
+            logger.debug(f"[PostWriteHook] app/core/database.py 导出契约检查通过")
 
         if 'app/core/response.py' in file_path:
-            logger.info(f"[PostWriteHook] 检查核心模块导出契约: app/core/response.py")
+            logger.debug(f"[PostWriteHook] 检查核心模块导出契约: app/core/response.py")
             has_success_response = 'def success_response' in content
             has_error_response = 'def error_response' in content
             if not has_success_response:
@@ -184,7 +184,7 @@ class CodeValidator:
             if not has_error_response:
                 logger.error(f"[PostWriteHook] [严重错误] app/core/response.py 缺少 error_response 函数！")
                 return "[严重错误] 禁止删除 app/core/response.py 中的 error_response 函数！"
-            logger.info(f"[PostWriteHook] app/core/response.py 导出契约检查通过")
+            logger.debug(f"[PostWriteHook] app/core/response.py 导出契约检查通过")
 
         # 6. 检查 @router. 装饰器是否在 router = APIRouter() 之后
         if has_decorator and has_router_init:
@@ -220,7 +220,7 @@ class CodeValidator:
                     return f"[严重错误] @app. 装饰器（第 {first_app_decorator_line+1} 行）出现在 app = FastAPI()（第 {app_init_line+1} 行）之前！"
                 logger.debug(f"[PostWriteHook] @app. 装饰器位置检查通过")
 
-        logger.info(f"[PostWriteHook] 文件检查通过: {file_path}")
+        logger.debug(f"[PostWriteHook] 文件检查通过: {file_path}")
         return None
 
 

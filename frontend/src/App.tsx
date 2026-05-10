@@ -10,6 +10,7 @@ import { Settings } from '@pages/Settings';
 import { Analytics } from '@pages/Analytics';
 import { Documents } from '@pages/Documents';
 import { ConsoleLayout } from '@components/Layout';
+import { ErrorBoundary } from '@components/Common/ErrorBoundary';
 
 // ============================================
 // OmniFlowAI 主应用
@@ -17,9 +18,10 @@ import { ConsoleLayout } from '@components/Layout';
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <Routes>
           {/* 官网首页 */}
           <Route path="/" element={<Landing />} />
 
@@ -36,9 +38,10 @@ function App() {
 
           {/* 404 重定向 */}
           <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </BrowserRouter>
-    </QueryClientProvider>
+          </Routes>
+        </BrowserRouter>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }
 

@@ -48,7 +48,11 @@ export function ApproveDrawer() {
     queryKey: ['pipeline', pipelineId],
     queryFn: ({ signal }) => apiGet<Pipeline>(`/pipeline/${pipelineId}/status`, { signal }),
     enabled: !!pipelineId && isApproveDrawerOpen,
-    refetchInterval: 2000,
+    refetchInterval: (query) => {
+      const data = query.state.data as Pipeline | undefined;
+      if (data?.status === 'success' || data?.status === 'failed') return false;
+      return 2000;
+    },
     staleTime: 0,
   });
 

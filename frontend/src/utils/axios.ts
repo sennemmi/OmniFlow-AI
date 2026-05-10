@@ -84,12 +84,6 @@ export async function apiPost<T>(url: string, data?: Record<string, unknown>): P
   return apiClient.post<any, T>(url, data);
 }
 
-export async function apiPut<T>(url: string, data?: Record<string, unknown>): Promise<T> {
-  return apiClient.put<any, T>(url, data);
-}
-
 export async function apiDelete<T>(url: string): Promise<T> {
   return apiClient.delete<any, T>(url);
 }
-
-export default apiClient;

@@ -12,6 +12,7 @@ EventBus / NotificationService
 """
 
 import asyncio
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Callable, Any, Optional
 from dataclasses import dataclass
@@ -129,13 +130,15 @@ class EventBus:
         self._handlers: Dict[str, EventHandler] = {}
         self._lock = asyncio.Lock()
 
-    def register(self, handler: EventHandler) -> None:
+    async def register(self, handler: EventHandler) -> None:
         """注册事件处理器"""
-        self._handlers[handler.name] = handler
+        async with self._lock:
+            self._handlers[handler.name] = handler
 
-    def unregister(self, name: str) -> None:
+    async def unregister(self, name: str) -> None:
         """注销事件处理器"""
-        self._handlers.pop(name, None)
+        async with self._lock:
+            self._handlers.pop(name, None)
 
     async def emit(self, event: LogEvent) -> None:
         """
@@ -144,10 +147,11 @@ class EventBus:
         Args:
             event: 日志事件
         """
-        # 并发执行所有处理器
+        async with self._lock:
+            handlers = list(self._handlers.values())
         tasks = [
             self._safe_handle(handler, event)
-            for handler in self._handlers.values()
+            for handler in handlers
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -165,23 +169,31 @@ class EventBus:
 
 # 全局 EventBus 实例
 _event_bus: Optional[EventBus] = None
+_event_bus_lock = threading.Lock()
 
 
 def get_event_bus() -> EventBus:
-    """获取全局 EventBus 实例（单例）"""
+    """获取全局 EventBus 实例（线程安全单例）"""
     global _event_bus
     if _event_bus is None:
-        _event_bus = EventBus()
-        # 默认注册 SSE 和 Structlog 处理器
-        _event_bus.register(SSEPushHandler())
-        _event_bus.register(StructlogHandler())
+        with _event_bus_lock:
+            if _event_bus is None:
+                _event_bus = EventBus()
     return _event_bus
 
 
+async def init_event_bus() -> None:
+    """初始化 EventBus 默认处理器（在异步上下文中调用）"""
+    bus = get_event_bus()
+    await bus.register(SSEPushHandler())
+    await bus.register(StructlogHandler())
+
+
 def reset_event_bus() -> None:
-    """重置 EventBus（用于测试）"""
+    """重置 EventBus（仅用于测试，禁止在生产环境调用）"""
     global _event_bus
-    _event_bus = None
+    with _event_bus_lock:
+        _event_bus = None
 
 
 # =============================================================================

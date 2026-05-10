@@ -155,50 +155,8 @@ class RequirementHandler(StageHandler):
 
     async def complete(self, context: StageContext, result: StageResult) -> None:
         """完成阶段：保存 Stage 输出并更新 Pipeline 状态"""
-        from sqlmodel import select
-        from app.models.pipeline import PipelineStage, PipelineStatus
-
-        # 【关键修复】保存 Stage 的 output_data
-        if context.stage_id:
-            statement = select(PipelineStage).where(PipelineStage.id == context.stage_id)
-            query_result = await context.session.execute(statement)
-            stage = query_result.scalar_one_or_none()
-            if stage:
-                stage.output_data = result.output_data
-                from app.core.timezone import now
-                # 【修复】正确映射 PipelineStatus 到 StageStatus
-                # StageStatus 没有 paused，当 Pipeline 是 paused 时，Stage 应该是 SUCCESS（等待审批）
-                if result.success:
-                    if result.status == PipelineStatus.PAUSED:
-                        stage.status = StageStatus.SUCCESS  # 阶段执行成功，等待审批
-                    elif result.status == PipelineStatus.SUCCESS:
-                        stage.status = StageStatus.SUCCESS
-                    elif result.status == PipelineStatus.RUNNING:
-                        stage.status = StageStatus.RUNNING
-                    else:
-                        stage.status = StageStatus.SUCCESS
-                else:
-                    stage.status = StageStatus.FAILED
-                stage.completed_at = now()
-                stage.input_tokens = result.metrics.get("input_tokens", 0)
-                stage.output_tokens = result.metrics.get("output_tokens", 0)
-                stage.duration_ms = result.metrics.get("duration_ms", 0)
-                stage.retry_count = result.metrics.get("retry_count", 0)
-                stage.reasoning = result.metrics.get("reasoning")
-                await context.session.commit()
-
-        # 更新 Pipeline 状态
-        pipeline = await WorkflowService.get_pipeline_with_stages(
-            context.pipeline_id, context.session
-        )
-
-        if pipeline:
-            if result.success:
-                await WorkflowService.set_pipeline_paused(pipeline, context.session)
-            else:
-                await WorkflowService.set_pipeline_failed(pipeline, context.session)
-                from app.core.sse_log_buffer import remove_buffer
-                remove_buffer(context.pipeline_id)
+        await self._save_stage_result(context, result)
+        await self._update_pipeline_after_stage(context, result)
 
     async def handle_error(
         self,

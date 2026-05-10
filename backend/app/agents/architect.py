@@ -40,6 +40,16 @@ class ArchitectAgent(ToolUsingAgent[ArchitectOutput]):
     # 【强制】必须使用工具探索，最多 10 次
     MAX_TOOL_CALLS = 10
 
+    # Architect 专用 JSON 截断修复字段
+    _truncated_json_fields: List[str] = [
+        '"feature_description"', '"affected_files"', '"estimated_effort"',
+        '"technical_design"', '"acceptance_criteria"', '"required_symbols"'
+    ]
+    _truncated_json_defaults: Dict[str, Any] = {
+        "acceptance_criteria": [],
+        "required_symbols": []
+    }
+
     def __init__(self):
         super().__init__(agent_name="ArchitectAgent")
 

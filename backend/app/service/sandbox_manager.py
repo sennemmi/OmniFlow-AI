@@ -226,11 +226,9 @@ class SandboxManager:
         async with self._pool_lock:
             if self._pool_initialized:
                 return
-            self._pool_initialized = True
 
         if not await self._ensure_network():
             error("预热池启动失败：Docker 网络不可用，将使用正常启动流程")
-            self._pool_initialized = False
             return
 
         success_count = 0
@@ -301,10 +299,16 @@ class SandboxManager:
             except Exception as e:
                 error(f"预热池容器 {i} 创建失败: {str(e)}")
 
+        # 初始化完成后才在锁内设置标志位（防止其他协程看到未完成的初始化）
+        async with self._pool_lock:
+            if success_count > 0:
+                self._pool_initialized = True
+            else:
+                self._pool_initialized = False
+
         # 【降级提示】如果预热池没有完全初始化，给出警告
         if success_count == 0:
             error("预热池初始化完全失败，所有 Pipeline 将使用正常启动流程（启动时间会增加 ~10-30s）")
-            self._pool_initialized = False
         elif success_count < self.POOL_SIZE:
             warning(f"预热池部分初始化成功 ({success_count}/{self.POOL_SIZE})，系统仍可运行但性能可能受影响")
         else:
@@ -345,14 +349,14 @@ class SandboxManager:
             return None
 
         # 【核心修复】创建临时目录、复制项目并设置路径
-        # 这样 DELIVERY 阶段在临时目录上执行 git 操作，不会动原始项目
+        # try/finally 确保任何异常路径下临时目录都被清理
         import tempfile
         import shutil
         from app.core.config import settings
 
         project_path = str(Path(settings.TARGET_PROJECT_PATH).resolve())
         temp_dir = tempfile.mkdtemp(prefix=f"omniflow-sandbox-{pipeline_id}-")
-
+        copy_ok = False
         try:
             shutil.copytree(
                 project_path,
@@ -363,11 +367,14 @@ class SandboxManager:
                     'node_modules', '.venv', 'venv', '.env'
                 )
             )
+            copy_ok = True
         except Exception as e:
             error(f"预热池复制项目代码到临时目录失败：{str(e)}")
-            shutil.rmtree(temp_dir, ignore_errors=True)
             await self._force_remove_container(new_name)
             return None
+        finally:
+            if not copy_ok:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
         sandbox_info = SandboxInfo(
             container_id=container_id,
@@ -841,6 +848,15 @@ class SandboxManager:
 
     # ==================== 高级工具方法 ====================
 
+    @staticmethod
+    def _sanitize_sandbox_path(path: str) -> str:
+        """防止路径穿越攻击：规范化路径并确保在 /workspace 内"""
+        workspace = Path("/workspace")
+        resolved = (workspace / path).resolve()
+        if not str(resolved).startswith(str(workspace)):
+            raise ValueError(f"路径穿越检测：{path} 尝试访问 /workspace 之外")
+        return str(resolved)
+
     async def read_file(self, pipeline_id: int, path: str) -> str:
         """
         读取容器内 /workspace/{path} 的文件内容
@@ -855,7 +871,8 @@ class SandboxManager:
         Raises:
             FileNotFoundError: 文件不存在或读取失败
         """
-        result = await self.exec(pipeline_id, f"cat /workspace/{path}")
+        safe_path = self._sanitize_sandbox_path(path)
+        result = await self.exec(pipeline_id, f"cat {safe_path}")
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr)
         return result.stdout
@@ -872,11 +889,11 @@ class SandboxManager:
         Returns:
             bool: 是否写入成功
         """
-        # 用 base64 传输内容避免引号转义问题
+        safe_path = self._sanitize_sandbox_path(path)
         b64 = base64.b64encode(content.encode()).decode()
         result = await self.exec(
             pipeline_id,
-            f"echo {b64} | base64 -d > /workspace/{path}"
+            f"echo {b64} | base64 -d > {safe_path}"
         )
         return result.exit_code == 0
 
@@ -912,8 +929,9 @@ class SandboxManager:
         Returns:
             str: 目录列表字符串
         """
+        safe_path = self._sanitize_sandbox_path(path)
         result = await self.exec(
-            pipeline_id, f"find /workspace/{path} -maxdepth {depth} -not -path '*/.git/*'"
+            pipeline_id, f"find {safe_path} -maxdepth {depth} -not -path '*/.git/*'"
         )
         return result.stdout
 

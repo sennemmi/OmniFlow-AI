@@ -4,6 +4,7 @@
 提供原子文件读写、路径安全、备份、Token 生成与验证
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -12,10 +13,10 @@ import os
 import secrets
 import shutil
 import tempfile
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from app.core.config import settings
 
@@ -47,11 +48,6 @@ class PathSecurityError(Exception):
     pass
 
 
-class ReadTokenError(Exception):
-    """Read Token 验证错误"""
-    pass
-
-
 class FileSafeIOService:
     """
     文件安全 IO 服务
@@ -63,7 +59,7 @@ class FileSafeIOService:
     4. Read Token 生成与验证
     """
 
-    BACKUP_DIR_NAME = ".devflow_backups"
+    BACKUP_DIR_NAME = ".omniflow_backups"
     MAX_BACKUP_AGE_DAYS = 7
     READ_TOKEN_EXPIRY_MINUTES = 30
 
@@ -91,7 +87,8 @@ class FileSafeIOService:
 
         # Read Token Secret
         self._read_token_secret = self._get_read_token_secret()
-        self._token_cache: Dict[str, Dict[str, Any]] = {}
+        # 已使用 token 的集合（防重放），value 为过期时间
+        self._used_tokens: Dict[str, datetime] = {}
 
     def _get_read_token_secret(self) -> str:
         """获取 Read Token 密钥"""
@@ -104,35 +101,26 @@ class FileSafeIOService:
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
     def _generate_read_token(self, file_path: str, content_hash: str) -> str:
-        """生成 Read Token"""
-        expiry = datetime.utcnow() + timedelta(minutes=self.READ_TOKEN_EXPIRY_MINUTES)
+        """生成自包含签名 Read Token（JWT-like：{base64(payload)}.{hmac}）"""
+        expiry = datetime.now(UTC) + timedelta(minutes=self.READ_TOKEN_EXPIRY_MINUTES)
         payload = {
             "path": file_path,
             "hash": content_hash,
             "exp": expiry.isoformat(),
-            "iat": datetime.utcnow().isoformat()
+            "iat": datetime.now(UTC).isoformat()
         }
-
         payload_json = json.dumps(payload, sort_keys=True)
+        payload_b64 = base64.urlsafe_b64encode(payload_json.encode('utf-8')).decode('utf-8')
         signature = hmac.new(
             self._read_token_secret.encode('utf-8'),
-            payload_json.encode('utf-8'),
+            payload_b64.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
 
-        token = f"{payload_json}.{signature}"
-        token_encoded = secrets.token_urlsafe(32)
-
-        self._token_cache[token_encoded] = {
-            "payload": payload,
-            "signature": signature,
-            "used": False
-        }
-
-        return token_encoded
+        return f"{payload_b64}.{signature}"
 
     def _verify_read_token(self, token: str, file_path: str, current_content: str) -> bool:
-        """验证 Read Token"""
+        """验证自包含签名 Read Token"""
         if not token:
             return False
 
@@ -140,44 +128,76 @@ class FileSafeIOService:
         if token == "NEW_FILE":
             return True
 
-        # 检查缓存
-        cached = self._token_cache.get(token)
-        if not cached:
-            logger.warning(f"Read Token 未找到或已过期: {token[:20]}...")
+        # 1. 解析 token 结构：{base64(payload)}.{hmac}
+        try:
+            payload_b64, signature = token.rsplit(".", 1)
+        except ValueError:
+            logger.warning("Read Token 格式无效")
             return False
 
-        # 检查是否已使用
-        if cached.get("used"):
-            logger.warning(f"Read Token 已被使用: {token[:20]}...")
+        # 2. 验证 HMAC 签名（常数时间比较防时序攻击）
+        expected_sig = hmac.new(
+            self._read_token_secret.encode('utf-8'),
+            payload_b64.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_sig):
+            logger.warning("Read Token 签名无效")
             return False
 
-        # 验证 payload
-        payload = cached["payload"]
+        # 3. 解码 payload
+        try:
+            # base64 补齐 padding
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode('utf-8')
+            payload = json.loads(payload_json)
+        except Exception:
+            logger.warning("Read Token payload 解析失败")
+            return False
 
-        # 检查路径匹配
+        # 4. 检查路径匹配
         if payload["path"] != file_path:
             logger.warning(f"Read Token 路径不匹配: {payload['path']} != {file_path}")
             return False
 
-        # 检查过期时间
+        # 5. 检查过期时间
         try:
             exp = datetime.fromisoformat(payload["exp"])
-            if datetime.utcnow() > exp:
-                logger.warning(f"Read Token 已过期")
+            if datetime.now(UTC) > exp:
+                logger.warning("Read Token 已过期")
                 return False
-        except Exception as e:
-            logger.error(f"Read Token 过期时间解析失败: {e}")
+        except Exception:
+            logger.warning("Read Token 过期时间解析失败")
             return False
 
-        # 验证内容哈希（检测文件是否被修改）
+        # 6. 验证内容哈希（检测文件是否被修改）
         current_hash = self._compute_content_hash(current_content)
         if payload["hash"] != current_hash:
-            logger.warning(f"Read Token 内容哈希不匹配，文件可能已被修改")
+            logger.warning("Read Token 内容哈希不匹配，文件可能已被修改")
+            return False
+
+        # 7. 防重放：检查是否已被使用
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        if token_hash in self._used_tokens:
+            logger.warning("Read Token 已被使用（重放攻击）")
             return False
 
         # 标记为已使用
-        cached["used"] = True
+        self._used_tokens[token_hash] = datetime.now(UTC)
+        self._cleanup_used_tokens()
         return True
+
+    def _cleanup_used_tokens(self):
+        """清理过期的已使用 token 记录，防止内存泄漏"""
+        now = datetime.now(UTC)
+        expired = [
+            h for h, t in self._used_tokens.items()
+            if (now - t).total_seconds() > self.READ_TOKEN_EXPIRY_MINUTES * 60
+        ]
+        for h in expired:
+            del self._used_tokens[h]
 
     def _validate_path(self, relative_path: str) -> Path:
         """

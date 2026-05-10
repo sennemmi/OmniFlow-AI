@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from app.agents.coder import coder_agent, CoderAgent, CoderOutput
 from app.agents.tester import tester_agent
 from app.service.sandbox_file_service import SandboxFileService
+from app.utils.file_operation_utils import clean_backend_prefix
 
 if TYPE_CHECKING:
     from app.utils.agent_debug_utils import AgentDebugger
@@ -51,12 +52,9 @@ async def run_syntax_fix_loop(
         """将各种形式的路径归一化为 file_service 可接受的相对路径"""
         if not fp:
             return fp
-        # 去除 /workspace/backend/ 或 /workspace/ 前缀（沙箱日志中的绝对路径）
+        # 去除 /workspace/ 前缀（沙箱日志中的绝对路径），然后清理 backend/ 前缀
         fp = fp.replace('/workspace/backend/', '').replace('/workspace/', '')
-        # 去除开头的 backend/（偶发的嵌套前缀）
-        while fp.startswith('backend/') or fp.startswith('backend\\'):
-            fp = fp.replace('backend/', '', 1).replace('backend\\', '', 1)
-        return fp.lstrip('/')
+        return clean_backend_prefix(fp)
 
     for attempt in range(max_retries):
         logger.info(f"语法错误自动修复 第 {attempt + 1}/{max_retries} 次")

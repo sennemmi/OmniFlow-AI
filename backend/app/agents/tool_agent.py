@@ -79,6 +79,175 @@ class ToolUsingAgent(LangGraphAgent[T]):
             logger.info(f"[{self.agent_name}] AgentTools 已重新创建, agent_role={agent_role!r}")
         return self._agent_tools
 
+    def _build_llm_call_params(
+        self,
+        messages: List[Dict],
+        tools: List[Dict],
+        temperature: float,
+        current_max_tokens: int,
+        response_format: Optional[Dict[str, Any]],
+        is_final_output: bool,
+    ) -> Dict[str, Any]:
+        """构建 litellm 调用参数"""
+        params = {
+            "model": settings.llm_model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": temperature,
+            "max_tokens": current_max_tokens,
+            "api_key": settings.llm_api_key,
+            "api_base": settings.llm_api_base,
+            "custom_llm_provider": "openai",
+        }
+        if is_final_output and response_format:
+            params["response_format"] = response_format
+            logger.info(f"[{self.agent_name}] 最终输出阶段使用结构化输出: {response_format}")
+        return params
+
+    def _is_context_overflow_error(self, error_str: str) -> bool:
+        """检测是否是上下文超限错误"""
+        return (
+            "choices': None" in error_str
+            or "choices is None" in error_str
+            or ("completion_tokens': 0" in error_str and "prompt_tokens': 0" in error_str)
+            or "context length exceeded" in error_str.lower()
+            or "maximum context length" in error_str.lower()
+        )
+
+    async def _execute_tool_calls(
+        self,
+        message,
+        tools: List[Dict],
+        agent_tools: "AgentTools",
+        pipeline_id: int,
+        messages: List[Dict],
+    ) -> tuple[List[Dict], int, bool, bool]:
+        """执行单次 LLM 响应中的所有 tool_calls。
+        返回 (tool_results, consecutive_code_apply_failures, switched_to_legacy, should_continue)
+        """
+        tool_results = []
+        consecutive_failures = 0
+        switched_to_legacy = False
+
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+
+            available_tools = {t["function"]["name"] for t in tools}
+            if tool_name not in available_tools:
+                logger.warning(f"[{self.agent_name}] 工具 {tool_name} 不可用，跳过")
+                result = json.dumps({"success": False, "error": f"工具 {tool_name} 不可用"})
+                tool_results.append({"tool": tool_name, "arguments": tool_args, "result": {"success": False, "error": "工具不可用"}, "success": False})
+                continue
+
+            logger.info(f"[{self.agent_name}] Executing tool: {tool_name}({tool_args})")
+            result = await agent_tools.execute_tool(tool_name, tool_args, pipeline_id)
+
+            try:
+                result_data = json.loads(result)
+                tool_results.append({"tool": tool_name, "arguments": tool_args, "result": result_data, "success": result_data.get("success", True)})
+                if tool_name == "code_apply":
+                    if not result_data.get("success", False):
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3 and not switched_to_legacy:
+                            switched_to_legacy = True
+                            logger.warning(f"[{self.agent_name}] code_apply 连续失败，切换到 LEGACY 模式")
+                            messages.append({
+                                "role": "user",
+                                "content": "【流程切换通知】code_apply 多次失败，系统已切换为 LEGACY 模式。请直接输出完整 JSON 格式。"
+                            })
+                    else:
+                        consecutive_failures = 0
+            except Exception:
+                tool_results.append({"tool": tool_name, "arguments": tool_args, "result": result, "success": True})
+
+            # 截断过长的工具结果
+            MAX_TOOL_RESULT_CHARS = 8000
+            tool_content = result
+            if len(result) > MAX_TOOL_RESULT_CHARS:
+                try:
+                    result_obj = json.loads(result)
+                    if "lines" in result_obj and len(result_obj["lines"]) > MAX_TOOL_RESULT_CHARS:
+                        result_obj["lines"] = result_obj["lines"][:MAX_TOOL_RESULT_CHARS] + "\n... [已截断]"
+                        result_obj["truncated"] = True
+                        tool_content = json.dumps(result_obj, ensure_ascii=False)
+                except (json.JSONDecodeError, KeyError):
+                    tool_content = result[:MAX_TOOL_RESULT_CHARS] + "\n... [内容已截断]"
+
+            messages.append({"role": "tool", "content": tool_content, "tool_call_id": tool_call.id})
+
+        # 检查总上下文是否过大
+        MAX_CONTEXT_CHARS = 60000
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        should_continue = True
+        if total_chars > MAX_CONTEXT_CHARS:
+            logger.warning(f"[{self.agent_name}] 上下文过大 ({total_chars} chars)，请求 LLM 输出简短结论")
+            messages.append({
+                "role": "user",
+                "content": "上下文已接近上限，请立即基于以上信息输出简短 JSON 结论，不要再调用工具。"
+            })
+
+        return tool_results, consecutive_failures, switched_to_legacy, should_continue
+
+    async def _force_final_output(
+        self,
+        messages: List[Dict],
+        response_format: Optional[Dict[str, Any]],
+        total_input_tokens: int,
+        total_output_tokens: int,
+        tool_call_count: int,
+        tool_results: List[Dict],
+    ) -> Dict[str, Any]:
+        """达到最大工具调用次数后强制输出最终答案"""
+        import litellm
+
+        logger.warning(f"[{self.agent_name}] Max tool calls ({self.MAX_TOOL_CALLS}) reached, forcing final output")
+        messages.append({
+            "role": "user",
+            "content": f"已达到最大工具调用次数（{self.MAX_TOOL_CALLS}次）。请基于已获取的信息立即输出最终答案，不要再使用任何工具。直接输出 JSON 格式的结果。"
+        })
+
+        try:
+            final_call_params = {
+                "model": settings.llm_model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 16384,
+                "api_key": settings.llm_api_key,
+                "api_base": settings.llm_api_base,
+                "custom_llm_provider": "openai",
+            }
+            if response_format:
+                final_call_params["response_format"] = response_format
+
+            response = await litellm.acompletion(**final_call_params)
+            if response.usage:
+                total_input_tokens += response.usage.prompt_tokens or 0
+                total_output_tokens += response.usage.completion_tokens or 0
+
+            content = response.choices[0].message.content or ""
+            logger.info(f"[{self.agent_name}] 最终输出内容长度: {len(content)} 字符")
+
+            return {
+                "content": content,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "tool_calls": tool_call_count,
+                "tool_results": tool_results,
+                "note": f"工具调用达到上限({self.MAX_TOOL_CALLS})后强制输出"
+            }
+        except Exception as e:
+            logger.error(f"[{self.agent_name}] 强制输出时出错: {e}")
+            return {
+                "content": "",
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "tool_calls": tool_call_count,
+                "tool_results": tool_results,
+                "error": f"Max tool calls reached and final output failed: {e}"
+            }
+
     async def _call_llm_with_tools(
         self,
         system_prompt: str,
@@ -106,11 +275,9 @@ class ToolUsingAgent(LangGraphAgent[T]):
         Returns:
             Dict: {content, input_tokens, output_tokens, tool_calls, tool_results}
         """
-        # 获取工具定义（传入 pipeline_id 以便 install_dependency 工具使用）
         agent_tools = self._get_agent_tools(project_path, pipeline_id)
         tools = agent_tools.tool_definitions
 
-        # 构建消息
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -119,235 +286,75 @@ class ToolUsingAgent(LangGraphAgent[T]):
         total_input_tokens = 0
         total_output_tokens = 0
         tool_call_count = 0
-        tool_results = []  # 记录所有工具执行结果
-        consecutive_code_apply_failures = 0  # code_apply 连续失败计数
-        switched_to_legacy_mode = False  # 是否已切换到 LEGACY 模式
-
-        # 【重试机制】空内容重试计数
+        tool_results: List[Dict] = []
+        consecutive_code_apply_failures = 0
+        switched_to_legacy_mode = False
         empty_content_retries = 0
 
         while tool_call_count < self.MAX_TOOL_CALLS:
             try:
-                # 调用 LLM（带工具）
                 import litellm
 
-                # 【关键】区分工具调用和最终输出的 max_tokens
-                # 工具调用阶段使用较小值（1000），最终输出阶段使用传入的值
                 has_recent_tool_calls = any(
                     m.get("role") == "assistant" and m.get("tool_calls")
-                    for m in messages[-3:]  # 检查最近3条消息是否有工具调用
+                    for m in messages[-3:]
                 )
-                # 最终输出：没有最近工具调用，或者已经达到最大工具调用次数
                 is_final_output = not has_recent_tool_calls or tool_call_count >= self.MAX_TOOL_CALLS - 1
 
+                current_max_tokens = (max_tokens if (is_final_output and max_tokens) else 1000)
                 if is_final_output and max_tokens:
-                    # 最终输出阶段，使用完整的 max_tokens
-                    current_max_tokens = max_tokens
                     logger.info(f"[{self.agent_name}] 最终输出阶段，使用 max_tokens={max_tokens}")
-                else:
-                    # 工具调用阶段，使用较小的 max_tokens 节省预算
-                    current_max_tokens = 1000
-                    logger.debug(f"[{self.agent_name}] 工具调用阶段，使用 max_tokens=1000")
 
-                # 构建调用参数
-                call_params = {
-                    "model": settings.llm_model,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto",  # 允许模型选择是否使用工具
-                    "temperature": temperature,
-                    "max_tokens": current_max_tokens,
-                    "api_key": settings.llm_api_key,
-                    "api_base": settings.llm_api_base,
-                    "custom_llm_provider": "openai"  # 强制使用 OpenAI 兼容方式
-                }
-
-                # 【结构化输出】最终输出阶段，如果指定了 response_format，则使用结构化输出
-                if is_final_output and response_format:
-                    call_params["response_format"] = response_format
-                    logger.info(f"[{self.agent_name}] 最终输出阶段使用结构化输出: {response_format}")
+                call_params = self._build_llm_call_params(
+                    messages, tools, temperature, current_max_tokens, response_format, is_final_output
+                )
 
                 response = await litellm.acompletion(**call_params)
 
-                # 记录 Token 使用
                 if response.usage:
                     total_input_tokens += response.usage.prompt_tokens or 0
                     total_output_tokens += response.usage.completion_tokens or 0
 
                 message = response.choices[0].message
 
-                # 检查是否是工具调用
                 if message.tool_calls:
                     tool_call_count += 1
                     logger.info(f"[{self.agent_name}] Tool call #{tool_call_count}")
 
-                    # 添加助手消息（包含 tool_calls）
-                    # 【DeepSeek Thinking Mode】需要传递 reasoning_content
                     assistant_message = {
                         "role": "assistant",
                         "content": message.content or "",
                         "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": tc.type,
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments
-                                }
-                            }
+                            {"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                             for tc in message.tool_calls
                         ]
                     }
-                    # 如果存在 reasoning_content，添加到消息中（DeepSeek 需要）
                     reasoning_content = getattr(message, 'reasoning_content', None)
                     if reasoning_content:
                         assistant_message["reasoning_content"] = reasoning_content
                     messages.append(assistant_message)
 
-                    # 执行工具调用（支持异步工具）
-                    for tool_call in message.tool_calls:
-                        tool_name = tool_call.function.name
-                        tool_args = json.loads(tool_call.function.arguments)
-
-                        # 【权限控制】检查工具是否在允许列表中
-                        available_tools = {t["function"]["name"] for t in tools}
-                        if tool_name not in available_tools:
-                            logger.warning(f"[{self.agent_name}] 工具 {tool_name} 不在可用列表中，跳过执行")
-                            result = json.dumps({
-                                "success": False,
-                                "error": f"工具 {tool_name} 不可用。可用工具: {', '.join(available_tools)}"
-                            })
-                            tool_results.append({
-                                "tool": tool_name,
-                                "arguments": tool_args,
-                                "result": {"success": False, "error": "工具不可用"},
-                                "success": False
-                            })
-                            continue
-
-                        logger.info(f"[{self.agent_name}] Executing tool: {tool_name}({tool_args})")
-
-                        # 执行工具（传入 pipeline_id 用于日志推送）
-                        result = await agent_tools.execute_tool(tool_name, tool_args, pipeline_id)
-
-                        # 记录工具结果
-                        try:
-                            result_data = json.loads(result)
-                            tool_results.append({
-                                "tool": tool_name,
-                                "arguments": tool_args,
-                                "result": result_data,
-                                "success": result_data.get("success", True)
-                            })
-
-                            # 【智能回退】检测 code_apply 连续失败
-                            if tool_name == "code_apply":
-                                if not result_data.get("success", False):
-                                    consecutive_code_apply_failures += 1
-                                    logger.warning(
-                                        f"[{self.agent_name}] code_apply 连续失败 {consecutive_code_apply_failures} 次"
-                                    )
-
-                                    if consecutive_code_apply_failures >= 3 and not switched_to_legacy_mode:
-                                        # 自动切换到 LEGACY 模式
-                                        switched_to_legacy_mode = True
-                                        logger.warning(
-                                            f"[{self.agent_name}] code_apply 连续失败 {consecutive_code_apply_failures} 次,"
-                                            f"切换到 LEGACY 模式(生成完整文件)"
-                                        )
-                                        # 注入切换指令到 messages
-                                        messages.append({
-                                            "role": "user",
-                                            "content": (
-                                                "【流程切换通知】由于 code_apply 工具多次失败,"
-                                                "系统已自动切换为 LEGACY 模式。请直接输出完整的 JSON 格式,"
-                                                "包含所有文件的 search_block/replace_block。"
-                                            )
-                                        })
-                                else:
-                                    # 成功后重置计数器
-                                    consecutive_code_apply_failures = 0
-                        except:
-                            tool_results.append({
-                                "tool": tool_name,
-                                "arguments": tool_args,
-                                "result": result,
-                                "success": True
-                            })
-
-                        # 【层面一】工具返回内容截断，防止上下文爆炸
-                        MAX_TOOL_RESULT_CHARS = 8000  # 约 2000 tokens
-
-                        tool_content = result
-                        if len(result) > MAX_TOOL_RESULT_CHARS:
-                            # 解析 JSON，只截断 lines 字段，保留元信息
-                            try:
-                                result_obj = json.loads(result)
-                                if "lines" in result_obj:
-                                    lines_text = result_obj["lines"]
-                                    if len(lines_text) > MAX_TOOL_RESULT_CHARS:
-                                        kept_lines = lines_text[:MAX_TOOL_RESULT_CHARS]
-                                        result_obj["lines"] = kept_lines + f"\n... [已截断，原文件共 {result_obj.get('total_lines', '?')} 行，超出部分省略]"
-                                        result_obj["truncated"] = True
-                                        tool_content = json.dumps(result_obj, ensure_ascii=False)
-                            except (json.JSONDecodeError, KeyError):
-                                tool_content = result[:MAX_TOOL_RESULT_CHARS] + "\n... [内容已截断]"
-
-                        # 添加工具结果到消息
-                        messages.append({
-                            "role": "tool",
-                            "content": tool_content,
-                            "tool_call_id": tool_call.id
-                        })
-
-                    # 【层面二】防止总消息历史过大
-                    MAX_CONTEXT_CHARS = 60000  # Kimi-K2.5 约 128K tokens，留 50% 安全边距
-
-                    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-                    if total_chars > MAX_CONTEXT_CHARS:
-                        logger.warning(
-                            f"[{self.agent_name}] 上下文过大 ({total_chars} chars)，"
-                            f"停止工具调用，请求 LLM 输出简短结论"
-                        )
-                        # 【修复】不再直接返回 fallback，而是让 LLM 基于已有信息输出简短 JSON
-                        # 添加提示消息，要求 LLM 输出简短结论
-                        messages.append({
-                            "role": "user",
-                            "content": "上下文已接近上限，请立即基于以上信息输出简短 JSON 结论（不要详细设计，只输出核心字段），不要再调用工具。"
-                        })
-                        # 继续循环，让 LLM 输出最终答案
-                        continue
-
-                    # 继续循环，让 LLM 基于工具结果继续思考
+                    new_tool_results, consecutive_code_apply_failures, switched = await self._execute_tool_calls(
+                        message, tools, agent_tools, pipeline_id, messages
+                    )
+                    tool_results.extend(new_tool_results)
+                    if switched:
+                        switched_to_legacy_mode = True
                     continue
 
-                # 不是工具调用，返回最终答案
-                # 【调试】记录 message.content 的详细信息
+                # 非工具调用 — 返回最终答案
                 if message.content:
                     logger.info(f"[{self.agent_name}] LLM 返回内容长度: {len(message.content)} 字符")
-                    logger.info(f"[{self.agent_name}] LLM 返回内容前200字符: {repr(message.content[:200])}")
-                    logger.info(f"[{self.agent_name}] LLM 返回内容后200字符: {repr(message.content[-200:])}")
-                    # 检查 finish_reason
-                    if hasattr(response.choices[0], 'finish_reason'):
-                        finish_reason = response.choices[0].finish_reason
-                        logger.info(f"[{self.agent_name}] LLM finish_reason: {finish_reason}")
-                        if finish_reason == 'length':
-                            logger.error(f"[{self.agent_name}] LLM 输出因长度限制被截断！")
+                    if hasattr(response.choices[0], 'finish_reason') and response.choices[0].finish_reason == 'length':
+                        logger.error(f"[{self.agent_name}] LLM 输出因长度限制被截断！")
+                elif empty_content_retries < max_retries:
+                    empty_content_retries += 1
+                    logger.warning(f"[{self.agent_name}] 空内容重试 {empty_content_retries}/{max_retries}")
+                    messages.append({"role": "user", "content": "你刚才没有返回任何内容。请确保输出有效的 JSON 格式的回答。"})
+                    continue
                 else:
-                    logger.warning(f"[{self.agent_name}] LLM 返回空内容")
-                    # 【重试机制】如果返回空内容且未达到最大重试次数，则重试
-                    if empty_content_retries < max_retries:
-                        empty_content_retries += 1
-                        logger.warning(f"[{self.agent_name}] 空内容重试 {empty_content_retries}/{max_retries}")
-                        # 添加提示消息，要求 LLM 输出有效内容
-                        messages.append({
-                            "role": "user",
-                            "content": "你刚才没有返回任何内容。请确保输出有效的 JSON 格式的回答，不要返回空内容。"
-                        })
-                        continue  # 继续循环，重新调用 LLM
-                    else:
-                        logger.error(f"[{self.agent_name}] 空内容重试次数已达上限 ({max_retries})，放弃重试")
-                
+                    logger.error(f"[{self.agent_name}] 空内容重试已达上限 ({max_retries})")
+
                 return {
                     "content": message.content,
                     "input_tokens": total_input_tokens,
@@ -360,21 +367,8 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 error_str = str(e)
                 logger.error(f"[{self.agent_name}] LLM call with tools failed: {e}")
 
-                # 【层面三】识别"上下文超限"导致的空响应（不可重试，重试只会再次超限）
-                is_context_overflow = (
-                    "choices': None" in error_str or
-                    "choices is None" in error_str or
-                    ("completion_tokens': 0" in error_str and "prompt_tokens': 0" in error_str) or
-                    "context length exceeded" in error_str.lower() or
-                    "maximum context length" in error_str.lower()
-                )
-
-                if is_context_overflow:
-                    logger.warning(
-                        f"[{self.agent_name}] 检测到上下文超限（choices=None），"
-                        f"已完成 {tool_call_count} 次工具调用，尝试从已有结果构建输出"
-                    )
-                    # 不抛异常，而是尝试从已有工具结果降级输出
+                if self._is_context_overflow_error(error_str):
+                    logger.warning(f"[{self.agent_name}] 上下文超限，尝试降级输出")
                     fallback = self._build_output_from_tool_results(tool_results)
                     if fallback:
                         return {
@@ -383,82 +377,18 @@ class ToolUsingAgent(LangGraphAgent[T]):
                             "output_tokens": total_output_tokens,
                             "tool_calls": tool_call_count,
                             "tool_results": tool_results,
-                            "fallback_output": fallback,  # 标记为降级输出
+                            "fallback_output": fallback,
                             "error": "context_overflow_with_fallback"
                         }
-                    # 没有 fallback，才真正抛出
                     raise RuntimeError(
-                        f"上下文超限且无法降级：已读取文件过多或单文件过大。"
-                        f"工具调用次数={tool_call_count}"
+                        f"上下文超限且无法降级：工具调用次数={tool_call_count}"
                     ) from e
-
-                # 其他错误正常抛出
                 raise
 
-        # 达到最大工具调用次数 - 不再直接返回错误，而是让 AI 直接输出内容
-        logger.warning(f"[{self.agent_name}] Max tool calls ({self.MAX_TOOL_CALLS}) reached, forcing final output")
-
-        # 添加提示消息，要求 AI 立即输出最终答案，不再使用工具
-        messages.append({
-            "role": "user",
-            "content": f"已达到最大工具调用次数（{self.MAX_TOOL_CALLS}次）。请基于已获取的信息立即输出最终答案，不要再使用任何工具。直接输出 JSON 格式的结果。"
-        })
-
-        # 继续调用 LLM，让 AI 直接输出内容
-        try:
-            import litellm
-
-            logger.info(f"[{self.agent_name}] 调用 LLM 输出最终答案（工具调用已达上限）")
-
-            # 构建调用参数
-            final_call_params = {
-                "model": settings.llm_model,
-                "messages": messages,
-                "temperature": 0.0,
-                # 【防截断补丁】在逃生舱模式下，必须给予足够的 Token 输出超长文件
-                "max_tokens": 16384,
-                "api_key": settings.llm_api_key,
-                "api_base": settings.llm_api_base,
-                "custom_llm_provider": "openai"
-            }
-            
-            # 【关键】如果指定了 response_format，在最终输出阶段使用它
-            if response_format:
-                final_call_params["response_format"] = response_format
-                logger.info(f"[{self.agent_name}] 强制输出阶段使用结构化输出: {response_format}")
-
-            response = await litellm.acompletion(**final_call_params)
-
-            # 记录 Token 使用
-            if response.usage:
-                total_input_tokens += response.usage.prompt_tokens or 0
-                total_output_tokens += response.usage.completion_tokens or 0
-
-            message = response.choices[0].message
-            content = message.content or ""
-
-            logger.info(f"[{self.agent_name}] 最终输出内容长度: {len(content)} 字符")
-
-            return {
-                "content": content,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tool_calls": tool_call_count,
-                "tool_results": tool_results,
-                "note": f"工具调用达到上限({self.MAX_TOOL_CALLS})后强制输出"
-            }
-
-        except Exception as e:
-            logger.error(f"[{self.agent_name}] 强制输出时出错: {e}")
-            # 如果强制输出也失败，返回错误
-            return {
-                "content": "",
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tool_calls": tool_call_count,
-                "tool_results": tool_results,
-                "error": f"Max tool calls reached and final output failed: {e}"
-            }
+        return await self._force_final_output(
+            messages, response_format, total_input_tokens, total_output_tokens,
+            tool_call_count, tool_results
+        )
 
     async def execute(
         self,

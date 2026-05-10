@@ -40,41 +40,17 @@ class FileChange(BaseModel):
     fallback_start_line: Optional[int] = Field(None, description="备用起始行号")
     fallback_end_line: Optional[int] = Field(None, description="备用结束行号")
 
-    # 【行号格式 - 向后兼容】
-    start_line: Optional[int] = Field(None, description="起始行号(1-based, 包含)")
-    end_line: Optional[int] = Field(None, description="结束行号(1-based, 包含)")
+    # 【行号格式 — 已弃用，请使用 fallback_start_line/fallback_end_line】
+    start_line: Optional[int] = Field(None, deprecated=True, description="已弃用")
+    end_line: Optional[int] = Field(None, deprecated=True, description="已弃用")
 
     # 仅用于新建文件 (change_type="add")
     content: Optional[str] = Field(None, description="完整文件内容（仅 add 时使用）")
 
-    # 可选：用于验证的原始代码片段（帮助检测行号漂移）
-    expected_original: Optional[str] = Field(None, description="预期被替换的原始代码片段（用于验证）")
+    # 【已弃用】曾用于验证行号漂移
+    expected_original: Optional[str] = Field(None, deprecated=True, description="已弃用")
 
     description: str = Field("", description="改动说明")
-
-
-class SearchReplaceChange(BaseModel):
-    """
-    搜索替换变更模型 - Claude Code 风格
-
-    基于精确搜索-替换块的方式，比行号更稳定，避免行号漂移问题。
-    """
-    file_path: str = Field(description="文件相对路径")
-    change_type: str = Field(description="变更类型: add | modify | delete")
-
-    # 用于 modify：搜索块和替换块
-    search_block: Optional[str] = Field(None, description="精确要替换的旧代码块")
-    replace_block: Optional[str] = Field(None, description="新代码块")
-
-    # 用于 add：完整文件内容
-    content: Optional[str] = Field(None, description="完整文件内容（仅 add 时使用）")
-
-    # 通用的描述字段
-    description: str = Field("", description="改动说明")
-
-    # 可选的行号备用方案（当搜索块匹配失败时，回退到行号）
-    fallback_start_line: Optional[int] = Field(None, description="备用起始行号")
-    fallback_end_line: Optional[int] = Field(None, description="备用结束行号")
 
 
 class TestFile(BaseModel):

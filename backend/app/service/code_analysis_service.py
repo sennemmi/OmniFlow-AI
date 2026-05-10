@@ -7,7 +7,7 @@
 import ast
 import logging
 from pathlib import Path
-from typing import List, Optional, Set, Dict, Any
+from typing import List, Optional, Dict, Any
 
 from app.core.config import settings
 
@@ -194,91 +194,6 @@ class CodeAnalysisService:
                         related_tests.append(pattern)
 
         return related_tests
-
-    def analyze_project_structure(self) -> Dict[str, Any]:
-        """
-        分析项目结构
-
-        Returns:
-            Dict: 项目结构信息
-        """
-        structure = {
-            "total_files": 0,
-            "python_files": 0,
-            "test_files": 0,
-            "api_files": [],
-            "service_files": [],
-            "model_files": [],
-            "other_files": []
-        }
-
-        try:
-            for py_file in self.project_root.rglob("*.py"):
-                rel_path = str(py_file.relative_to(self.project_root))
-                structure["total_files"] += 1
-                structure["python_files"] += 1
-
-                if "test_" in rel_path or "_test.py" in rel_path:
-                    structure["test_files"] += 1
-                elif "/api/" in rel_path or "api_" in rel_path:
-                    structure["api_files"].append(rel_path)
-                elif "/service/" in rel_path:
-                    structure["service_files"].append(rel_path)
-                elif "/models/" in rel_path or "/model/" in rel_path:
-                    structure["model_files"].append(rel_path)
-                else:
-                    structure["other_files"].append(rel_path)
-
-        except Exception as e:
-            logger.error(f"分析项目结构失败: {e}")
-
-        return structure
-
-    def find_import_cycles(self, file_path: str, visited: Optional[Set[str]] = None) -> List[List[str]]:
-        """
-        查找循环导入（简化版）
-
-        Args:
-            file_path: 起始文件路径
-            visited: 已访问文件集合
-
-        Returns:
-            List[List[str]]: 发现的循环导入链
-        """
-        if visited is None:
-            visited = set()
-
-        cycles = []
-
-        if file_path in visited:
-            return [[file_path]]  # 发现循环
-
-        visited.add(file_path)
-
-        abs_path = self.project_root / file_path
-        if not abs_path.exists():
-            return cycles
-
-        try:
-            content = abs_path.read_text(encoding='utf-8')
-            imports = self.extract_imports_from_content(content)
-
-            for imp in imports:
-                if imp.startswith('app.') or imp.startswith('backend.'):
-                    dep_file = self.find_file_by_module(imp)
-                    if dep_file and dep_file != file_path:
-                        sub_cycles = self.find_import_cycles(dep_file, visited.copy())
-                        for cycle in sub_cycles:
-                            if file_path in cycle:
-                                cycles.append([file_path] + cycle)
-                            else:
-                                cycles.append(cycle)
-
-        except Exception as e:
-            logger.error(f"查找循环导入失败: {e}")
-
-        return cycles
-
 
 # 单例实例
 code_analysis = CodeAnalysisService()

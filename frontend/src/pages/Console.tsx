@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Plus,
   GitBranch,
@@ -35,10 +35,12 @@ export function Console() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<Template | null>(null);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   // 获取统计数据
   const {
     data: stats,
+    refetch: refetchStats,
   } = useQuery<SystemStats>({
     queryKey: ['system-stats'],
     queryFn: () => apiGet('/system/stats'),
@@ -49,6 +51,7 @@ export function Console() {
   const {
     data: pipelinesData,
     isLoading: isLoadingPipelines,
+    refetch: refetchPipelines,
   } = useQuery<PipelineListResponse>({
     queryKey: ['pipelines'],
     queryFn: () => apiGet('/pipelines'),
@@ -56,9 +59,9 @@ export function Console() {
 
   const pipelines = pipelinesData?.pipelines || [];
 
-  // 硬刷新 - 浏览器页面重载
   const handleRefresh = () => {
-    window.location.reload();
+    queryClient.invalidateQueries({ queryKey: ['system-stats'] });
+    queryClient.invalidateQueries({ queryKey: ['pipelines'] });
   };
 
   // 快捷操作：Cmd+K 打开创建弹窗

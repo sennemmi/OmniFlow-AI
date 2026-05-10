@@ -2,6 +2,7 @@
 数据库连接管理
 """
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import SQLModel
@@ -22,7 +23,6 @@ def _get_engine_args():
         # SQLite 连接池配置
         # - pool_pre_ping: 连接前检查连接是否有效
         # - pool_recycle: 连接回收时间（秒）
-        # - connect_args: 连接参数
         args.update({
             "pool_pre_ping": True,
             "pool_recycle": 3600,  # 1小时回收连接
@@ -30,8 +30,6 @@ def _get_engine_args():
                 # 设置 SQLite 超时时间（秒）
                 # 当数据库被锁定时，等待最多 30 秒
                 "timeout": 30,
-                # 启用 WAL 模式提高并发性能
-                # "check_same_thread": False,  # 异步模式下不需要
             }
         })
     
@@ -69,7 +67,19 @@ async def init_db():
         # 导入所有模型以确保它们被注册
         from app.models.pipeline import Pipeline, PipelineStage
 
+        # SQLite: 启用 WAL 模式提高并发写入性能
+        if settings.DATABASE_URL.startswith("sqlite"):
+            await conn.run_sync(lambda c: c.execute("PRAGMA journal_mode=WAL"))
+
         await conn.run_sync(SQLModel.metadata.create_all)
+
+    # SQLite: 为后续连接也启用 WAL 模式
+    if settings.DATABASE_URL.startswith("sqlite"):
+        @event.listens_for(engine.sync_engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
 
     # 设置 SQLAlchemy 慢查询监听
     from app.core.logging import setup_sqlalchemy_logging

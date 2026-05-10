@@ -145,11 +145,3 @@ class PipelineRead(SQLModel):
 class PipelineCreate(SQLModel):
     """Pipeline 创建模型 - 用于 API 请求"""
     description: str
-
-
-class ArchitectOutput(SQLModel):
-    """架构师 Agent 输出结构"""
-    feature_description: str = Field(description="功能描述")
-    affected_files: List[str] = Field(description="受影响文件列表")
-    estimated_effort: str = Field(description="预估工作量")
-    technical_design: Optional[str] = Field(default=None, description="技术设计方案")

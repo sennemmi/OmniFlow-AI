@@ -64,34 +64,18 @@ export function Pipelines() {
 
     setDeletingId(id);
     try {
-      console.log(`[DEBUG] 开始删除 Pipeline ${id}`);
       const response = await apiDelete(`/pipeline/${id}`);
-      console.log(`[DEBUG] 删除响应:`, response);
-      
+
       if (response.success) {
         addToast({ message: `流水线 #${id} 已删除`, type: 'success' });
-        
-        // 【关键修复】使用乐观更新，立即从缓存中移除该 Pipeline
-        const currentData = queryClient.getQueryData(['pipelines']);
-        console.log(`[DEBUG] 当前缓存数据:`, currentData);
-        
+
         queryClient.setQueryData(['pipelines'], (oldData: PipelineListResponse | undefined) => {
-          console.log(`[DEBUG] setQueryData 回调, oldData:`, oldData);
           if (!oldData) return oldData;
-          const newData = {
+          return {
             ...oldData,
-            pipelines: oldData.pipelines.filter((p) => {
-              console.log(`[DEBUG] 比较 p.id=${p.id} (${typeof p.id}) vs id=${id} (${typeof id}), 结果:`, p.id !== id);
-              return p.id !== id;
-            }),
+            pipelines: oldData.pipelines.filter((p) => p.id !== id),
           };
-          console.log(`[DEBUG] 新数据:`, newData);
-          return newData;
         });
-        
-        // 验证更新后的数据
-        const updatedData = queryClient.getQueryData(['pipelines']);
-        console.log(`[DEBUG] 更新后的缓存数据:`, updatedData);
         
         // 从选中项中移除
         setSelectedItems((prev) => {
@@ -492,7 +476,7 @@ interface ListViewProps {
   onSort: (field: SortField) => void;
   sortField: SortField;
   sortOrder: SortOrder;
-  statusConfig: Record<string, any>;
+  statusConfig: StatusDisplayConfig;
   onNavigate: (path: string) => void;
   onDelete: (id: number, e?: React.MouseEvent) => void;
   deletingId: number | null;
@@ -665,10 +649,12 @@ function ListView({
   );
 }
 
+type StatusDisplayConfig = Record<string, { icon: React.ComponentType<{ className?: string }>; label: string; color: string; bgColor: string; borderColor: string; dotColor: string }>;
+
 // 网格视图
 interface GridViewProps {
   pipelines: PipelineListItem[];
-  statusConfig: Record<string, any>;
+  statusConfig: StatusDisplayConfig;
   onNavigate: (path: string) => void;
 }
 

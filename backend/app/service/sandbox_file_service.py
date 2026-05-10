@@ -250,88 +250,40 @@ class SandboxFileService:
 
     async def _write_file_safe(self, full_path: str, content: str) -> Dict[str, Any]:
         """
-        【改进】使用更安全的写入方式
+        使用 python3 在沙箱内解码写入，避免 shell 转义和命令行长度限制。
 
-        使用 cat > file <<'EOF' 语法，避免 shell 转义问题
+        将内容通过标准输入传给 python3 脚本，由脚本完成 base64 解码和写入。
         """
         try:
-            # 使用 base64 编码 + 管道写入，避免转义问题
-            encoded_content = base64.b64encode(content.encode()).decode()
+            import shlex
 
-            # 【新增】防止 Windows 命令行参数过长导致写入失败
-            # Windows 命令行参数长度限制约为 8191 字符，留有余量使用 7000 作为阈值
-            MAX_CMD_ARG_LENGTH = 7000
-            if len(encoded_content) > MAX_CMD_ARG_LENGTH:
-                logger.info(f"[SandboxFileService] 文件过大 ({len(encoded_content)} 字符)，使用分块写入")
-                return await self._write_file_fallback(full_path, encoded_content)
+            encoded = base64.b64encode(content.encode()).decode()
+            safe_path = shlex.quote(full_path)
 
-            # 方案 1：使用 printf 和管道（更可靠）
-            # 【修复】路径加单引号防止空格问题
-            write_cmd = f"printf '%s' '{encoded_content}' | base64 -d > '{full_path}'"
+            # 通过 heredoc 将 base64 内容安全地传给 python3
+            # 使用 python3 而非管道避免 shell 转义导致的 base64 损坏
+            cmd = (
+                f"python3 -c \""
+                f"import base64, sys; "
+                f"data = base64.b64decode(sys.argv[1]); "
+                f"open({safe_path}, 'wb').write(data)"
+                f"\" {shlex.quote(encoded)}"
+            )
+
             exec_result = await sandbox_manager.exec(
                 self.pipeline_id,
-                write_cmd,
+                cmd,
                 timeout=30
             )
 
             if exec_result.exit_code != 0:
-                logger.error(f"[SandboxFileService] 安全写入失败：{exec_result.stderr}")
-
-                # 方案 2：回退到旧的 echo 分块方式（带重试）
-                logger.info(f"[SandboxFileService] 尝试回退写入方式...")
-                return await self._write_file_fallback(full_path, encoded_content)
+                error_msg = exec_result.stderr.strip() if exec_result.stderr else "未知错误"
+                logger.error(f"[SandboxFileService] python3 写入失败: {error_msg}")
+                return {"success": False, "error": f"文件写入失败: {error_msg}"}
 
             return {"success": True}
         except Exception as e:
-            logger.error(f"[SandboxFileService] 安全写入异常：{e}")
-            return {"success": False, "error": str(e)}
-
-    async def _write_file_fallback(self, full_path: str, encoded_content: str) -> Dict[str, Any]:
-        """
-        【回退方案】使用分段 echo 写入
-
-        当安全写入失败时使用，带重试机制
-        """
-        try:
-            chunk_size = 4000
-            chunks = [encoded_content[i:i+chunk_size] for i in range(0, len(encoded_content), chunk_size)]
-
-            # 先清空文件
-            # 【修复】路径加单引号防止空格问题
-            clear_result = await sandbox_manager.exec(
-                self.pipeline_id,
-                f"> '{full_path}'",
-                timeout=10
-            )
-
-            if clear_result.exit_code != 0:
-                return {"success": False, "error": f"清空文件失败: {clear_result.stderr}"}
-
-            # 分块写入
-            for i, chunk in enumerate(chunks):
-                # 【修复】路径加单引号防止空格问题
-                write_cmd = f"echo -n '{chunk}' >> '{full_path}'"
-                exec_result = await sandbox_manager.exec(
-                    self.pipeline_id,
-                    write_cmd,
-                    timeout=10
-                )
-                if exec_result.exit_code != 0:
-                    return {"success": False, "error": f"写入块 {i+1}/{len(chunks)} 失败: {exec_result.stderr}"}
-
-            # 解码
-            # 【修复】路径加单引号防止空格问题
-            decode_result = await sandbox_manager.exec(
-                self.pipeline_id,
-                f"base64 -d '{full_path}' > '{full_path}.tmp' && mv '{full_path}.tmp' '{full_path}'",
-                timeout=10
-            )
-
-            if decode_result.exit_code != 0:
-                return {"success": False, "error": f"解码失败: {decode_result.stderr}"}
-
-            return {"success": True}
-        except Exception as e:
+            logger.error(f"[SandboxFileService] 安全写入异常: {e}")
             return {"success": False, "error": str(e)}
 
     async def _verify_python_syntax(self, full_path: str) -> Dict[str, Any]:

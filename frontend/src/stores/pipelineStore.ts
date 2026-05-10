@@ -24,9 +24,6 @@ interface PipelineState {
   openApproveDrawer: (stage: PipelineStage, nodeSource?: 'CODER' | 'TESTER') => void;
   closeApproveDrawer: () => void;
 
-  // 更新流水线状态（用于轮询更新）
-  updatePipelineStatus: (pipelineId: number, updates: Partial<Pipeline>) => void;
-  updateStageStatus: (pipelineId: number, stageId: number, updates: Partial<PipelineStage>) => void;
 }
 
 export const usePipelineStore = create<PipelineState>((set, get) => ({
@@ -50,25 +47,4 @@ export const usePipelineStore = create<PipelineState>((set, get) => ({
     isApproveDrawerOpen: false,
     selectedNodeSource: null,
   }),
-  
-  updatePipelineStatus: (pipelineId, updates) => {
-    const { selectedPipeline } = get();
-    if (selectedPipeline?.id === pipelineId) {
-      set({
-        selectedPipeline: { ...selectedPipeline, ...updates },
-      });
-    }
-  },
-  
-  updateStageStatus: (pipelineId, stageId, updates) => {
-    const { selectedPipeline } = get();
-    if (selectedPipeline?.id === pipelineId) {
-      const updatedStages = selectedPipeline.stages.map((stage) =>
-        stage.id === stageId ? { ...stage, ...updates } : stage
-      );
-      set({
-        selectedPipeline: { ...selectedPipeline, stages: updatedStages },
-      });
-    }
-  },
 }));

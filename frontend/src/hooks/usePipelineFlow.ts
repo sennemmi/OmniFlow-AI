@@ -7,12 +7,23 @@ import type { Pipeline, PipelineStage } from '@types';
 // 【修复】统一前后端状态枚举，移除 success -> completed 的映射
 // ============================================
 
+import type { LucideIcon } from 'lucide-react';
+
+// 状态显示配置类型
+export interface StatusDisplayConfig {
+  icon: LucideIcon | string;
+  label: string;
+  color: string;
+  bg: string;
+  dot: string;
+}
+
 // 状态配置 - 与后端 PipelineStatus 枚举保持一致
 // 后端 PipelineStatus: running, paused, success, failed
 // 后端 StageStatus: pending, running, success, failed
-export const statusConfig: Record<string, { 
-  icon: string; 
-  class: string; 
+export const statusConfig: Record<string, {
+  icon: string;
+  class: string;
   label: string;
   bgClass?: string;
   borderClass?: string;

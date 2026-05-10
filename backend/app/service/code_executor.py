@@ -2,19 +2,12 @@
 代码执行服务
 业务逻辑层 - 负责将 Agent 生成的代码应用到本地文件系统
 
-【重构说明】
-本模块已从单体服务拆分为多个专业模块：
-- app/service/file_safe_io.py - 原子文件读写、路径安全、备份、Token
-- app/service/code_analysis_service.py - 代码分析、依赖分析
-- app/service/auto_heal_service.py - Ruff 自动修复
-
-本模块现在作为门面，组合以上服务，对外暴露统一接口。
+本模块组合 FileSafeIOService 和 CodeAnalysisService，对外暴露统一接口。
 
 原则：
 1. 在修改前自动备份原文件（防止 AI 改坏代码）
 2. 强制"先读后写"：必须提供 read_token 才能写入
-3. 代码写入后自动执行 Ruff 修复（Linter-based Auto-healing）
-4. 原子写入 + 路径安全（防止目录穿越攻击）
+3. 原子写入 + 路径安全（防止目录穿越攻击）
 """
 
 import logging
@@ -27,16 +20,8 @@ from app.service.file_safe_io import (
     FileReadResult,
     FileChangeResult,
     BatchChangeResult,
-    file_safe_io
 )
-from app.service.code_analysis_service import (
-    CodeAnalysisService,
-    code_analysis
-)
-from app.service.auto_heal_service import (
-    AutoHealService,
-    auto_heal
-)
+from app.service.code_analysis_service import CodeAnalysisService
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +41,12 @@ class CodeExecutorService:
     3. 【核心】强制"先读后写"机制（Read Token）
     4. 冲突检测和验证
     5. 支持批量文件操作
-    6. 代码写入后自动执行 Ruff 修复
-    7. 原子写入 + 路径安全
+    6. 原子写入 + 路径安全
 
-    【重构】核心逻辑已拆分到独立模块：
+    核心逻辑已拆分到独立模块：
     - FileSafeIOService: 文件安全 IO
     - CodeAnalysisService: 代码分析
-    - AutoHealService: 自动修复
     """
-
-    BACKUP_DIR_NAME = ".devflow_backups"
-    MAX_BACKUP_AGE_DAYS = 7
-    READ_TOKEN_EXPIRY_MINUTES = 30
 
     def __init__(self, project_root: Optional[str] = None):
         """
@@ -96,14 +75,9 @@ class CodeExecutorService:
             self.project_root = target_path_obj.resolve()
             self.project_root.mkdir(parents=True, exist_ok=True)
 
-        # 备份目录（在目标项目内）
-        self.backup_dir = self.project_root / self.BACKUP_DIR_NAME
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-
-        # 初始化子服务
+        # 初始化子服务（FileSafeIOService 内部管理备份目录和文件安全）
         self._file_io = FileSafeIOService(str(self.project_root))
         self._code_analysis = CodeAnalysisService(str(self.project_root))
-        self._auto_heal = AutoHealService()
 
     # =========================================================================
     # 门面方法 - 文件操作（委托给 FileSafeIOService）
@@ -160,36 +134,8 @@ class CodeExecutorService:
         """获取与源文件相关的测试文件"""
         return self._code_analysis.get_related_test_files(source_file)
 
-    def analyze_project_structure(self) -> Dict[str, Any]:
-        """分析项目结构"""
-        return self._code_analysis.analyze_project_structure()
-
-    # =========================================================================
-    # 门面方法 - 自动修复（委托给 AutoHealService）
-    # =========================================================================
-
-    def auto_heal_code(self, project_root: Optional[str] = None) -> Dict[str, Any]:
-        """调用 Ruff 进行静默修复"""
-        target_root = project_root or str(self.project_root)
-        return self._auto_heal.auto_heal(target_root)
-
-    def check_code(self, file_path: str) -> Dict[str, Any]:
-        """检查代码问题（不修复）"""
-        return self._auto_heal.check_code(file_path)
-
-    def format_code(self, file_path: str) -> Dict[str, Any]:
-        """格式化代码"""
-        return self._auto_heal.format_code(file_path)
-
-
 # 向后兼容的类导出
 FileChange = FileChangeResult
 
 # 单例实例
 code_executor = CodeExecutorService()
-
-
-# 向后兼容的函数导出
-def auto_heal_code(project_root: str) -> Dict[str, Any]:
-    """调用 Ruff 进行静默修复（向后兼容）"""
-    return auto_heal.auto_heal(project_root)

@@ -5,7 +5,7 @@
 
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional
 from fastapi import APIRouter, Request, Depends
 from pydantic import BaseModel, Field
@@ -16,6 +16,7 @@ from app.service.system_stats import SystemStatsService
 from app.service.health_service import HealthService
 from app.core.response import ResponseModel, success_response, error_response
 from app.core.database import get_session, get_db_status
+from app.core.logging import get_request_id_from_request
 from app.models.pipeline import Pipeline, PipelineStage, PipelineStatus
 from app.core.config import settings
 import structlog
@@ -32,7 +33,7 @@ router = APIRouter()
 @router.get("/health", summary="基础健康检查 (兼容端点)")
 async def basic_health_check(request: Request):
     """供内部服务和探针使用的轻量级健康检查"""
-    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    request_id = get_request_id_from_request(request)
     try:
         health_data = await HealthService.get_component_health()
         overall_health = health_data.get("overall_health", "unhealthy")
@@ -41,7 +42,7 @@ async def basic_health_check(request: Request):
                 "status": overall_health,
                 "overall_health": overall_health,
                 "components": health_data.get("components", {}),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             },
             request_id=request_id
         )
@@ -123,7 +124,7 @@ async def get_system_stats(
     """
     获取服务器实时 CPU 使用率、内存占用情况和 Pipeline 统计数据
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     try:
         stats = await SystemStatsService.collect_stats(session)
         return ResponseModel(
@@ -174,7 +175,7 @@ async def get_system_health(request: Request) -> ResponseModel:
     """
     获取系统健康状态，返回包含status、components、overall_health字段的响应
     """
-    request_id = getattr(request.state, "request_id", "")
+    request_id = get_request_id_from_request(request)
     try:
         health_data = await HealthService.get_component_health()
         components = health_data.get("components", {})
@@ -223,7 +224,7 @@ async def get_system_metrics(request: Request) -> ResponseModel:
     """
     获取系统资源使用指标，返回包含cpu_usage、memory_usage、disk_usage、uptime_seconds字段的响应
     """
-    request_id = getattr(request.state, "request_id", "")
+    request_id = get_request_id_from_request(request)
     try:
         resource_stats = await SystemStatsService.get_resource_stats()
         
@@ -249,121 +250,6 @@ async def get_system_metrics(request: Request) -> ResponseModel:
             request_id=request_id
         )
 
-
-# ============================================
-# 新增系统资源统计端点
-# ============================================
-
-class SystemResourceStats(BaseModel):
-    """系统资源统计响应模型"""
-    cpu_percent: float = Field(
-        ...,
-        description="CPU 使用率 (百分比，0-100)",
-        ge=0,
-        le=100,
-        example=45.5
-    )
-    memory_percent: float = Field(
-        ...,
-        description="内存使用率 (百分比，0-100)",
-        ge=0,
-        le=100,
-        example=62.3
-    )
-    memory_used_mb: int = Field(
-        ...,
-        description="已使用内存 (MB)",
-        example=4096
-    )
-    memory_total_mb: int = Field(
-        ...,
-        description="总内存 (MB)",
-        example=8192
-    )
-    disk_percent: float = Field(
-        ...,
-        description="磁盘使用率 (百分比，0-100)",
-        ge=0,
-        le=100,
-        example=75.0
-    )
-    disk_used_gb: float = Field(
-        ...,
-        description="已使用磁盘空间 (GB)",
-        example=150.5
-    )
-    disk_total_gb: float = Field(
-        ...,
-        description="总磁盘空间 (GB)",
-        example=200.0
-    )
-    uptime_seconds: int = Field(
-        ...,
-        description="服务运行时间 (秒)",
-        example=3600
-    )
-
-
-@router.get(
-    "/system/stats",
-    response_model=ResponseModel,
-    summary="获取系统资源使用统计",
-    description="""
-    获取服务器实时的 CPU 使用率、内存占用情况和磁盘使用情况。
-
-    返回数据说明：
-    - **cpu_percent**: CPU 使用率百分比（0-100）
-    - **memory_percent**: 内存使用率百分比（0-100）
-    - **memory_used_mb**: 已使用内存（MB）
-    - **memory_total_mb**: 总内存（MB）
-    - **disk_percent**: 磁盘使用率百分比（0-100）
-    - **disk_used_gb**: 已使用磁盘空间（GB）
-    - **disk_total_gb**: 总磁盘空间（GB）
-    - **uptime_seconds**: 服务运行时间（秒）
-
-    适用于：
-    - 系统监控面板
-    - 资源使用趋势分析
-    - 告警阈值判断
-    """,
-    response_description="系统 CPU、内存和磁盘使用统计"
-)
-async def get_system_stats(request: Request):
-    """
-    获取系统资源使用统计（CPU、内存、磁盘）
-    """
-    request_id = getattr(request.state, "request_id", None)
-    try:
-        stats = await SystemStatsService.get_resource_stats()
-        return ResponseModel(
-            success=True,
-            data=SystemResourceStats(
-                cpu_percent=stats["cpu_percent"],
-                memory_percent=stats["memory_percent"],
-                memory_used_mb=stats["memory_used_mb"],
-                memory_total_mb=stats["memory_total_mb"],
-                disk_percent=stats["disk_percent"],
-                disk_used_gb=stats["disk_used_gb"],
-                disk_total_gb=stats["disk_total_gb"],
-                uptime_seconds=stats["uptime_seconds"]
-            ).model_dump(),
-            error=None,
-            request_id=request_id
-        )
-    except Exception as e:
-        from app.core.logging import error
-        error("获取系统资源统计失败", exc_info=True)
-        return ResponseModel(
-            success=False,
-            data=None,
-            error=str(e),
-            request_id=request_id
-        )
-
-
-# ============================================
-# 新增数据库状态检查端点
-# ============================================
 
 class DatabaseStatusResponse(BaseModel):
     """数据库状态响应模型"""
@@ -412,7 +298,7 @@ async def get_db_status_endpoint(request: Request):
     """
     检查数据库连接状态和统计信息
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     try:
         db_status = await get_db_status()
         return ResponseModel(
@@ -515,7 +401,7 @@ async def get_detailed_health(request: Request):
     """
     综合健康检查，聚合服务状态、数据库状态和资源使用信息
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     try:
         # 1. 服务状态
         uptime_seconds = int(time.time() - SERVICE_START_TIME)
@@ -617,7 +503,7 @@ async def get_system_config(
     """
     获取系统配置信息
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     try:
         from app.core.config import settings
 
@@ -699,7 +585,7 @@ async def get_analytics(
     """
     获取系统全局分析统计
     """
-    request_id = getattr(request.state, "request_id", None)
+    request_id = get_request_id_from_request(request)
     try:
         # 统计 Pipeline 状态分布
         total_result = await session.execute(select(func.count(Pipeline.id)))

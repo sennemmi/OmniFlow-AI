@@ -247,9 +247,16 @@ class LangGraphAgent(ABC, Generic[T]):
                 "error": None
             }
         except ValidationError as e:
+            error_details = json.dumps(e.errors(), indent=2, ensure_ascii=False)
+            retry_prompt = (
+                f"The previous output failed Pydantic validation:\n"
+                f"{error_details}\n"
+                f"Please correct the JSON output to match the required schema."
+            )
+            logger.warning(f"[{self.agent_name}] Validation failed: {error_details}")
             return {
                 **state,
-                "error": f"Validation error: {e}"
+                "error": retry_prompt
             }
     
     def _retry_node(self, state: BaseAgentState) -> BaseAgentState:
@@ -442,17 +449,26 @@ class LangGraphAgent(ABC, Generic[T]):
             except json.JSONDecodeError:
                 pass  # 修复失败，继续抛出原始错误
 
-        # 5. 如果还不行，报错原始信息
-        raise JSONParseError(f"JSON 解析完全失败，内容截断严重。原始开头: {clean_response[:200]}")
+        # 5. 如果还不行，报错原始信息（包含 raw_output 便于排查 LLM 提示词问题）
+        raw_preview = clean_response[:500]
+        raise JSONParseError(
+            f"JSON 解析完全失败，内容截断严重。\n"
+            f"raw_output (前500字符): {raw_preview}"
+        )
     
+    # 子类可重写的 JSON 修复字段列表（子类按需覆盖）
+    _truncated_json_fields: List[str] = []
+    # 子类可重写的截断字段默认值
+    _truncated_json_defaults: Dict[str, Any] = {}
+
     def _try_fix_truncated_json(self, json_str: str) -> Optional[str]:
         """
         尝试修复截断的不完整 JSON
 
-        策略：
-        1. 如果 JSON 以 { 开头但不以 } 结尾，尝试添加缺少的闭合符号
-        2. 如果字符串在引号内被截断，尝试关闭引号并补全字段
-        3. 如果字段不完整，尝试补全缺失的字段
+        策略（通用，不依赖具体字段名）：
+        1. 大括号/方括号计数补全
+        2. 字符串引号补全
+        3. 子类可通过 _truncated_json_fields 和 _truncated_json_defaults 注入字段级修复
 
         Args:
             json_str: 可能截断的 JSON 字符串
@@ -465,29 +481,19 @@ class LangGraphAgent(ABC, Generic[T]):
 
         fixed = json_str.strip()
 
-        # 【增强】检查关键字段是否缺失，如果缺失则补全
-        required_fields = ['"feature_description"', '"affected_files"', '"estimated_effort"',
-                          '"technical_design"', '"acceptance_criteria"', '"required_symbols"']
-
-        # 找到最后一个完整的字段
+        # 字段级截断修复（仅当子类提供了字段列表时生效）
+        required_fields = self._truncated_json_fields
         last_complete_field_end = 0
         for field in required_fields:
             pos = fixed.rfind(field)
             if pos > last_complete_field_end:
                 last_complete_field_end = pos
 
-        # 如果在某个字段值内部被截断，截断到该字段的开始，并补全默认值
         if last_complete_field_end > 0:
-            # 找到该字段的开始位置
             field_start = last_complete_field_end
-            # 检查该字段是否完整（后面有逗号或右括号）
             rest = fixed[field_start:]
-
-            # 如果看起来在字段值内部（有冒号但后面没有逗号或}）
             if ':' in rest and not (rest.rstrip().endswith(',') or rest.rstrip().endswith(']') or rest.rstrip().endswith('}')):
-                # 截断到该字段之前
                 fixed = fixed[:field_start].rstrip()
-                # 如果最后一个字符是逗号，移除它
                 if fixed.endswith(','):
                     fixed = fixed[:-1]
 
@@ -513,11 +519,10 @@ class LangGraphAgent(ABC, Generic[T]):
                 else:
                     fixed = fixed + '"'
 
-        # 【增强】补全缺失的必填字段
-        if '"acceptance_criteria"' not in fixed:
-            fixed = fixed.rstrip() + ',\n  "acceptance_criteria": []'
-        if '"required_symbols"' not in fixed:
-            fixed = fixed.rstrip() + ',\n  "required_symbols": []'
+        # 子类注入的截断字段默认值
+        for field_name, default_value in self._truncated_json_defaults.items():
+            if f'"{field_name}"' not in fixed:
+                fixed = fixed.rstrip() + f',\n  "{field_name}": {json.dumps(default_value)}'
 
         # 补全闭合的大括号和方括号
         fixed = fixed + '}' * open_braces
@@ -578,7 +583,9 @@ class LangGraphAgent(ABC, Generic[T]):
                 "output_tokens": 0,
                 **initial_state  # 合并业务状态
             }
-            
+
+            result = None  # 确保 except 块中可安全访问
+
             try:
                 # 执行状态机（异步）
                 result = await self.graph.ainvoke(full_initial_state)
@@ -600,8 +607,17 @@ class LangGraphAgent(ABC, Generic[T]):
                 tool_calls = result.get("tool_calls", 0)
                 tool_results = result.get("tool_results", [])
                 
+                base_result = {
+                    "retry_count": result.get("retry_count", 0),
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                    "duration_ms": duration_ms,
+                    "tool_calls": tool_calls,
+                    "tool_results": tool_results,
+                    "reasoning": reasoning_content,
+                }
+
                 if result.get("error"):
-                    # 执行失败
                     error_msg = result["error"]
                     error(
                         f"[{self.agent_name}] 执行失败",
@@ -617,19 +633,12 @@ class LangGraphAgent(ABC, Generic[T]):
                     )
                     
                     return {
+                        **base_result,
                         "success": False,
                         "output": None,
                         "error": error_msg,
-                        "retry_count": result.get("retry_count", 0),
-                        "input_tokens": total_input_tokens,
-                        "output_tokens": total_output_tokens,
-                        "duration_ms": duration_ms,
-                        "tool_calls": tool_calls,
-                        "tool_results": tool_results,
-                        "reasoning": reasoning_content
                     }
-                
-                # 执行成功
+
                 await push_log(
                     pipeline_id,
                     "thought",
@@ -641,16 +650,10 @@ class LangGraphAgent(ABC, Generic[T]):
                 logger.info(f"[DEBUG] Agent={self.agent_name} returning metrics: input_tokens={total_input_tokens}, output_tokens={total_output_tokens}, duration_ms={duration_ms}, tool_calls={tool_calls}")
 
                 return {
+                    **base_result,
                     "success": True,
                     "output": result["output"],
                     "error": None,
-                    "retry_count": result.get("retry_count", 0),
-                    "input_tokens": total_input_tokens,
-                    "output_tokens": total_output_tokens,
-                    "duration_ms": duration_ms,
-                    "tool_calls": tool_calls,
-                    "tool_results": tool_results,
-                    "reasoning": reasoning_content
                 }
                 
             except Exception as e:
@@ -723,5 +726,9 @@ class MockAgent(BaseAgent[BaseModel]):
     def validate_output(self, output: Dict[str, Any]) -> BaseModel:
         return BaseModel(**output)
     
-    async def _call_llm(self, system_prompt: str, user_prompt: str, **kwargs) -> str:
-        return json.dumps(self._mock_response)
+    async def _call_llm(self, system_prompt: str, user_prompt: str, **kwargs) -> Dict[str, Any]:
+        return {
+            "content": json.dumps(self._mock_response),
+            "input_tokens": 0,
+            "output_tokens": 0
+        }

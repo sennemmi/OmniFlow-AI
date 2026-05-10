@@ -9,11 +9,10 @@
 """
 
 import asyncio
-import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from app.core.config import settings
 from app.core.sse_log_buffer import push_log
@@ -135,7 +134,7 @@ class DeliveryHandler(StageHandler):
             # Git 操作在独立的交付工作区执行
             git_service = GitProviderService(str(delivery_workspace))
             timestamp = now().strftime("%Y%m%d_%H%M%S")
-            git_branch = f"devflow/pipeline-{pipeline_id}-{timestamp}"
+            git_branch = f"omniflow/pipeline-{pipeline_id}-{timestamp}"
 
             # 【关键改进】交付工作区是全新的，需要初始化 Git
             await push_log(

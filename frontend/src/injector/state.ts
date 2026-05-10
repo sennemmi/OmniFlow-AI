@@ -55,15 +55,6 @@ class StateManager {
   }
 
   /**
-   * 批量设置状态
-   */
-  setMultiple(updates: Partial<AppState>): void {
-    Object.entries(updates).forEach(([key, value]) => {
-      this.set(key as keyof AppState, value as AppState[keyof AppState]);
-    });
-  }
-
-  /**
    * 重置选择状态
    */
   resetSelectionState(): void {
@@ -184,10 +175,6 @@ class StateManager {
 // 导出单例
 export const stateManager = new StateManager();
 export const appState = state;
-
-// 导出便捷访问
-export const getState = () => stateManager.getState();
-export const get = <K extends keyof AppState>(key: K) => stateManager.get(key);
 
 // 兼容旧命名
 export { stateManager as StateManager, state };

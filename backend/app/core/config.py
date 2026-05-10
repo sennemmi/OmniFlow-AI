@@ -63,39 +63,30 @@ class Config(BaseSettings):
     # 计算属性
     # ============================================
 
+    # Provider 映射表 — 新增 provider 只需在一处维护
+    _PROVIDER_MAP = {
+        "mimo":     ("MIMO_API_KEY",     "MIMO_API_BASE",     "MIMO_DEFAULT_MODEL"),
+        "openai":   ("OPENAI_API_KEY",   "OPENAI_API_BASE",   "DEFAULT_MODEL"),
+        "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE", "DEEPSEEK_DEFAULT_MODEL"),
+    }
+
     @property
     def llm_api_key(self) -> Optional[str]:
         """根据 LLM_PROVIDER 返回对应的 API Key"""
-        provider = self.LLM_PROVIDER.lower()
-        if provider == "mimo":
-            return self.MIMO_API_KEY
-        elif provider == "openai":
-            return self.OPENAI_API_KEY
-        elif provider == "deepseek":
-            return self.DEEPSEEK_API_KEY
-        return None
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[0], None) if entry else None
 
     @property
     def llm_api_base(self) -> str:
         """根据 LLM_PROVIDER 返回对应的 API Base"""
-        provider = self.LLM_PROVIDER.lower()
-        if provider == "mimo":
-            return self.MIMO_API_BASE
-        elif provider == "openai":
-            return self.OPENAI_API_BASE
-        elif provider == "deepseek":
-            return self.DEEPSEEK_API_BASE
-        return ""
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[1], "") if entry else ""
 
     @property
     def llm_model(self) -> str:
         """根据 LLM_PROVIDER 返回使用的模型名称"""
-        provider = self.LLM_PROVIDER.lower()
-        if provider == "mimo":
-            return self.MIMO_DEFAULT_MODEL
-        elif provider == "deepseek":
-            return self.DEEPSEEK_DEFAULT_MODEL
-        return self.DEFAULT_MODEL
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[2], self.DEFAULT_MODEL) if entry else self.DEFAULT_MODEL
 
     # ============================================
     # AI 目标项目配置
@@ -137,6 +128,15 @@ class Config(BaseSettings):
 
 # 全局配置实例
 settings = Config()
+
+# 生产环境安全检查：CORS 不允许通配符
+if not settings.DEBUG and "*" in settings.CORS_ORIGINS:
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.warning(
+        "安全警告：生产环境中 CORS_ORIGINS 配置为 [\"*\"]，"
+        "任何来源都能访问 API。请在 .env 中设置 CORS_ORIGINS=[\"https://yourdomain.com\"]"
+    )
 
 
 # ============================================
