@@ -1,0 +1,133 @@
+"""
+数据库连接管理
+"""
+
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlmodel import SQLModel
+
+from app.core.config import settings
+
+# 创建异步引擎 - 优化连接池配置避免 SQLite 锁定问题
+# 参考 SQLAlchemy 文档：https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#database-locking-behavior-concurrency
+def _get_engine_args():
+    """获取数据库引擎参数"""
+    args = {
+        "echo": False,
+        "future": True,
+    }
+    
+    # SQLite 特定优化
+    if settings.DATABASE_URL.startswith("sqlite"):
+        # SQLite 连接池配置
+        # - pool_pre_ping: 连接前检查连接是否有效
+        # - pool_recycle: 连接回收时间（秒）
+        args.update({
+            "pool_pre_ping": True,
+            "pool_recycle": 3600,  # 1小时回收连接
+            "connect_args": {
+                # 设置 SQLite 超时时间（秒）
+                # 当数据库被锁定时，等待最多 30 秒
+                "timeout": 30,
+            }
+        })
+    
+    return args
+
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    **_get_engine_args()
+)
+
+# 创建异步会话工厂
+async_session_factory = sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+
+async def get_session() -> AsyncSession:
+    """获取数据库会话（依赖注入使用）"""
+    async with async_session_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+
+async def init_db():
+    """初始化数据库表"""
+    async with engine.begin() as conn:
+        # 导入所有模型以确保它们被注册
+        from app.models.pipeline import Pipeline, PipelineStage
+
+        # SQLite: 启用 WAL 模式提高并发写入性能
+        if settings.DATABASE_URL.startswith("sqlite"):
+            await conn.run_sync(lambda c: c.execute(text("PRAGMA journal_mode=WAL")))
+
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    # SQLite: 为后续连接也启用 WAL 模式
+    if settings.DATABASE_URL.startswith("sqlite"):
+        @event.listens_for(engine.sync_engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+    # 设置 SQLAlchemy 慢查询监听
+    from app.core.logging import setup_sqlalchemy_logging
+    setup_sqlalchemy_logging(engine)
+
+
+async def get_db_status() -> dict:
+    """
+    获取数据库连接池状态
+    
+    Returns:
+        dict: 包含以下字段的字典：
+            - connected: 是否连接成功
+            - database_url: 数据库连接URL（已脱敏）
+            - pool_size: 连接池大小
+            - active_connections: 当前活跃连接数
+    """
+    from app.core.config import settings
+    
+    # 脱敏处理数据库URL
+    database_url = settings.DATABASE_URL
+    if "@" in database_url:
+        # 如果有用户名密码，进行脱敏
+        parts = database_url.split("@")
+        protocol_part = parts[0].split("://")[0]
+        host_part = parts[1]
+        database_url = f"{protocol_part}://***@{host_part}"
+    
+    try:
+        # 检查连接池状态
+        pool = engine.pool
+        pool_size = pool.size() if hasattr(pool, 'size') else 5
+        
+        # 尝试执行简单查询来验证连接
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+            connected = True
+    except Exception:
+        connected = False
+        pool_size = 0
+    
+    # 获取活跃连接数（SQLAlchemy 异步引擎不直接提供，使用估算值）
+    active_connections = 1 if connected else 0
+    
+    return {
+        "connected": connected,
+        "database_url": database_url,
+        "pool_size": pool_size,
+        "active_connections": active_connections
+    }

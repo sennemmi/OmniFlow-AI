@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -i '2434,2508d' pipeline.py)",
+      "Bash(sed -i '1659,1695d' pipeline.py)",
+      "Bash(sed -i '1590,1657d' pipeline.py)",
+      "Bash(sed -i '991,1579d' pipeline.py)",
+      "Bash(npx -p typescript tsc --noEmit --pretty)",
+      "Bash(Get-ChildItem -Recurse -File -Name backend)",
+      "Bash(Select-Object -First 200)"
+    ]
+  }
+}

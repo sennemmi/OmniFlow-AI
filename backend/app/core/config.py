@@ -1,0 +1,187 @@
+"""
+OmniFlowAI 核心配置模块
+
+遵循 '以状态管理为荣' 原则，所有可配置项集中管理。
+"""
+from pathlib import Path
+from pydantic_settings import BaseSettings
+from typing import Optional, List
+
+
+class Config(BaseSettings):
+    """应用配置类"""
+
+    # 应用基础配置
+    APP_NAME: str = "OmniFlowAI"
+    APP_VERSION: str = "0.1.0"
+    DEBUG: bool = False
+    ENV: str = "development"
+
+    # 服务器配置
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+
+    # CORS 配置
+    CORS_ORIGINS: List[str] = ["*"]
+
+    # 数据库配置
+    # 注意：异步 SQLAlchemy 需要使用 sqlite+aiosqlite 格式
+    DATABASE_URL: str = "sqlite+aiosqlite:///./omniflow.db"
+
+    # API 版本
+    API_V1_PREFIX: str = "/api/v1"
+
+    # 沙箱测试功能开关（默认启用）
+    SANDBOX_TEST_ENABLED: bool = True
+
+    # ============================================
+    # AI 模型配置
+    # ============================================
+
+    # LLM Provider 选择
+    # 可选值: openai | mimo | deepseek
+    LLM_PROVIDER: str = "deepseek"
+
+    # 默认模型配置
+    DEFAULT_MODEL: str = "deepseek-chat"
+
+    # OpenAI 配置
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_API_BASE: str = "https://api.openai.com/v1"
+
+    # MiMo (小米米墨) 配置
+    MIMO_API_KEY: Optional[str] = None
+    MIMO_API_BASE: str = "https://api.xiaomimimo.com/v1"
+    MIMO_DEFAULT_MODEL: str = "mimo-v2.5-pro"
+
+    # DeepSeek 配置
+    DEEPSEEK_API_KEY: Optional[str] = None
+    DEEPSEEK_API_BASE: str = "https://api.deepseek.com/v1"
+    DEEPSEEK_DEFAULT_MODEL: str = "deepseek-chat"
+
+    # ============================================
+    # 计算属性
+    # ============================================
+
+    # Provider 映射表 — 新增 provider 只需在一处维护
+    _PROVIDER_MAP = {
+        "mimo":     ("MIMO_API_KEY",     "MIMO_API_BASE",     "MIMO_DEFAULT_MODEL"),
+        "openai":   ("OPENAI_API_KEY",   "OPENAI_API_BASE",   "DEFAULT_MODEL"),
+        "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE", "DEEPSEEK_DEFAULT_MODEL"),
+    }
+
+    @property
+    def llm_api_key(self) -> Optional[str]:
+        """根据 LLM_PROVIDER 返回对应的 API Key"""
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[0], None) if entry else None
+
+    @property
+    def llm_api_base(self) -> str:
+        """根据 LLM_PROVIDER 返回对应的 API Base"""
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[1], "") if entry else ""
+
+    @property
+    def llm_model(self) -> str:
+        """根据 LLM_PROVIDER 返回使用的模型名称"""
+        entry = self._PROVIDER_MAP.get(self.LLM_PROVIDER.lower())
+        return getattr(self, entry[2], self.DEFAULT_MODEL) if entry else self.DEFAULT_MODEL
+
+    # ============================================
+    # AI 目标项目配置
+    # ============================================
+
+    # AI 操作的目标项目路径（必须使用绝对路径）
+    TARGET_PROJECT_PATH: str = ""
+
+    # ============================================
+    # 代码安全机制配置
+    # ============================================
+
+    # Read Token 密钥（用于验证先读后写机制）
+    # 如果不设置，系统会自动生成一个随机密钥（重启后失效）
+    READ_TOKEN_SECRET: Optional[str] = None
+
+    # ============================================
+    # GitHub 集成配置
+    # ============================================
+
+    GITHUB_TOKEN: Optional[str] = None
+    GITHUB_OWNER: Optional[str] = None
+    GITHUB_REPO: Optional[str] = None
+
+    # ============================================
+    # Agent 调试配置
+    # ============================================
+
+    # 是否启用 Agent 调试输出
+    AGENT_DEBUG_ENABLED: bool = True
+    # Agent 调试输出目录
+    AGENT_DEBUG_OUTPUT_DIR: str = "./agent_debug_output"
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+        extra = "ignore"  # 忽略未定义的字段
+
+
+# 全局配置实例
+settings = Config()
+
+# 生产环境安全检查：CORS 不允许通配符
+if not settings.DEBUG and "*" in settings.CORS_ORIGINS:
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.warning(
+        "安全警告：生产环境中 CORS_ORIGINS 配置为 [\"*\"]，"
+        "任何来源都能访问 API。请在 .env 中设置 CORS_ORIGINS=[\"https://yourdomain.com\"]"
+    )
+
+
+# ============================================
+# 路径处理工具函数
+# ============================================
+
+def get_workspace_path(subdir: str = "") -> Path:
+    """
+    获取工作区路径
+
+    Args:
+        subdir: 子目录名（如 "frontend", "backend"）
+
+    Returns:
+        Path: 工作区绝对路径
+    """
+    # 【修复】如果 TARGET_PROJECT_PATH 未设置，使用默认路径
+    if settings.TARGET_PROJECT_PATH:
+        base_path = Path(settings.TARGET_PROJECT_PATH)
+    else:
+        # 默认使用后端目录的父目录（项目根目录）
+        backend_dir = Path(__file__).parent.parent.parent
+        base_path = backend_dir.parent
+
+    if subdir:
+        return base_path / subdir
+    return base_path
+
+
+def process_file_path(file_path: str) -> Path:
+    """
+    处理文件路径，转换为绝对路径
+
+    Args:
+        file_path: 原始文件路径（可能是相对路径）
+
+    Returns:
+        Path: 处理后的绝对路径
+    """
+    path = Path(file_path)
+
+    # 如果已经是绝对路径，直接返回
+    if path.is_absolute():
+        return path
+
+    # 如果是相对路径，基于 TARGET_PROJECT_PATH 解析
+    base_path = Path(settings.TARGET_PROJECT_PATH)
+    return base_path / path

@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"          # 所有 async def test_ 自动识别，不需要手动加 @mark
+asyncio_default_fixture_loop_scope = "function"  # 设置默认的 fixture loop scope
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --color=yes"
+
+# 按标签分层运行
+markers = [
+    "unit: 单元测试，不依赖外部服务",
+    "integration: 集成测试，mock 外部服务",
+    "e2e: 端到端测试，需要真实环境",
+    "slow: 运行超过 5s 的测试",
+    "defense: 防御性测试（系统核心保护机制）",
+    "layer1: 代码修改与沙箱防线",
+    "layer2: 测试运行器与决策防线",
+    "layer3: 多 Agent 协作与状态机防线",
+    "layer4: 工作流与状态持久化防线",
+]
