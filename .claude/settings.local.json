@@ -7,7 +7,14 @@
       "Bash(sed -i '991,1579d' pipeline.py)",
       "Bash(npx -p typescript tsc --noEmit --pretty)",
       "Bash(Get-ChildItem -Recurse -File -Name backend)",
-      "Bash(Select-Object -First 200)"
+      "Bash(Select-Object -First 200)",
+      "Bash(python -m py_compile app/core/contract_checker.py)",
+      "Bash(python -m py_compile app/service/repair_service.py)",
+      "Bash(python -m py_compile app/service/code_generation_service.py)",
+      "Bash(python -m py_compile app/service/quality_gate_service.py)",
+      "Bash(python -m py_compile app/agents/repairer_with_tools_prompts.py)",
+      "Bash(dir *)",
+      "PowerShell(python -m py_compile backend/app/service/repair_service.py; Write-Host \"repair_service OK\")"
     ]
   }
 }

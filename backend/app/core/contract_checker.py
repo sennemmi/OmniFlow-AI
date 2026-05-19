@@ -7,6 +7,7 @@
 
 import ast
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
 
@@ -380,6 +381,132 @@ def verify_return_fields_consistency(
     return mismatches
 
 
+def _extract_key_tokens_from_function_change(
+    func_name: str, description: str
+) -> Dict[str, List[str]]:
+    """
+    从 function_change 中提取用于验证的代码模式（通用实现，不绑定特定框架）。
+
+    解析策略：
+    - 如果 func_name 是函数调用形式（如 module.method(args) 或 method(args)），
+      则被调用的方法名作为 required token，参数名作为 any_of token。
+    - 如果 func_name 是 "import X" 形式，则 X 作为 any_of token。
+    - 否则，整个 func_name 作为 any_of token（普通符号名）。
+
+    Returns:
+        {"required": [...], "any_of": [...]}
+        - required: 所有 token 都必须在代码中出现（结构性/动作性关键字）
+        - any_of: 至少一个 token 出现在代码中即视为关联确认（名称性关键字）
+    """
+    required = []
+    any_of = []
+    desc = (description or "").lower()
+    clean = func_name.strip()
+
+    # 模式 1: 函数/方法调用形式 → 提取被调用的方法名和参数名
+    # 例如: "app.include_router(hello_router)" → required=["include_router"], any_of=["hello_router"]
+    #       "register_middleware(auth_middleware)" → required=["register_middleware"], any_of=["auth_middleware"]
+    call_match = re.match(r'(?:[\w.]+\.)?(\w+)\(', clean)
+    if call_match:
+        required.append(call_match.group(1))
+        args = re.findall(r'\((\w+)', clean)
+        any_of.extend(args)
+        return {"required": required, "any_of": any_of}
+
+    # 模式 2: import 形式
+    # 例如: "import hello_router" → any_of=["hello_router"]
+    if clean.startswith("import "):
+        target = clean.replace("import ", "").strip()
+        if target:
+            any_of.append(target)
+        return {"required": required, "any_of": any_of}
+
+    # 也检查 description 中是否提到 import
+    if "import" in desc:
+        any_of.append(clean)
+        return {"required": required, "any_of": any_of}
+
+    # 模式 3: 普通符号名（函数/类/变量定义）
+    # 例如: "hello", "MyService", "router"
+    if clean and not clean.startswith("app."):
+        any_of.append(clean)
+
+    return {"required": required, "any_of": any_of}
+
+
+def verify_function_changes_coverage(
+    function_changes: List[Dict[str, Any]],
+    code_files: Dict[str, str]
+) -> List[str]:
+    """
+    验证 CoderAgent 的输出是否覆盖了 DesignerAgent function_changes 中的每一项。
+
+    通过检查生成代码中是否包含 function_change 描述的关键模式来验证。
+    针对"一个文件多个变更"的场景（如 main.py 需要同时添加 import 和 include_router），
+    防止 CoderAgent 只实现了部分变更。
+
+    Args:
+        function_changes: DesignerAgent 的 function_changes 列表
+        code_files: 生成的代码文件映射
+
+    Returns:
+        未覆盖的变更描述列表，空列表表示全部覆盖
+    """
+    uncovered = []
+
+    for fc in function_changes:
+        file_path = fc.get("file", "")
+        func_name = fc.get("function", "")
+        action = fc.get("action", "")
+        description = fc.get("description", "")
+
+        if action not in ("add", "modify"):
+            continue
+
+        # 找到匹配的代码文件
+        content = None
+        for k, v in code_files.items():
+            normalized_k = k.replace("\\", "/")
+            normalized_fp = file_path.replace("\\", "/")
+            if normalized_k.endswith(normalized_fp) or normalized_fp.endswith(
+                normalized_k.replace("backend/", "")
+            ):
+                content = v
+                break
+
+        if content is None:
+            uncovered.append(f"{func_name} in {file_path} (file not in generated output)")
+            continue
+
+        # 提取需要检查的关键 token
+        token_spec = _extract_key_tokens_from_function_change(func_name, description)
+        required = token_spec.get("required", [])
+        any_of = token_spec.get("any_of", [])
+
+        if not required and not any_of:
+            continue
+
+        content_lower = content.lower()
+
+        # 检查强制 token：全部必须出现
+        missing_required = [t for t in required if t.lower() not in content_lower]
+        if missing_required:
+            uncovered.append(
+                f"{func_name} in {file_path}: "
+                f"required tokens {missing_required} not found in generated code"
+            )
+            continue
+
+        # 检查可选 token：至少一个出现
+        if any_of and not any(t.lower() in content_lower for t in any_of):
+            uncovered.append(
+                f"{func_name} in {file_path}: "
+                f"none of expected tokens {any_of} found in generated code"
+            )
+
+    return uncovered
+
+
 def check_contract_before_test(
     design_output: Dict[str, Any],
     code_files: Dict[str, str],
@@ -417,6 +544,23 @@ def check_contract_before_test(
             "violations": missing,
             "type": "missing_implementation"
         }
+
+    # 1.5 【新增】检查 function_changes 是否全部被代码覆盖
+    # 防止 CoderAgent 漏掉"同一文件多个变更"中的某项
+    # （如 main.py 需要同时添加 import 和 include_router，但 CoderAgent 只做了 import）
+    function_changes = design_output.get("function_changes", [])
+    if function_changes:
+        uncovered = verify_function_changes_coverage(function_changes, code_files)
+        if uncovered:
+            logger.error(f"契约违反: 缺少 {len(uncovered)} 个 function_change 覆盖")
+            for u in uncovered:
+                logger.error(f"  - {u}")
+
+            return {
+                "success": False,
+                "violations": uncovered,
+                "type": "missing_function_change_coverage"
+            }
 
     # 2. 【新增】检查返回字段与契约的一致性（跨文件一致性检查）
     return_field_mismatches = verify_return_fields_consistency(code_files, interface_specs)

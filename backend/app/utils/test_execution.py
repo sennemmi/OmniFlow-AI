@@ -13,6 +13,16 @@ from app.service.sandbox_manager import sandbox_manager
 logger = logging.getLogger(__name__)
 
 
+def extract_failed_tests(logs: str) -> List[str]:
+    """
+    从 pytest 输出中提取失败的测试名称，过滤掉进度指示器等误捕获。
+
+    统一所有调用方使用此函数，避免重复实现和 bug 分散。
+    """
+    raw = re.findall(r'FAILED\s+(\S+)', logs)
+    return [t for t in raw if not re.match(r'^\[\d+%\]$', t) and t not in ('[', 'FAILED', 'ERROR')]
+
+
 async def run_pytest_in_sandbox(
     pipeline_id: int,
     test_path: str,
@@ -42,17 +52,19 @@ async def run_pytest_in_sandbox(
     log("info", f"🧪 运行 pytest: {test_path}")
 
     try:
+        # 清理 __pycache__ 避免 .pyc 缓存导致修复后的代码不生效
+        cleanup_cmd = "find /workspace/backend -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null; "
         exec_result = await sandbox_manager.exec(
             pipeline_id,
-            f"cd /workspace && PYTHONPATH=/workspace/backend python -m pytest {test_path} {extra_args} 2>&1",
+            f"cd /workspace && {cleanup_cmd}PYTHONPATH=/workspace/backend python -B -m pytest {test_path} {extra_args} 2>&1",
             timeout=timeout
         )
 
         logs = exec_result.stdout + "\n" + exec_result.stderr
         success = exec_result.exit_code == 0
 
-        # 提取失败的测试 (FAILED)
-        failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+        # 提取失败的测试 (FAILED) — 使用统一函数过滤误捕获
+        failed_tests = extract_failed_tests(logs)
         # 提取错误的测试 (ERROR - 如导入错误、收集错误等)
         error_tests = re.findall(r'ERROR\s+(\S+)', logs)
         # 提取错误数量

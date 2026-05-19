@@ -100,14 +100,16 @@ class RepairService:
             }
         """
         async def log(level: str, message: str):
+            # 只通过一种渠道输出日志，避免前端重复显示
             if log_callback:
                 if asyncio.iscoroutinefunction(log_callback):
                     await log_callback(level, message)
                 else:
-                    log_callback(level, message)
+                    result = log_callback(level, message)
+                    if asyncio.iscoroutine(result):
+                        await result
             else:
-                getattr(logger, level.lower(), logger.info)(message)
-            await push_log(pipeline_id, level.lower(), message, stage="REPAIR")
+                await push_log(pipeline_id, level.lower(), message, stage="REPAIR")
 
         await log("info", "🔧 启动智能修复循环...")
 
@@ -125,6 +127,11 @@ class RepairService:
         if collection_errors:
             failed_tests.extend(collection_errors)
             failed_tests = list(set(failed_tests))  # 去重
+        # 过滤掉 pytest 进度指示器（如 "[20%]", "[100%]"）等误捕获的非测试名
+        failed_tests = [
+            t for t in failed_tests
+            if not re.match(r'^\[\d+%\]$', t) and t not in ('[', 'FAILED', 'ERROR')
+        ]
         await log("info", f"📋 发现 {len(failed_tests)} 个失败/错误测试" +
                    (f"（含 {len(collection_errors)} 个收集错误）" if collection_errors else ""))
 
@@ -312,8 +319,9 @@ class RepairService:
             all_generated_paths=generated_file_paths
         )
 
-        # 构建修复工单
-        failed_tests = re.findall(r'FAILED\s+(\S+)', test_logs)
+        # 构建修复工单 — 使用统一的失败测试提取函数，过滤进度指示器垃圾
+        from app.utils.test_execution import extract_failed_tests
+        failed_tests = extract_failed_tests(test_logs)
         fix_order = build_fix_order(
             failed_tests=failed_tests,
             logs=test_logs,
@@ -321,11 +329,18 @@ class RepairService:
             missing_symbols=missing_symbols
         )
 
-        # 构建目标文件字典
+        # 构建目标文件字典 — 预加载所有已生成/修改的文件内容
+        # 避免 RepairerAgent 浪费工具配额去重复读取已知文件
         target_files = {}
         for path in essential_paths:
             if path in file_contents:
                 target_files[path] = file_contents[path]
+        # 也包含 code_files 中所有文件（不仅仅是 essential）
+        for file_info in code_files:
+            fp = file_info.get("file_path", "")
+            content = file_info.get("content", "") or file_info.get("replace_block", "")
+            if fp and content and fp not in target_files:
+                target_files[fp] = content
 
         # 调用 RepairerAgentWithTools
         repairer = RepairerAgentWithTools()

@@ -289,6 +289,8 @@ class MiMoProvider(OpenAICompatibleProvider):
     MiMo (小米米墨) Provider
 
     使用 OpenAI 兼容接口，集成智能重试机制
+    注意：默认关闭思考模式(thinking)以避免多轮工具调用时的400错误
+    参考：https://platform.xiaomimimo.com/docs/zh-CN/api/chat/openai-api
     """
 
     def __init__(self):
@@ -300,6 +302,103 @@ class MiMoProvider(OpenAICompatibleProvider):
             retry_name="mimo_provider",
             use_openai_prefix=True
         )
+
+    async def _do_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.3,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """实际调用 MiMo API，关闭思考模式以避免多轮工具调用问题"""
+        # 构建模型名称
+        model = f"openai/{self._model}" if self._use_openai_prefix else self._model
+
+        # 构建调用参数
+        call_params = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "api_key": self._api_key,
+            "api_base": self._api_base,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "thinking": {"type": "disabled"}  # 关闭思考模式，避免多轮工具调用时的400错误
+        }
+
+        # 如果指定了 custom_llm_provider，添加到参数中
+        if self._custom_llm_provider:
+            call_params["custom_llm_provider"] = self._custom_llm_provider
+
+        # 如果指定了 response_format，添加到参数中
+        if response_format:
+            call_params["response_format"] = response_format
+            logger.info(f"[{self.provider_name}] 使用结构化输出: {response_format}")
+
+        response = await litellm.acompletion(**call_params)
+
+        # 【详细日志】记录完整响应结构以诊断问题
+        logger.debug(f"[{self.provider_name}] Raw response: {response}")
+
+        if not response:
+            raise LLMCallError("LLM 返回 None 响应")
+
+        if not response.choices:
+            # 【详细日志】记录 response 结构以诊断空 choices 问题
+            usage_info = response.usage if hasattr(response, 'usage') else None
+            logger.error(
+                f"[{self.provider_name}] Empty choices detected! "
+                f"This is typically an API intermittent issue (rate limiting or service unavailable). "
+                f"usage={usage_info}, model={self._model}"
+            )
+            # 返回一个可重试的错误信号
+            raise LLMCallError(
+                f"API 间歇性错误：LLM 返回空响应 (usage: {usage_info}). "
+                f"这通常是 {self.provider_name} API 的临时问题，建议自动重试。"
+            )
+
+        # 检查 message content 是否为空
+        message = response.choices[0].message
+        if not message.content or not message.content.strip():
+            logger.warning(f"[{self.provider_name}] Message content is empty! message: {message}, finish_reason: {response.choices[0].finish_reason}")
+            # 某些模型可能返回 reasoning 内容而不是 content
+            reasoning_content = getattr(message, 'reasoning_content', None) or getattr(message, 'reasoning', None)
+            if reasoning_content:
+                logger.info(f"[{self.provider_name}] Found reasoning content, using as fallback")
+                return {
+                    "content": reasoning_content,
+                    "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "output_tokens": response.usage.completion_tokens if response.usage else 0
+                }
+            raise LLMCallError(f"LLM 返回空内容 (finish_reason: {response.choices[0].finish_reason})")
+
+        # 提取 Token 信息
+        if response.usage:
+            input_tokens = response.usage.prompt_tokens or 0
+            output_tokens = response.usage.completion_tokens or 0
+        else:
+            # 降级：通过内容长度粗略估算（1字符≈0.3 token）
+            content = response.choices[0].message.content or ""
+            input_tokens = int(len(user_prompt) * 0.3)
+            output_tokens = int(len(content) * 0.3)
+            logger.warning(
+                f"[{self.provider_name}] response.usage is None, "
+                f"using estimated tokens: input={input_tokens}, output={output_tokens}"
+            )
+
+        logger.info(
+            f"[{self.provider_name}] response.usage: {response.usage}, "
+            f"input_tokens={input_tokens}, output_tokens={output_tokens}"
+        )
+
+        return {
+            "content": response.choices[0].message.content,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
 
 
 class DeepSeekProvider(OpenAICompatibleProvider):

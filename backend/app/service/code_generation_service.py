@@ -6,6 +6,7 @@
 """
 
 import logging
+import re
 import time
 from typing import Dict, List, Optional, Any, Callable
 
@@ -119,11 +120,15 @@ class CodeGenerationService:
         current_error_context = None
 
         async def log(level: str, message: str):
+            # 只通过一种渠道输出日志，避免前端重复显示
             if log_callback:
-                await log_callback(level, message)
-            else:
-                getattr(logger, level.lower(), logger.info)(message)
-            if pipeline_id:
+                if asyncio.iscoroutinefunction(log_callback):
+                    await log_callback(level, message)
+                else:
+                    result = log_callback(level, message)
+                    if asyncio.iscoroutine(result):
+                        await result
+            elif pipeline_id:
                 await push_log(pipeline_id, level.lower(), message, stage="CODING")
 
         await log("info", "🚀 启动代码生成与修复流程...")
@@ -357,7 +362,14 @@ class CodeGenerationService:
 
             # 7. 契约检查
             if enable_contract_check:
-                code_files_dict = {f["file_path"]: f["content"] for f in all_files if f.get("content")}
+                # 构建代码文件字典：包含 add 类型的 content 和 modify 类型的 replace_block
+                code_files_dict = {}
+                for f in all_files:
+                    fp = f.get("file_path", "")
+                    if f.get("content"):
+                        code_files_dict[fp] = f["content"]
+                    elif f.get("replace_block"):
+                        code_files_dict[fp] = f["replace_block"]
                 contract_check = check_contract_before_test(
                     design_output=design_output,
                     code_files=code_files_dict
@@ -376,6 +388,21 @@ class CodeGenerationService:
                     continue
 
                 await log("success", "✅ 契约检查通过")
+
+            # 7.5 【安全检查】对 modify 类文件检查变量使用顺序
+            # 防止 CoderAgent 将 app.include_router() 放在 app = FastAPI() 之前
+            ordering_errors = self._check_variable_ordering(all_files, file_service, pipeline_id)
+            if ordering_errors:
+                await log("error", f"❌ 变量引用顺序错误: {ordering_errors}")
+                current_error_context = (
+                    f"【变量引用顺序错误】以下代码在使用变量前未定义:\n"
+                    f"{chr(10).join(ordering_errors)}\n\n"
+                    f"请确保代码按正确顺序放置。例如 import 放在文件顶部，"
+                    f"app.include_router() 调用放在 app = FastAPI() 之后。"
+                )
+                attempt += 1
+                fix_history.append({"type": "ordering_fix", "success": False, "errors": ordering_errors})
+                continue
 
             # 8. 同步到沙箱（如果提供了 file_service）
             if file_service:
@@ -812,6 +839,53 @@ class CodeGenerationService:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to sync file to sandbox: {file_path}: {e}")
+
+    def _check_variable_ordering(
+        self,
+        all_files: List[Dict[str, Any]],
+        file_service: Optional[SandboxFileService],
+        pipeline_id: Optional[int],
+    ) -> List[str]:
+        """
+        检查 modify 类文件中的变量引用顺序问题。
+
+        主要检测：app.include_router() / app.add_middleware() 等调用是否出现在
+        app = FastAPI() 定义之前。CoderAgent 有时会将路由注册代码与 import
+        合并输出，导致引用未定义的变量。
+
+        Returns:
+            错误描述列表，空列表表示无问题
+        """
+        errors = []
+
+        for f in all_files:
+            fp = f.get("file_path", "")
+            change_type = f.get("change_type", "")
+
+            if change_type != "modify":
+                continue
+
+            # 从 replace_block 获取修改后的内容
+            content = f.get("replace_block", "")
+            if not content:
+                continue
+
+            # 检查：replace_block 中是否包含对 "app." 的调用
+            # 如果 replace_block 同时包含 import 语句和 app.xxx() 调用，
+            # 说明 CoderAgent 可能将路由注册错误地放在了 import 段
+            has_app_call = bool(re.search(r'\bapp\.\w+\s*\(', content))
+            has_import = bool(re.search(r'^\s*(from\s+|import\s+)', content, re.MULTILINE))
+            has_app_definition = bool(re.search(r'\bapp\s*=\s*FastAPI\s*\(', content))
+
+            if has_app_call and has_import and not has_app_definition:
+                errors.append(
+                    f"{fp}: replace_block 包含 app.xxx() 调用和 import 语句，"
+                    f"但未包含 app = FastAPI() 定义。这会导致 NameError。"
+                    f"请将 app.xxx() 调用拆分为独立的 files 条目，"
+                    f"放在 app = FastAPI() 定义之后的位置。"
+                )
+
+        return errors
 
     def _build_result(
         self,

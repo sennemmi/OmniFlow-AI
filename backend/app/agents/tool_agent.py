@@ -20,6 +20,14 @@ from abc import abstractmethod
 from app.agents.base import LangGraphAgent, BaseAgentState
 from app.agents.tools import AgentTools, get_agent_tools
 from app.core.config import settings
+from app.agents.llm_providers import MiMoProvider
+
+def _get_thinking_param() -> Dict[str, Any]:
+    """获取思考模式参数，如果是 MiMo 则关闭思考模式"""
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "mimo":
+        return {"thinking": {"type": "disabled"}}
+    return {}
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +107,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
             "api_key": settings.llm_api_key,
             "api_base": settings.llm_api_base,
             "custom_llm_provider": "openai",
+            **_get_thinking_param(),  # MiMo 关闭思考模式，避免多轮工具调用时的400错误
         }
         if is_final_output and response_format:
             params["response_format"] = response_format
@@ -217,6 +226,7 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 "api_key": settings.llm_api_key,
                 "api_base": settings.llm_api_base,
                 "custom_llm_provider": "openai",
+                **_get_thinking_param(),  # MiMo 关闭思考模式，避免多轮工具调用时的400错误
             }
             if response_format:
                 final_call_params["response_format"] = response_format
@@ -532,11 +542,12 @@ class ToolUsingAgent(LangGraphAgent[T]):
                     return {
                         "success": False,
                         "error": "LLM 返回空内容，且无法从工具结果构建输出",
-                        "injected_files": injected_files,  # ← 新增：即使失败也传递已读取的文件内容
+                        "injected_files": injected_files,
                         "input_tokens": result.get("input_tokens", 0),
                         "output_tokens": result.get("output_tokens", 0),
                         "tool_calls": result.get("tool_calls", 0),
-                        "tool_results": result.get("tool_results", [])
+                        "tool_results": result.get("tool_results", []),
+                        "partial_success": len(result.get("tool_results", [])) > 0
                     }
             
             parsed_output = self.parse_output(raw_output)
@@ -548,7 +559,9 @@ class ToolUsingAgent(LangGraphAgent[T]):
                 return {
                     "success": False,
                     "error": "Output validation failed",
-                    "raw_output": raw_output[:500]
+                    "raw_output": raw_output[:500],
+                    "tool_results": result.get("tool_results", []),
+                    "tool_calls": result.get("tool_calls", 0)
                 }
 
             # 将 Pydantic 模型转换为字典

@@ -390,23 +390,47 @@ class LangGraphAgent(ABC, Generic[T]):
         Raises:
             JSONParseError: 解析失败
         """
-        # 1. 强力剥离 Markdown 代码块标记
+        # 1. 强力剥离 Markdown 代码块及前置文本
         clean_response = response.strip()
 
-        # 1.1 只提取包裹整个响应的 ```json 代码块（从响应开头开始）
-        # 使用 re.match 而非 re.search，确保只匹配从开头开始的代码块
-        # 避免误匹配 JSON 字段值内部嵌套的代码块（如 suggestion 中的 ```python）
+        # 1.0 如果响应不是以 { 或 [ 开头，查找 JSON 起始位置
+        # 处理 LLM 在 JSON 前附加解释文本的情况（如"根据分析..."）
+        if clean_response and clean_response[0] not in ('{', '['):
+            json_start = clean_response.find('{')
+            json_start_bracket = clean_response.find('[')
+            if json_start_bracket >= 0 and (json_start < 0 or json_start_bracket < json_start):
+                json_start = json_start_bracket
+            if json_start > 0:
+                # 检查是否在 ```json 代码块内
+                pre_json = clean_response[:json_start]
+                fence_match = re.search(r'```(?:json)?\s*$', pre_json)
+                if fence_match:
+                    # JSON 在 ```json 代码块中，找到对应的结束 ```
+                    json_content = clean_response[json_start:]
+                    end_fence = json_content.rfind('```')
+                    if end_fence > 0:
+                        json_content = json_content[:end_fence]
+                    clean_response = json_content.strip()
+                else:
+                    # 没有代码块标记，直接截取 JSON
+                    clean_response = clean_response[json_start:]
+                    # 去除尾部文本（最后一个 } 或 ] 之后的内容）
+                    last_brace = clean_response.rfind('}')
+                    last_bracket = clean_response.rfind(']')
+                    end_pos = max(last_brace, last_bracket)
+                    if end_pos > 0:
+                        clean_response = clean_response[:end_pos + 1]
+
+        # 1.1 提取包裹整个响应的 ```json 代码块
         code_block_match = re.match(
             r'\s*```(?:json)?\s*\n(.*)\n\s*```\s*$',
             clean_response, re.DOTALL
         )
         if code_block_match:
             inner = code_block_match.group(1).strip()
-            # 安全校验：提取的内容必须以 { 或 [ 开头（确认为 JSON）
             if inner and inner[0] in ('{', '['):
                 clean_response = inner
         elif clean_response.startswith("```"):
-            # 兜底：如果开头是 ``` 但不是标准包裹格式，手动清理首尾标记
             clean_response = re.sub(r'^```(?:json)?\s*', '', clean_response)
             clean_response = re.sub(r'\s*```$', '', clean_response)
 

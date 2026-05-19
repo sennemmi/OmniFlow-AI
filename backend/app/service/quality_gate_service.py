@@ -268,7 +268,13 @@ class QualityGateService:
         pipeline_id: int,
     ) -> Dict[str, Any]:
         """契约检查"""
-        code_files_dict = {f["file_path"]: f["content"] for f in code_files if f.get("content")}
+        code_files_dict = {}
+        for f in code_files:
+            fp = f.get("file_path", "")
+            if f.get("content"):
+                code_files_dict[fp] = f["content"]
+            elif f.get("replace_block"):
+                code_files_dict[fp] = f["replace_block"]
 
         contract_check = check_contract_before_test(
             design_output=design_output,

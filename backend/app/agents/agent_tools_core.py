@@ -51,21 +51,16 @@ class AgentToolsCore:
         from app.service.sandbox_manager import sandbox_manager
 
         try:
-            # project_path (backend) 挂载到 /workspace，所以直接使用 /workspace
-            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            # 沙箱中所有项目文件都在 /workspace/backend/ 下
             clean_pattern = clean_backend_prefix(pattern)
-            WORKSPACE_ROOT = '/workspace'
+            WORKSPACE_ROOT = '/workspace/backend'
 
-            # 【修复】使用更可靠的查找策略
             if '**' in clean_pattern:
-                # 对于递归模式，提取目录前缀和文件模式
                 parts = clean_pattern.split('**', 1)
                 if parts[0] and parts[0].strip('/'):
-                    # 有特定目录前缀，如 app/**/*.py -> app
                     base_dir = f"{WORKSPACE_ROOT}/{parts[0].strip('/')}"
                 else:
-                    # 无特定目录前缀，如 **/*.py，限制在 backend 目录下查找
-                    base_dir = f"{WORKSPACE_ROOT}/backend"
+                    base_dir = WORKSPACE_ROOT
                 
                 # 提取文件模式（如 *.py）
                 file_pattern = parts[1].lstrip('/').replace('**/', '').replace('**', '') if len(parts) > 1 else '*'
@@ -162,15 +157,13 @@ class AgentToolsCore:
         from app.service.sandbox_manager import sandbox_manager
 
         try:
-            # 【修复】循环替换所有 backend/ 前缀，避免路径重复
+            # 移除 backend/ 前缀以便拼接沙箱路径
+            # 沙箱中所有文件都在 /workspace/backend/ 下
             clean_path = clean_backend_prefix(path)
 
-            # 【优化】限制搜索范围，避免全盘扫描
             if clean_path:
-                # 有特定路径，使用该路径
-                search_dir = f"/workspace/{clean_path}"
+                search_dir = f"/workspace/backend/{clean_path}"
             else:
-                # 无特定路径，限制在 backend 目录下搜索
                 search_dir = "/workspace/backend"
             
             escaped_pattern = pattern.replace("'", '\'"\'"\'')

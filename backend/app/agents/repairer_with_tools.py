@@ -16,6 +16,7 @@ RepairerAgent with Tools - 带测试运行工具的代码修复代理
 
 import json
 import logging
+import re
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 
@@ -117,14 +118,56 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
     def system_prompt(self) -> str:
         return SYSTEM_PROMPT
 
+    def _extract_written_files_from_tool_results(
+        self, tool_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        从工具调用结果中提取已通过 replace_lines 成功写入沙箱的文件。
+
+        replace_lines 工具直接修改沙箱文件，即使 LLM 后续 JSON 输出解析失败，
+        文件修改已经生效。此方法识别这些已成功的修改，避免重复写入。
+        """
+        rescued = []
+        seen = set()
+        for tr in tool_results or []:
+            if not tr.get("success"):
+                continue
+            tool_name = tr.get("tool", "")
+            args = tr.get("arguments", {})
+            result_data = tr.get("result", {})
+
+            if tool_name == "replace_lines" and result_data.get("success"):
+                fp = args.get("file_path", "")
+                if fp and fp not in seen:
+                    seen.add(fp)
+                    rescued.append({
+                        "file_path": fp,
+                        "source": "replace_lines_recovery"
+                    })
+        return rescued
+
+    def _check_tests_passed_in_tool_results(
+        self, tool_results: List[Dict[str, Any]]
+    ) -> bool:
+        """检查工具调用记录中是否有 run_tests 成功通过"""
+        for tr in tool_results or []:
+            if tr.get("tool") == "run_tests" and tr.get("success"):
+                result_data = tr.get("result", {})
+                if isinstance(result_data, str):
+                    try:
+                        result_data = json.loads(result_data)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                if result_data.get("success"):
+                    return True
+        return False
+
     def _extract_error_summary(self, logs: str) -> str:
         """从测试日志中提取错误摘要（使用统一的提取方法）"""
-        # 使用统一的提取方法
-        error_content = extract_pytest_failures(logs, max_chars=5000)
+        from app.utils.test_execution import extract_failed_tests
 
-        # 提取失败测试数量
-        import re
-        failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+        error_content = extract_pytest_failures(logs, max_chars=5000)
+        failed_tests = extract_failed_tests(logs)
         failed_count = len(failed_tests)
 
         summary = f"失败测试数: {failed_count}\n"
@@ -266,9 +309,9 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
             logs = exec_result.stdout + "\n" + exec_result.stderr
             success = exec_result.exit_code == 0
 
-            # 提取失败的测试
-            import re
-            failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+            # 提取失败的测试 — 使用统一函数
+            from app.utils.test_execution import extract_failed_tests
+            failed_tests = extract_failed_tests(logs)
             
             # 【调试】提取收集到的测试数量
             collected_match = re.search(r'collected\s+(\d+)\s+item', logs)
@@ -659,7 +702,59 @@ class RepairerAgentWithTools(ToolUsingAgent[CoderOutput]):
                 )
 
             if not result.get("success"):
-                logger.error(f"[RepairerAgent] 第 {round_num + 1} 轮修复失败")
+                # 【Bug 2/3 修复】检查本轮是否通过 replace_lines 等工具已实际修改了文件
+                # 工具调用成功 ≠ LLM 最终输出格式正确，不能因为 JSON 解析失败就丢弃已写入的修复
+                tool_results = result.get("tool_results", [])
+                rescued_files = self._extract_written_files_from_tool_results(tool_results)
+                if rescued_files:
+                    logger.warning(
+                        f"[RepairerAgent] 第 {round_num + 1} 轮 JSON 解析失败，"
+                        f"但 replace_lines 工具已成功修改 {len(rescued_files)} 个文件（修改已在沙箱中生效）"
+                    )
+                    # replace_lines 已直接将修改写入沙箱，无需再次写入
+                    for rf in rescued_files:
+                        all_files_modified.append(rf)
+                    # 运行测试验证已写入的修复
+                    test_result = await self._run_test_with_dependency_handling(
+                        installed_packages, MAX_SAME_PACKAGE_INSTALLS
+                    )
+                    self.state.last_test_output = test_result.get("logs", "")
+                    if test_result.get("success"):
+                        logger.info(f"[RepairerAgent] 第 {round_num + 1} 轮恢复后测试通过！")
+                        return {
+                            "success": True,
+                            "output": {
+                                "files": all_files_modified,
+                                "summary": f"修复成功（replace_lines 已生效），经过 {round_num + 1} 轮",
+                                "rounds": round_num + 1,
+                                "recovered_from_parse_failure": True
+                            },
+                            "test_result": test_result
+                        }
+                    logger.warning(f"[RepairerAgent] replace_lines 已执行但测试仍失败，继续下一轮...")
+                    continue  # 进入下一轮修复
+
+                # 【额外恢复路径】检查本轮是否已有 run_tests 成功通过
+                # LLM 在测试通过后可能继续浪费工具调用，导致 max_tool_calls 截断 JSON
+                # 但工具调用记录中的 run_tests 成功已证明修复有效
+                tests_passed_in_tools = self._check_tests_passed_in_tool_results(tool_results)
+                if tests_passed_in_tools:
+                    logger.info(f"[RepairerAgent] 第 {round_num + 1} 轮 JSON 解析失败，"
+                                f"但工具调用中测试已通过，视为修复成功")
+                    return {
+                        "success": True,
+                        "output": {
+                            "files": all_files_modified,
+                            "summary": f"修复成功（测试在工具调用中已通过），经过 {round_num + 1} 轮",
+                            "rounds": round_num + 1,
+                            "recovered_from_parse_failure": True,
+                            "tests_passed_in_tools": True
+                        }
+                    }
+
+                logger.error(f"[RepairerAgent] 第 {round_num + 1} 轮修复失败（无 replace_lines 工具修改）")
+                if self.state.current_round < self.state.max_rounds - 1:
+                    continue  # Bug 3 修复：还有剩余轮次时不立即返回失败
                 return result
 
             output = result.get("output", {})

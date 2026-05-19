@@ -61,6 +61,10 @@ class StructuredLLMClient:
             {"role": "user", "content": user_prompt}
         ]
         
+        # 【MiMo 思考模式】检查是否需要启用思考模式
+        if "mimo" in model.lower():
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+
         # 使用 Instructor 调用 LLM，强制输出符合 response_model
         response, completion = await self.client.chat.completions.create_with_completion(
             model=model,

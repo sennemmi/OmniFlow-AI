@@ -223,12 +223,9 @@ class CodingHandler(StageHandler):
             )
 
         if result.success:
-            # 更新 Pipeline 状态为 PAUSED（等待审批）
-            pipeline = await WorkflowService.get_pipeline_with_stages(
-                context.pipeline_id, context.session
-            )
-            if pipeline:
-                await WorkflowService.set_pipeline_paused(pipeline, context.session)
+            # 【不再在此设置 PAUSED】 Pipeline 状态由调用方管理
+            # 后台任务 _run_coding_task_background 会在所有阶段完成后统一设置 PAUSED
+            # 单阶段审批模式由 trigger_coding_phase 的调用者决定何时暂停
 
             fix_history = result.output_data.get("fix_history", [])
             fix_summary = f"（经历 {len(fix_history)} 轮自动修复）" if fix_history else ""

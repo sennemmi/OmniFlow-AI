@@ -576,9 +576,9 @@ class AgentTools:
             failed_count = test_result.get("failed", 0)
             passed_count = test_result.get("passed", 0)
 
-            # 提取失败的测试名称
-            import re
-            failed_tests = re.findall(r'FAILED\s+(\S+)', logs)
+            # 提取失败的测试名称 — 使用统一函数过滤进度指示器等误捕获
+            from app.utils.test_execution import extract_failed_tests
+            failed_tests = extract_failed_tests(logs) or test_result.get("failed_tests", [])
 
             result = {
                 "success": success,
